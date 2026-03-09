@@ -28,9 +28,11 @@ Press `f` to open the link picker and jump to any link.
 
 ## Images
 
-![A scenic mountain landscape](https://example.com/mountain.jpg)
+![A scenic mountain landscape](https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=800)
 
-![Logo](https://example.com/logo.png)
+![The Rust Programming Language Logo](https://www.rust-lang.org/logos/rust-logo-512x512.png)
+
+![Octocat](https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png)
 
 ## Math Rendering
 

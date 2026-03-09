@@ -1,15 +1,13 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use crossterm::cursor::MoveTo;
-use crossterm::queue;
-use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crossterm::style::Color;
 use image::{DynamicImage, GenericImageView, RgbaImage, imageops::FilterType};
 
-// ── Protocol detection ──────────────────────────────────────────────────────
+// ── Image protocol detection ────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImageProtocol {
     Kitty,
     ITerm2,
@@ -17,29 +15,52 @@ pub enum ImageProtocol {
 }
 
 pub fn detect_protocol() -> ImageProtocol {
-    // Kitty and Ghostty support the Kitty graphics protocol
-    if std::env::var("KITTY_WINDOW_ID").is_ok()
-        || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok()
-        || std::env::var("TERM")
-            .map(|t| t.contains("kitty") || t.contains("ghostty"))
-            .unwrap_or(false)
-    {
+    // Kitty terminal
+    if std::env::var("KITTY_WINDOW_ID").is_ok() {
         return ImageProtocol::Kitty;
     }
-    // iTerm2 and WezTerm support the iTerm2 inline image protocol
-    if let Ok(prog) = std::env::var("TERM_PROGRAM")
-        && (prog == "iTerm.app" || prog == "WezTerm")
-    {
+    if std::env::var("TERM").ok().as_deref() == Some("xterm-kitty") {
+        return ImageProtocol::Kitty;
+    }
+    // Check TERM_PROGRAM for various terminals
+    if let Ok(term) = std::env::var("TERM_PROGRAM") {
+        match term.as_str() {
+            "WezTerm" | "ghostty" => return ImageProtocol::Kitty,
+            "iTerm.app" => return ImageProtocol::ITerm2,
+            _ => {}
+        }
+    }
+    // Ghostty via TERM
+    if std::env::var("TERM").ok().as_deref() == Some("xterm-ghostty") {
+        return ImageProtocol::Kitty;
+    }
+    // iTerm2 via LC_TERMINAL
+    if std::env::var("LC_TERMINAL").ok().as_deref() == Some("iTerm2") {
         return ImageProtocol::ITerm2;
     }
     ImageProtocol::HalfBlock
 }
 
-// ── Cell aspect ratio detection ─────────────────────────────────────────────
+// ── Cell metrics ────────────────────────────────────────────────────────────
 
-/// Get the terminal cell aspect ratio (cell_height / cell_width).
-/// Uses TIOCGWINSZ ioctl to get pixel dimensions, falls back to 2.0.
-pub fn get_cell_aspect_ratio() -> f64 {
+#[derive(Clone, Copy)]
+pub struct CellMetrics {
+    pub aspect: f64,
+    pub cell_w_px: u32,
+    pub cell_h_px: u32,
+}
+
+impl Default for CellMetrics {
+    fn default() -> Self {
+        CellMetrics {
+            aspect: 2.0,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        }
+    }
+}
+
+pub fn get_cell_metrics() -> CellMetrics {
     #[cfg(unix)]
     {
         unsafe {
@@ -52,15 +73,17 @@ pub fn get_cell_aspect_ratio() -> f64 {
             {
                 let cell_w = ws.ws_xpixel as f64 / ws.ws_col as f64;
                 let cell_h = ws.ws_ypixel as f64 / ws.ws_row as f64;
-                return cell_h / cell_w;
+                return CellMetrics {
+                    aspect: cell_h / cell_w,
+                    cell_w_px: cell_w.round() as u32,
+                    cell_h_px: cell_h.round() as u32,
+                };
             }
         }
     }
-    2.0 // Default: most terminal fonts have ~2:1 cell aspect ratio
+    CellMetrics::default()
 }
 
-/// Calculate display cell dimensions (cols, rows) that preserve the image's
-/// aspect ratio within the given bounds, accounting for terminal cell shape.
 fn calc_display_cells(
     img_w: u32,
     img_h: u32,
@@ -71,10 +94,6 @@ fn calc_display_cells(
     if img_w == 0 || img_h == 0 || max_cols == 0 || max_rows == 0 {
         return (1, 1);
     }
-    // In a common unit (cell_width = 1):
-    //   available width  = max_cols
-    //   available height = max_rows * cell_aspect
-    // Scale image to fit, then convert back to cell dimensions.
     let scale_w = max_cols as f64 / img_w as f64;
     let scale_h = (max_rows as f64 * cell_aspect) / img_h as f64;
     let scale = scale_w.min(scale_h);
@@ -85,65 +104,159 @@ fn calc_display_cells(
     (display_cols.min(max_cols), display_rows.min(max_rows))
 }
 
+// ── PNG encoding helper ─────────────────────────────────────────────────────
+
+fn encode_png(img: &DynamicImage) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("PNG encoding failed");
+    bytes
+}
+
+// ── Kitty graphics protocol ─────────────────────────────────────────────────
+
+/// Transmit image data to the terminal with an ID (no display). Uses q=2 to
+/// suppress terminal responses.
+fn transmit_kitty_image(
+    stdout: &mut impl Write,
+    png_data: &[u8],
+    id: u32,
+) -> io::Result<()> {
+    let b64 = BASE64.encode(png_data);
+    let chunk_size = 4096;
+    let total_chunks = b64.len().div_ceil(chunk_size);
+
+    for (i, chunk) in b64.as_bytes().chunks(chunk_size).enumerate() {
+        let more = if i < total_chunks - 1 { 1 } else { 0 };
+        if i == 0 {
+            stdout.write_all(
+                format!(
+                    "\x1b_Ga=t,f=100,t=d,i={},q=2,m={};",
+                    id, more
+                )
+                .as_bytes(),
+            )?;
+        } else {
+            stdout.write_all(format!("\x1b_Gm={};", more).as_bytes())?;
+        }
+        stdout.write_all(chunk)?;
+        stdout.write_all(b"\x1b\\")?;
+    }
+    Ok(())
+}
+
+/// Place an already-transmitted Kitty image (or a sub-rectangle of it).
+fn place_kitty_image(
+    stdout: &mut impl Write,
+    id: u32,
+    cols: usize,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+) -> io::Result<()> {
+    write!(
+        stdout,
+        "\x1b_Ga=p,i={},q=2,x=0,y={},w={},h={},c={},r=1;\x1b\\",
+        id, src_y, src_w, src_h, cols
+    )?;
+    Ok(())
+}
+
+/// Delete all Kitty image placements on screen.
+pub fn kitty_delete_all(stdout: &mut impl Write) -> io::Result<()> {
+    stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\")?;
+    Ok(())
+}
+
+// ── iTerm2 inline image protocol ────────────────────────────────────────────
+
+fn encode_iterm2_strip(png_data: &[u8], cols: usize) -> Vec<u8> {
+    let b64 = BASE64.encode(png_data);
+    format!(
+        "\x1b]1337;File=inline=1;width={};height=1;preserveAspectRatio=0:{}\x07",
+        cols, b64
+    )
+    .into_bytes()
+}
+
 // ── Image cache ─────────────────────────────────────────────────────────────
 
-/// Maximum pixel dimension for source images (downscaled on fetch)
-const MAX_SOURCE_DIM: u32 = 800;
-
 /// Default placeholder rows when image dimensions are unknown
-pub const IMAGE_ROWS: usize = 12;
+pub const IMAGE_ROWS: usize = 8;
 
 /// Maximum image rows to allow
 pub const MAX_IMAGE_ROWS: usize = 20;
 
-struct EncodedPng {
-    base64: String,
-    png_size: usize,
+/// Maximum columns for image display
+const MAX_IMAGE_COLS: usize = 80;
+
+/// Max source dimension for halfblock (low-res fallback)
+const MAX_SOURCE_DIM_HALFBLOCK: u32 = 800;
+
+/// Max source dimension for Kitty/iTerm2 (higher quality)
+const MAX_SOURCE_DIM_NATIVE: u32 = 2000;
+
+/// Pre-computed Kitty image: uploaded once via `a=t`, placed per-frame via `a=p`.
+struct KittyImage {
+    id: u32,
+    cols: usize,
+    rows: usize,
+    target_w: u32,
+    target_h: u32,
+    cell_h_px: u32,
+    /// PNG data waiting to be transmitted; `None` once uploaded to terminal.
+    pending_png: Option<Vec<u8>>,
 }
 
 pub struct ImageCache {
     images: HashMap<String, Option<DynamicImage>>,
     protocol: ImageProtocol,
-    /// Pre-encoded base64 PNG data per url (Kitty/iTerm2)
-    encoded: HashMap<String, EncodedPng>,
-    /// Pre-resized RGBA pixel data per url (HalfBlock)
+
+    // HalfBlock: pre-resized RGBA pixel data
     resized: HashMap<String, RgbaImage>,
-    /// Content width used for last pre_render (to detect resize)
-    last_render_width: usize,
-    /// Terminal cell aspect ratio (cell_height / cell_width)
-    cell_aspect: f64,
-    /// Kitty protocol: mapping from URL to image ID (for transmit-once, place-many)
-    kitty_ids: HashMap<String, u32>,
-    /// Kitty protocol: next image ID to assign
+
+    // iTerm2: pre-encoded escape sequences per URL (one per display row)
+    iterm2_strips: HashMap<String, Vec<Vec<u8>>>,
+
+    // Kitty: image uploaded once, placed per-frame
+    kitty_images: HashMap<String, KittyImage>,
     next_kitty_id: u32,
+
+    last_render_width: usize,
+    cell_metrics: CellMetrics,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
+        let protocol = detect_protocol();
         ImageCache {
             images: HashMap::new(),
-            protocol: detect_protocol(),
-            encoded: HashMap::new(),
+            protocol,
             resized: HashMap::new(),
-            last_render_width: 0,
-            cell_aspect: get_cell_aspect_ratio(),
-            kitty_ids: HashMap::new(),
+            iterm2_strips: HashMap::new(),
+            kitty_images: HashMap::new(),
             next_kitty_id: 0,
+            last_render_width: 0,
+            cell_metrics: get_cell_metrics(),
         }
     }
 
-    #[allow(dead_code)]
     pub fn protocol(&self) -> ImageProtocol {
         self.protocol
     }
 
-    /// Refresh the cached cell aspect ratio (call on terminal resize).
     pub fn update_cell_aspect(&mut self) {
-        let new = get_cell_aspect_ratio();
-        if (new - self.cell_aspect).abs() > 0.01 {
-            self.cell_aspect = new;
-            // Invalidate HalfBlock cache since pixel scaling depends on aspect
+        let new = get_cell_metrics();
+        if (new.aspect - self.cell_metrics.aspect).abs() > 0.01
+            || new.cell_w_px != self.cell_metrics.cell_w_px
+            || new.cell_h_px != self.cell_metrics.cell_h_px
+        {
+            self.cell_metrics = new;
             self.resized.clear();
+            self.iterm2_strips.clear();
+            self.kitty_images.clear();
+        } else {
+            self.cell_metrics = new;
         }
     }
 
@@ -151,21 +264,30 @@ impl ImageCache {
         self.images.get(url).is_some_and(|o| o.is_some())
     }
 
-    /// Get the pixel dimensions of a cached image.
     pub fn image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
         self.images.get(url)?.as_ref().map(|img| img.dimensions())
     }
 
-    /// Calculate display cell dimensions (cols, rows) that preserve
-    /// the image's aspect ratio within the given bounds.
-    pub fn display_size(&self, url: &str, max_cols: usize, max_rows: usize) -> Option<(usize, usize)> {
+    pub fn display_size(
+        &self,
+        url: &str,
+        max_cols: usize,
+        max_rows: usize,
+    ) -> Option<(usize, usize)> {
         let (w, h) = self.image_dimensions(url)?;
-        Some(calc_display_cells(w, h, max_cols, max_rows, self.cell_aspect))
+        let capped_cols = max_cols.min(MAX_IMAGE_COLS);
+        Some(calc_display_cells(
+            w,
+            h,
+            capped_cols,
+            max_rows,
+            self.cell_metrics.aspect,
+        ))
     }
 
-    /// Calculate the ideal number of rows for an image at the given width.
     pub fn ideal_rows(&self, url: &str, content_width: usize) -> Option<usize> {
-        let (_, rows) = self.display_size(url, content_width, MAX_IMAGE_ROWS)?;
+        let capped_width = content_width.min(MAX_IMAGE_COLS);
+        let (_, rows) = self.display_size(url, capped_width, MAX_IMAGE_ROWS)?;
         Some(rows)
     }
 
@@ -173,16 +295,20 @@ impl ImageCache {
         if self.images.contains_key(url) {
             return;
         }
-        let img = fetch_image(url).map(|img| downscale(img, MAX_SOURCE_DIM));
+        let max_dim = match self.protocol {
+            ImageProtocol::HalfBlock => MAX_SOURCE_DIM_HALFBLOCK,
+            _ => MAX_SOURCE_DIM_NATIVE,
+        };
+        let img = fetch_image(url).map(|img| downscale(img, max_dim));
         self.images.insert(url.to_string(), img);
     }
 
-    /// Pre-encode/resize all fetched images for the current display dimensions.
-    /// Call after fetching images or on terminal resize.
+    /// Pre-render images for the current protocol and content width.
     pub fn pre_render(&mut self, content_width: usize) {
-        // On width change, invalidate halfblock cache (Kitty/iTerm2 cache is size-independent)
         if content_width != self.last_render_width {
             self.resized.clear();
+            self.iterm2_strips.clear();
+            self.kitty_images.clear();
             self.last_render_width = content_width;
         }
 
@@ -192,47 +318,82 @@ impl ImageCache {
             .filter_map(|(url, opt)| opt.as_ref().map(|_| url.clone()))
             .collect();
 
-        let cell_aspect = self.cell_aspect;
+        let cell_aspect = self.cell_metrics.aspect;
+        let cell_w_px = self.cell_metrics.cell_w_px;
+        let cell_h_px = self.cell_metrics.cell_h_px;
 
         for url in urls {
             let img = self.images.get(&url).unwrap().as_ref().unwrap();
+
             match self.protocol {
-                ImageProtocol::Kitty | ImageProtocol::ITerm2 => {
-                    if let std::collections::hash_map::Entry::Vacant(e) = self.encoded.entry(url)
-                        && let Ok(png_data) = encode_png(img)
-                    {
-                        let base64 = BASE64.encode(&png_data);
-                        e.insert(EncodedPng {
-                            png_size: png_data.len(),
-                            base64,
-                        });
-                    }
+                ImageProtocol::Kitty => {
+                    self.kitty_images.entry(url).or_insert_with(|| {
+                        let (img_w, img_h) = img.dimensions();
+                        let capped_cols = content_width.min(MAX_IMAGE_COLS);
+                        let (cols, rows) = calc_display_cells(
+                            img_w, img_h, capped_cols, MAX_IMAGE_ROWS, cell_aspect,
+                        );
+                        let target_w = (cols as u32 * cell_w_px).max(1);
+                        let target_h = (rows as u32 * cell_h_px).max(1);
+                        let resized =
+                            img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+                        let png = encode_png(&resized);
+                        self.next_kitty_id += 1;
+                        KittyImage {
+                            id: self.next_kitty_id,
+                            cols,
+                            rows,
+                            target_w,
+                            target_h,
+                            cell_h_px,
+                            pending_png: Some(png),
+                        }
+                    });
                 }
+
+                ImageProtocol::ITerm2 => {
+                    self.iterm2_strips.entry(url).or_insert_with(|| {
+                        let (img_w, img_h) = img.dimensions();
+                        let capped_cols = content_width.min(MAX_IMAGE_COLS);
+                        let (cols, rows) = calc_display_cells(
+                            img_w, img_h, capped_cols, MAX_IMAGE_ROWS, cell_aspect,
+                        );
+                        let target_w = (cols as u32 * cell_w_px).max(1);
+                        let target_h = (rows as u32 * cell_h_px).max(1);
+                        let resized =
+                            img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+                        let strip_h = cell_h_px;
+                        let mut strips = Vec::with_capacity(rows);
+                        for r in 0..rows {
+                            let y = r as u32 * strip_h;
+                            let h = strip_h.min(target_h.saturating_sub(y)).max(1);
+                            let strip = resized.crop_imm(0, y, target_w, h);
+                            let png = encode_png(&strip);
+                            strips.push(encode_iterm2_strip(&png, cols));
+                        }
+                        strips
+                    });
+                }
+
                 ImageProtocol::HalfBlock => {
                     self.resized.entry(url).or_insert_with(|| {
                         let (img_w, img_h) = img.dimensions();
                         let max_half_rows = (MAX_IMAGE_ROWS * 2) as f64;
-                        let max_cols = content_width as f64;
+                        let max_cols = content_width.min(MAX_IMAGE_COLS) as f64;
 
-                        // Account for cell aspect ratio:
-                        // Each half-block pixel is 1 col wide × 0.5 rows tall.
-                        // On-screen aspect of one pixel: cell_w / (cell_h/2) = 2/cell_aspect.
-                        // Target resize ratio to preserve image aspect:
-                        //   new_w/new_h = (img_w/img_h) * cell_aspect / 2
-                        let target_ratio = (img_w as f64 * cell_aspect) / (img_h as f64 * 2.0);
+                        let target_ratio =
+                            (img_w as f64 * cell_aspect) / (img_h as f64 * 2.0);
 
                         let h_if_w = max_cols / target_ratio;
                         let w_if_h = max_half_rows * target_ratio;
 
                         let (new_w, new_h) = if h_if_w <= max_half_rows {
-                            // Width-constrained
                             (max_cols.round() as u32, h_if_w.round().max(1.0) as u32)
                         } else {
-                            // Height-constrained
                             (w_if_h.round().max(1.0) as u32, max_half_rows as u32)
                         };
 
-                        img.resize_exact(new_w.max(1), new_h.max(1), FilterType::Triangle)
+                        img.resize_exact(new_w.max(1), new_h.max(1), FilterType::Lanczos3)
                             .to_rgba8()
                     });
                 }
@@ -240,101 +401,176 @@ impl ImageCache {
         }
     }
 
-    /// For Kitty protocol: transmit any images not yet sent to the terminal.
-    /// Images are stored with an ID so subsequent frames only need small
-    /// placement commands instead of re-sending full image data.
-    pub fn ensure_kitty_transmitted(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        if self.protocol != ImageProtocol::Kitty {
-            return Ok(());
-        }
-        let urls: Vec<String> = self
-            .encoded
-            .keys()
-            .filter(|url| !self.kitty_ids.contains_key(*url))
-            .cloned()
-            .collect();
-        for url in urls {
-            let enc = &self.encoded[&url];
-            self.next_kitty_id += 1;
-            let id = self.next_kitty_id;
-            transmit_kitty_image(stdout, &enc.base64, id)?;
-            self.kitty_ids.insert(url, id);
-        }
-        Ok(())
-    }
-
-    /// For Kitty protocol: delete all visible image placements.
-    /// Image data remains in memory (keyed by ID) for re-placement.
-    pub fn clear_kitty_placements(&self, stdout: &mut impl Write) -> io::Result<()> {
-        if self.protocol == ImageProtocol::Kitty {
-            write!(stdout, "\x1b_Ga=d,d=a,q=2\x1b\\")?;
-        }
-        Ok(())
-    }
-
-    /// Render a cached image to stdout at the given position.
-    /// The image is rendered within the available area, preserving aspect ratio
-    /// and centered horizontally.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_to(
+    /// Render a single image row. Returns true if the row was rendered.
+    pub fn render_image_row(
         &self,
         stdout: &mut impl Write,
         url: &str,
-        x: u16,
-        y: u16,
-        available_width: usize,
-        available_height: usize,
+        image_row: usize,
+        content_width: usize,
         bg: Color,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         match self.protocol {
             ImageProtocol::Kitty => {
-                if let Some(&id) = self.kitty_ids.get(url) {
-                    let (cols, rows) = self
-                        .display_size(url, available_width, available_height)
-                        .unwrap_or((available_width, available_height));
-                    let x_off = (available_width.saturating_sub(cols)) / 2;
-                    render_kitty_placement(
-                        stdout,
-                        id,
-                        x + x_off as u16,
-                        y,
-                        cols,
-                        rows,
-                    )?;
-                }
+                self.render_kitty_row(stdout, url, image_row, content_width)
             }
             ImageProtocol::ITerm2 => {
-                if let Some(enc) = self.encoded.get(url) {
-                    let (cols, rows) = self
-                        .display_size(url, available_width, available_height)
-                        .unwrap_or((available_width, available_height));
-                    let x_off = (available_width.saturating_sub(cols)) / 2;
-                    render_iterm2_cached(
-                        stdout,
-                        &enc.base64,
-                        enc.png_size,
-                        x + x_off as u16,
-                        y,
-                        cols,
-                        rows,
-                    )?;
-                }
+                self.render_iterm2_row(stdout, url, image_row, content_width)
             }
             ImageProtocol::HalfBlock => {
-                if let Some(resized) = self.resized.get(url) {
-                    render_halfblock_cached(
-                        stdout,
-                        resized,
-                        x,
-                        y,
-                        available_width,
-                        available_height,
-                        bg,
-                    )?;
-                }
+                self.render_halfblock_row(stdout, url, image_row, content_width, bg)
+            }
+        }
+    }
+
+    /// Transmit any Kitty images that haven't been uploaded to the terminal yet.
+    /// Call this once per frame, before placing images.
+    pub fn transmit_pending_kitty(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        for ki in self.kitty_images.values_mut() {
+            if let Some(png_data) = ki.pending_png.take() {
+                transmit_kitty_image(stdout, &png_data, ki.id)?;
             }
         }
         Ok(())
+    }
+
+    fn render_kitty_row(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        content_width: usize,
+    ) -> io::Result<bool> {
+        let ki = match self.kitty_images.get(url) {
+            Some(ki) => ki,
+            None => return Ok(false),
+        };
+        if image_row >= ki.rows {
+            return Ok(false);
+        }
+
+        let x_offset = content_width.saturating_sub(ki.cols) / 2;
+        if x_offset > 0 {
+            write!(stdout, "{}", " ".repeat(x_offset))?;
+        }
+        // Place a sub-rectangle of the already-uploaded image
+        let src_y = image_row as u32 * ki.cell_h_px;
+        let src_h = ki.cell_h_px.min(ki.target_h.saturating_sub(src_y)).max(1);
+        place_kitty_image(stdout, ki.id, ki.cols, src_y, ki.target_w, src_h)?;
+        // Kitty doesn't advance cursor — write spaces to fill the content width
+        write!(stdout, "{}", " ".repeat(content_width - x_offset))?;
+        Ok(true)
+    }
+
+    fn render_iterm2_row(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        content_width: usize,
+    ) -> io::Result<bool> {
+        let strips = match self.iterm2_strips.get(url) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let strip_seq = match strips.get(image_row) {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+        let (cols, _rows) = match self.display_size(url, content_width, MAX_IMAGE_ROWS) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        let x_offset = content_width.saturating_sub(cols) / 2;
+        if x_offset > 0 {
+            write!(stdout, "{}", " ".repeat(x_offset))?;
+        }
+        // Write pre-encoded escape sequence directly
+        stdout.write_all(strip_seq)?;
+        let filled = x_offset + cols;
+        if filled < content_width {
+            write!(stdout, "{}", " ".repeat(content_width - filled))?;
+        }
+        Ok(true)
+    }
+
+    fn render_halfblock_row(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        available_width: usize,
+        bg: Color,
+    ) -> io::Result<bool> {
+        let resized = match self.resized.get(url) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+
+        let new_w = resized.width() as usize;
+        let new_h = resized.height() as usize;
+        let x_offset = available_width.saturating_sub(new_w) / 2;
+
+        let (bg_r, bg_g, bg_b) = match bg {
+            Color::Rgb { r, g, b } => (r, g, b),
+            _ => (30, 30, 46),
+        };
+
+        let py_top = (image_row * 2) as u32;
+        let py_bot = (image_row * 2 + 1) as u32;
+
+        use std::fmt::Write as FmtWrite;
+        let mut buf = String::with_capacity(available_width * 30);
+        let mut cur_fg: (u8, u8, u8) = (0, 0, 0);
+        let mut cur_bg_c: (u8, u8, u8) = (0, 0, 0);
+        let mut first = true;
+
+        for col in 0..available_width {
+            let in_image = col >= x_offset && col < x_offset + new_w;
+            let cx = if in_image {
+                (col - x_offset) as u32
+            } else {
+                0
+            };
+
+            let fg = if in_image && py_top < new_h as u32 {
+                let p = resized.get_pixel(cx, py_top);
+                let a = p[3] as f64 / 255.0;
+                (
+                    (p[0] as f64 * a + bg_r as f64 * (1.0 - a)) as u8,
+                    (p[1] as f64 * a + bg_g as f64 * (1.0 - a)) as u8,
+                    (p[2] as f64 * a + bg_b as f64 * (1.0 - a)) as u8,
+                )
+            } else {
+                (bg_r, bg_g, bg_b)
+            };
+
+            let bg_col = if in_image && py_bot < new_h as u32 {
+                let p = resized.get_pixel(cx, py_bot);
+                let a = p[3] as f64 / 255.0;
+                (
+                    (p[0] as f64 * a + bg_r as f64 * (1.0 - a)) as u8,
+                    (p[1] as f64 * a + bg_g as f64 * (1.0 - a)) as u8,
+                    (p[2] as f64 * a + bg_b as f64 * (1.0 - a)) as u8,
+                )
+            } else {
+                (bg_r, bg_g, bg_b)
+            };
+
+            if first || fg != cur_fg {
+                let _ = write!(buf, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2);
+                cur_fg = fg;
+            }
+            if first || bg_col != cur_bg_c {
+                let _ = write!(buf, "\x1b[48;2;{};{};{}m", bg_col.0, bg_col.1, bg_col.2);
+                cur_bg_c = bg_col;
+            }
+            first = false;
+            buf.push('▀');
+        }
+        stdout.write_all(buf.as_bytes())?;
+        Ok(true)
     }
 }
 
@@ -348,7 +584,7 @@ fn downscale(img: DynamicImage, max_dim: u32) -> DynamicImage {
     let scale = max_dim as f64 / w.max(h) as f64;
     let new_w = ((w as f64 * scale).round() as u32).max(1);
     let new_h = ((h as f64 * scale).round() as u32).max(1);
-    img.resize(new_w, new_h, FilterType::Triangle)
+    img.resize(new_w, new_h, FilterType::Lanczos3)
 }
 
 fn fetch_image(url: &str) -> Option<DynamicImage> {
@@ -369,177 +605,4 @@ fn fetch_image_http(url: &str) -> Option<DynamicImage> {
     } else {
         None
     }
-}
-
-// ── Encoding ────────────────────────────────────────────────────────────────
-
-fn encode_png(img: &DynamicImage) -> io::Result<Vec<u8>> {
-    use image::ImageEncoder;
-    use image::codecs::png::PngEncoder;
-
-    let rgba = img.to_rgba8();
-    let mut png_data = Vec::new();
-    PngEncoder::new(&mut png_data)
-        .write_image(
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(io::Error::other)?;
-    Ok(png_data)
-}
-
-// ── Cached rendering ────────────────────────────────────────────────────────
-
-/// Transmit image data to the terminal with a Kitty image ID (no display).
-fn transmit_kitty_image(stdout: &mut impl Write, b64: &str, id: u32) -> io::Result<()> {
-    let chunk_size = 4096;
-    let b64_bytes = b64.as_bytes();
-
-    if b64_bytes.len() <= chunk_size {
-        write!(
-            stdout,
-            "\x1b_Gf=100,a=t,t=d,i={},q=2;{}\x1b\\",
-            id, b64
-        )?;
-    } else {
-        let mut offset = 0;
-        let mut first = true;
-        while offset < b64_bytes.len() {
-            let end = (offset + chunk_size).min(b64_bytes.len());
-            let chunk = std::str::from_utf8(&b64_bytes[offset..end]).unwrap_or("");
-            let more = if end < b64_bytes.len() { 1 } else { 0 };
-
-            if first {
-                write!(
-                    stdout,
-                    "\x1b_Gf=100,a=t,t=d,i={},q=2,m={};{}\x1b\\",
-                    id, more, chunk
-                )?;
-                first = false;
-            } else {
-                write!(stdout, "\x1b_Gm={};{}\x1b\\", more, chunk)?;
-            }
-            offset = end;
-        }
-    }
-
-    Ok(())
-}
-
-/// Place a previously transmitted Kitty image at a screen position.
-fn render_kitty_placement(
-    stdout: &mut impl Write,
-    id: u32,
-    x: u16,
-    y: u16,
-    cols: usize,
-    rows: usize,
-) -> io::Result<()> {
-    queue!(stdout, MoveTo(x, y))?;
-    write!(
-        stdout,
-        "\x1b_Ga=p,i={},c={},r={},q=2\x1b\\",
-        id, cols, rows
-    )?;
-    Ok(())
-}
-
-fn render_iterm2_cached(
-    stdout: &mut impl Write,
-    b64: &str,
-    png_size: usize,
-    x: u16,
-    y: u16,
-    width: usize,
-    height: usize,
-) -> io::Result<()> {
-    queue!(stdout, MoveTo(x, y))?;
-    write!(
-        stdout,
-        "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=1:{}\x07",
-        png_size, width, height, b64
-    )?;
-
-    Ok(())
-}
-
-fn render_halfblock_cached(
-    stdout: &mut impl Write,
-    resized: &RgbaImage,
-    x: u16,
-    y: u16,
-    width: usize,
-    height: usize,
-    bg: Color,
-) -> io::Result<()> {
-    let new_w = resized.width() as usize;
-    let new_h = resized.height() as usize;
-
-    // Center the image horizontally
-    let x_offset = width.saturating_sub(new_w) / 2;
-
-    let (bg_r, bg_g, bg_b) = match bg {
-        Color::Rgb { r, g, b } => (r, g, b),
-        _ => (30, 30, 46),
-    };
-
-    for row in 0..height {
-        queue!(stdout, MoveTo(x, y + row as u16))?;
-        let py_top = (row * 2) as u32;
-        let py_bot = (row * 2 + 1) as u32;
-
-        for col in 0..width {
-            // Map display column to image pixel column (centered)
-            let in_image = col >= x_offset && col < x_offset + new_w;
-            let cx = if in_image {
-                (col - x_offset) as u32
-            } else {
-                0
-            };
-
-            let (tr, tg, tb) = if in_image && py_top < new_h as u32 {
-                let p = resized.get_pixel(cx, py_top);
-                let a = p[3] as f64 / 255.0;
-                (
-                    (p[0] as f64 * a + bg_r as f64 * (1.0 - a)) as u8,
-                    (p[1] as f64 * a + bg_g as f64 * (1.0 - a)) as u8,
-                    (p[2] as f64 * a + bg_b as f64 * (1.0 - a)) as u8,
-                )
-            } else {
-                (bg_r, bg_g, bg_b)
-            };
-
-            let (br, bg_c, bb) = if in_image && py_bot < new_h as u32 {
-                let p = resized.get_pixel(cx, py_bot);
-                let a = p[3] as f64 / 255.0;
-                (
-                    (p[0] as f64 * a + bg_r as f64 * (1.0 - a)) as u8,
-                    (p[1] as f64 * a + bg_g as f64 * (1.0 - a)) as u8,
-                    (p[2] as f64 * a + bg_b as f64 * (1.0 - a)) as u8,
-                )
-            } else {
-                (bg_r, bg_g, bg_b)
-            };
-
-            queue!(
-                stdout,
-                SetForegroundColor(Color::Rgb {
-                    r: tr,
-                    g: tg,
-                    b: tb,
-                }),
-                SetBackgroundColor(Color::Rgb {
-                    r: br,
-                    g: bg_c,
-                    b: bb,
-                }),
-                Print("▀"),
-            )?;
-        }
-        queue!(stdout, SetAttribute(Attribute::Reset))?;
-    }
-
-    Ok(())
 }

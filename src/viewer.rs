@@ -10,7 +10,8 @@ use crossterm::{
     execute, queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
 
@@ -1185,6 +1186,17 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     let content_width = width.saturating_sub(4);
     let theme = &state.theme;
 
+    // Synchronized output: batch all writes so the terminal renders them atomically,
+    // preventing flicker when clearing image areas and re-rendering images on top.
+    queue!(stdout, BeginSynchronizedUpdate)?;
+
+    // Clear stale Kitty image placements before redrawing, then upload any
+    // pending images (transmitted once, placed cheaply per-frame).
+    if state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
+        crate::image::kitty_delete_all(stdout)?;
+        state.image_cache.transmit_pending_kitty(stdout)?;
+    }
+
     // Determine which lines to show
     let (_display_lines, _display_offset) = if state.slide_mode {
         let start = state
@@ -1250,14 +1262,6 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     // Content
     for row in 0..viewport {
         queue!(stdout, MoveTo(0, (row + 1) as u16))?;
-        queue!(
-            stdout,
-            SetBackgroundColor(theme.bg),
-            SetForegroundColor(theme.border),
-            Print("│ "),
-            SetAttribute(Attribute::Reset),
-            SetBackgroundColor(theme.bg),
-        )?;
 
         let line_idx = if state.slide_mode {
             let start = state
@@ -1270,48 +1274,86 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             state.offset + row
         };
 
-        if let Some(line) = state.wrapped.get(line_idx) {
-            let highlights = if !state.slide_mode {
-                state.search.highlights_for_line(line_idx)
-            } else {
-                vec![]
-            };
-            let highlighted;
-            let spans: &[StyledSpan] = if highlights.is_empty() {
-                &line.spans
-            } else {
-                highlighted = apply_search_highlights(&line.spans, &highlights, theme);
-                &highlighted
-            };
+        queue!(
+            stdout,
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.border),
+            Print("│ "),
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(theme.bg),
+        )?;
 
-            let mut col = 0;
-            for span in spans {
-                write_span(stdout, span, Some(theme.bg))?;
-                col += span.text.chars().count();
-            }
-            if col < content_width {
-                let common_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                    if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                        Some(bg)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(bg) = common_bg {
-                    queue!(
+        let mut drew_inline_image = false;
+        if let Some(line) = state.wrapped.get(line_idx) {
+            // Render image pixels inline (like code blocks) for all protocols
+            if let LineMeta::Image {
+                ref url,
+                row: image_row,
+                ..
+            } = line.meta
+            {
+                if state.image_cache.has_image(url) {
+                    drew_inline_image = state.image_cache.render_image_row(
                         stdout,
-                        SetBackgroundColor(bg),
-                        Print(" ".repeat(content_width - col)),
-                        SetAttribute(Attribute::Reset),
-                        SetBackgroundColor(theme.bg),
+                        url,
+                        image_row,
+                        content_width,
+                        theme.bg,
                     )?;
+                }
+            }
+
+            if !drew_inline_image {
+                let highlights = if !state.slide_mode {
+                    state.search.highlights_for_line(line_idx)
                 } else {
-                    queue!(stdout, Print(" ".repeat(content_width - col)))?;
+                    vec![]
+                };
+                let highlighted;
+                let spans: &[StyledSpan] = if highlights.is_empty() {
+                    &line.spans
+                } else {
+                    highlighted = apply_search_highlights(&line.spans, &highlights, theme);
+                    &highlighted
+                };
+
+                let mut col = 0;
+                for span in spans {
+                    write_span(stdout, span, Some(theme.bg))?;
+                    col += span.text.chars().count();
+                }
+                if col < content_width {
+                    let common_bg =
+                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                                Some(bg)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(bg) = common_bg {
+                        queue!(
+                            stdout,
+                            SetBackgroundColor(bg),
+                            Print(" ".repeat(content_width - col)),
+                            SetAttribute(Attribute::Reset),
+                            SetBackgroundColor(theme.bg),
+                        )?;
+                    } else {
+                        queue!(stdout, Print(" ".repeat(content_width - col)))?;
+                    }
                 }
             }
         } else {
             queue!(stdout, Print(" ".repeat(content_width)))?;
         }
+
+        // Reset attributes after content (needed after halfblock raw ANSI output)
+        queue!(
+            stdout,
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(theme.bg),
+        )?;
 
         // Scrollbar / right border
         if has_scrollbar && row >= thumb_start && row < thumb_end {
@@ -1336,11 +1378,11 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         }
     }
 
+    // Images are rendered inline during the content loop (like code blocks),
+    // so no separate overlay pass is needed.
+
     // Status bar
     render_status_bar(stdout, state)?;
-
-    // Render images (queued into same buffer as text, flushed together at end)
-    render_images(stdout, state)?;
 
     // Overlays (rendered on top)
     match state.mode {
@@ -1350,58 +1392,10 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         _ => {}
     }
 
+    queue!(stdout, EndSynchronizedUpdate)?;
     stdout.flush()
 }
 
-fn render_images(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<()> {
-    // Kitty: transmit new images once (data stored by ID in terminal memory),
-    // then clear old placements. Subsequent frames only send tiny placement commands.
-    state.image_cache.ensure_kitty_transmitted(stdout)?;
-    state.image_cache.clear_kitty_placements(stdout)?;
-
-    let viewport = state.viewport();
-    let content_width = state.content_width();
-
-    for row in 0..viewport {
-        let line_idx = if state.slide_mode {
-            let start = state
-                .slide_boundaries
-                .get(state.current_slide)
-                .copied()
-                .unwrap_or(0);
-            start + row
-        } else {
-            state.offset + row
-        };
-
-        if let Some(line) = state.wrapped.get(line_idx)
-            && let LineMeta::Image {
-                ref url,
-                row: 0,
-                total_rows,
-                ..
-            } = line.meta
-            && state.image_cache.has_image(url)
-        {
-            let visible_rows = total_rows.min(viewport.saturating_sub(row));
-            if visible_rows > 0 {
-                let screen_y = (row + 1) as u16; // +1 for title bar
-                let screen_x = 2u16; // after "│ "
-                // Ignore errors from image rendering — don't crash the viewer
-                let _ = state.image_cache.render_to(
-                    stdout,
-                    url,
-                    screen_x,
-                    screen_y,
-                    content_width,
-                    visible_rows,
-                    state.theme.bg,
-                );
-            }
-        }
-    }
-    Ok(())
-}
 
 fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
     let width = state.cols as usize;
