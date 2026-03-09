@@ -7,13 +7,14 @@ use crossterm::{
         MouseEventKind, read,
     },
     execute, queue,
-    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
 
 use crate::style::{Line, StyledSpan, wrap_lines};
+use crate::theme::Theme;
 
 /// RAII guard to restore terminal state on drop (including panics).
 struct TerminalGuard;
@@ -142,7 +143,8 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
 
     let (mut cols, mut rows) = size()?;
     let content_width = (cols as usize).saturating_sub(4);
-    let lines = crate::markdown::render(content, content_width);
+    let mut theme = Theme::dark();
+    let lines = crate::markdown::render(content, content_width, &theme);
     let mut wrapped = wrap_lines(&lines, content_width);
     let mut offset: usize = 0;
     let mut search = SearchState::new();
@@ -162,6 +164,7 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
             viewport,
             filename,
             &search,
+            &theme,
         )?;
 
         match read()? {
@@ -198,6 +201,18 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
                                 search.clear();
                             } else {
                                 break;
+                            }
+                        }
+
+                        KeyCode::Char('t') => {
+                            theme = theme.toggle();
+                            let content_width = (cols as usize).saturating_sub(4);
+                            let lines =
+                                crate::markdown::render(content, content_width, &theme);
+                            wrapped = wrap_lines(&lines, content_width);
+                            if search.has_results() {
+                                search.find_matches(&wrapped);
+                                search.jump_nearest(offset);
                             }
                         }
 
@@ -256,7 +271,7 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
                 cols = c;
                 rows = r;
                 let content_width = (cols as usize).saturating_sub(4);
-                let lines = crate::markdown::render(content, content_width);
+                let lines = crate::markdown::render(content, content_width, &theme);
                 wrapped = wrap_lines(&lines, content_width);
                 if search.has_results() {
                     search.find_matches(&wrapped);
@@ -279,6 +294,7 @@ fn scroll_to_match(search: &SearchState, offset: &mut usize, viewport: usize, ma
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     stdout: &mut io::Stdout,
     lines: &[Line],
@@ -287,23 +303,26 @@ fn render_frame(
     viewport: usize,
     filename: &str,
     search: &SearchState,
+    theme: &Theme,
 ) -> io::Result<()> {
-    let border_fg = Color::Rgb {
-        r: 55,
-        g: 58,
-        b: 65,
-    };
-    let label_fg = Color::Rgb {
-        r: 120,
-        g: 125,
-        b: 140,
-    };
-    let pos_fg = Color::Rgb {
-        r: 90,
-        g: 95,
-        b: 110,
-    };
     let content_width = width.saturating_sub(4); // │ + space + content + space + │
+
+    // Scrollbar calculation
+    let total = lines.len();
+    let has_scrollbar = total > viewport && viewport > 0;
+    let (thumb_start, thumb_end) = if has_scrollbar {
+        let thumb_size = (viewport * viewport / total).max(1).min(viewport);
+        let max_off = total.saturating_sub(viewport);
+        let track_range = viewport.saturating_sub(thumb_size);
+        let pos = if max_off > 0 && track_range > 0 {
+            offset * track_range / max_off
+        } else {
+            0
+        };
+        (pos, (pos + thumb_size).min(viewport))
+    } else {
+        (0, 0)
+    };
 
     // ── Top border: ╭─ filename ──...──╮ ──
     let file_label = format!(" {} ", filename);
@@ -313,11 +332,11 @@ fn render_frame(
     queue!(
         stdout,
         MoveTo(0, 0),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("╭─"),
-        SetForegroundColor(label_fg),
+        SetForegroundColor(theme.title),
         Print(&file_label),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print(format!("{}╮", "─".repeat(top_fill))),
         SetAttribute(Attribute::Reset),
     )?;
@@ -329,7 +348,7 @@ fn render_frame(
         // Left border
         queue!(
             stdout,
-            SetForegroundColor(border_fg),
+            SetForegroundColor(theme.border),
             Print("│ "),
             SetAttribute(Attribute::Reset),
         )?;
@@ -340,7 +359,7 @@ fn render_frame(
             let spans: &[StyledSpan] = if highlights.is_empty() {
                 &line.spans
             } else {
-                highlighted = apply_search_highlights(&line.spans, &highlights);
+                highlighted = apply_search_highlights(&line.spans, &highlights, theme);
                 &highlighted
             };
 
@@ -351,8 +370,6 @@ fn render_frame(
             }
             if col < content_width {
                 // Only extend background when all spans share the same bg
-                // (e.g. code block lines). Avoids inline code bg bleeding.
-                // Check original spans, not highlighted ones.
                 let common_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
                     if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
                         Some(bg)
@@ -375,25 +392,37 @@ fn render_frame(
             queue!(stdout, Print(" ".repeat(content_width)))?;
         }
 
-        // Right border
-        queue!(
-            stdout,
-            SetForegroundColor(border_fg),
-            Print(" │"),
-            SetAttribute(Attribute::Reset),
-        )?;
+        // Right border / scrollbar
+        if has_scrollbar && row >= thumb_start && row < thumb_end {
+            queue!(
+                stdout,
+                SetForegroundColor(theme.scrollbar_thumb),
+                Print(" ┃"),
+                SetAttribute(Attribute::Reset),
+            )?;
+        } else {
+            let bar_color = if has_scrollbar {
+                theme.scrollbar_track
+            } else {
+                theme.border
+            };
+            queue!(
+                stdout,
+                SetForegroundColor(bar_color),
+                Print(" │"),
+                SetAttribute(Attribute::Reset),
+            )?;
+        }
     }
 
     // ── Bottom border ──
     if search.input_active {
-        render_search_bar(stdout, &search.input_buf, width, viewport, border_fg)?;
+        render_search_bar(stdout, &search.input_buf, width, viewport, theme)?;
     } else if search.has_results() {
         let position = format_position(lines, offset, viewport);
-        render_results_bar(
-            stdout, &position, width, viewport, border_fg, pos_fg, search,
-        )?;
+        render_results_bar(stdout, &position, width, viewport, theme, search)?;
     } else {
-        render_position_bar(stdout, lines, offset, width, viewport, border_fg, pos_fg)?;
+        render_position_bar(stdout, lines, offset, width, viewport, theme)?;
     }
 
     stdout.flush()
@@ -404,13 +433,8 @@ fn render_search_bar(
     input: &str,
     width: usize,
     viewport: usize,
-    border_fg: Color,
+    theme: &Theme,
 ) -> io::Result<()> {
-    let search_fg = Color::Rgb {
-        r: 200,
-        g: 170,
-        b: 80,
-    };
     let search_label = format!(" /{}█ ", input);
     let search_label_len = search_label.chars().count();
     let fill = width.saturating_sub(3 + search_label_len);
@@ -418,11 +442,11 @@ fn render_search_bar(
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("╰─"),
-        SetForegroundColor(search_fg),
+        SetForegroundColor(theme.search_prompt),
         Print(&search_label),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("─".repeat(fill)),
         Print("╯"),
         SetAttribute(Attribute::Reset),
@@ -434,8 +458,7 @@ fn render_results_bar(
     position: &str,
     width: usize,
     viewport: usize,
-    border_fg: Color,
-    pos_fg: Color,
+    theme: &Theme,
     search: &SearchState,
 ) -> io::Result<()> {
     let pos_label = format!(" {} ", position);
@@ -449,17 +472,9 @@ fn render_results_bar(
     let search_info_len = search_info.chars().count();
 
     let search_info_fg = if search.matches.is_empty() {
-        Color::Rgb {
-            r: 200,
-            g: 80,
-            b: 80,
-        }
+        theme.search_no_match
     } else {
-        Color::Rgb {
-            r: 200,
-            g: 170,
-            b: 80,
-        }
+        theme.search_prompt
     };
 
     let fill = width.saturating_sub(4 + search_info_len + pos_label_len);
@@ -467,15 +482,15 @@ fn render_results_bar(
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("╰─"),
         SetForegroundColor(search_info_fg),
         Print(&search_info),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("─".repeat(fill)),
-        SetForegroundColor(pos_fg),
+        SetForegroundColor(theme.position),
         Print(&pos_label),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("─╯"),
         SetAttribute(Attribute::Reset),
     )
@@ -487,22 +502,45 @@ fn render_position_bar(
     offset: usize,
     width: usize,
     viewport: usize,
-    border_fg: Color,
-    pos_fg: Color,
+    theme: &Theme,
 ) -> io::Result<()> {
     let position = format_position(lines, offset, viewport);
     let pos_label = format!(" {} ", position);
-    let pos_label_len = pos_label.chars().count();
-    let bot_fill = width.saturating_sub(3 + pos_label_len);
+    let pos_len = pos_label.chars().count();
+
+    let hint = " / search · t theme ";
+    let hint_len = hint.chars().count();
+
+    // Only show hints if there's enough room
+    let needed = 4 + hint_len + pos_len;
+    let (show_hint, fill) = if width > needed {
+        (true, width - needed)
+    } else {
+        (false, width.saturating_sub(4 + pos_len))
+    };
 
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
-        SetForegroundColor(border_fg),
-        Print(format!("╰{}", "─".repeat(bot_fill))),
-        SetForegroundColor(pos_fg),
+        SetForegroundColor(theme.border),
+        Print("╰─"),
+    )?;
+
+    if show_hint {
+        queue!(
+            stdout,
+            SetForegroundColor(theme.help_hint),
+            Print(hint),
+        )?;
+    }
+
+    queue!(
+        stdout,
+        SetForegroundColor(theme.border),
+        Print("─".repeat(fill)),
+        SetForegroundColor(theme.position),
         Print(&pos_label),
-        SetForegroundColor(border_fg),
+        SetForegroundColor(theme.border),
         Print("─╯"),
         SetAttribute(Attribute::Reset),
     )
@@ -524,22 +562,11 @@ fn format_position(lines: &[Line], offset: usize, viewport: usize) -> String {
 fn apply_search_highlights(
     spans: &[StyledSpan],
     highlights: &[(usize, usize, bool)],
+    theme: &Theme,
 ) -> Vec<StyledSpan> {
-    let match_bg = Color::Rgb {
-        r: 100,
-        g: 80,
-        b: 0,
-    };
-    let current_bg = Color::Rgb {
-        r: 200,
-        g: 150,
-        b: 20,
-    };
-    let current_fg = Color::Rgb {
-        r: 20,
-        g: 20,
-        b: 20,
-    };
+    let match_bg = theme.search_match_bg;
+    let current_bg = theme.search_current_bg;
+    let current_fg = theme.search_current_fg;
 
     let mut result = Vec::new();
     let mut char_offset = 0;

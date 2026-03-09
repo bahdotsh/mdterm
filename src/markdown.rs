@@ -6,8 +6,10 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 use crate::style::{Line, Style, StyledSpan};
+use crate::theme::Theme;
 
-struct Renderer {
+struct Renderer<'a> {
+    theme: &'a Theme,
     lines: Vec<Line>,
     current_spans: Vec<StyledSpan>,
     width: usize,
@@ -52,9 +54,10 @@ enum ListKind {
     Ordered(u64),
 }
 
-impl Renderer {
-    fn new(width: usize) -> Self {
+impl<'a> Renderer<'a> {
+    fn new(width: usize, theme: &'a Theme) -> Self {
         Renderer {
+            theme,
             lines: Vec::new(),
             current_spans: Vec::new(),
             width,
@@ -89,44 +92,24 @@ impl Renderer {
             style.bold = true;
             match level {
                 HeadingLevel::H1 => {
-                    style.fg = Some(Color::White);
+                    style.fg = Some(self.theme.h1);
                 }
                 HeadingLevel::H2 => {
-                    style.fg = Some(Color::Rgb {
-                        r: 138,
-                        g: 180,
-                        b: 248,
-                    });
+                    style.fg = Some(self.theme.h2);
                 }
                 HeadingLevel::H3 => {
-                    style.fg = Some(Color::Rgb {
-                        r: 190,
-                        g: 145,
-                        b: 230,
-                    });
+                    style.fg = Some(self.theme.h3);
                 }
                 HeadingLevel::H4 => {
-                    style.fg = Some(Color::Rgb {
-                        r: 129,
-                        g: 199,
-                        b: 132,
-                    });
+                    style.fg = Some(self.theme.h4);
                     style.bold = false;
                 }
                 HeadingLevel::H5 => {
-                    style.fg = Some(Color::Rgb {
-                        r: 255,
-                        g: 183,
-                        b: 77,
-                    });
+                    style.fg = Some(self.theme.h5);
                     style.bold = false;
                 }
                 HeadingLevel::H6 => {
-                    style.fg = Some(Color::Rgb {
-                        r: 130,
-                        g: 130,
-                        b: 140,
-                    });
+                    style.fg = Some(self.theme.h6);
                     style.bold = false;
                     style.dim = true;
                 }
@@ -163,11 +146,7 @@ impl Renderer {
                 spans.push(StyledSpan {
                     text: "  ┃ ".to_string(),
                     style: Style {
-                        fg: Some(Color::Rgb {
-                            r: 100,
-                            g: 130,
-                            b: 180,
-                        }),
+                        fg: Some(self.theme.blockquote_bar),
                         ..Default::default()
                     },
                 });
@@ -189,11 +168,7 @@ impl Renderer {
                 spans: vec![StyledSpan {
                     text: "  ┃".to_string(),
                     style: Style {
-                        fg: Some(Color::Rgb {
-                            r: 100,
-                            g: 130,
-                            b: 180,
-                        }),
+                        fg: Some(self.theme.blockquote_bar),
                         ..Default::default()
                     },
                 }],
@@ -206,21 +181,9 @@ impl Renderer {
     fn emit_code_block(&mut self) {
         let lang = self.code_block_lang.trim().to_string();
         let code = std::mem::take(&mut self.code_block_content);
-        let code_bg = Color::Rgb {
-            r: 30,
-            g: 33,
-            b: 40,
-        };
-        let border_fg = Color::Rgb {
-            r: 55,
-            g: 58,
-            b: 65,
-        };
-        let label_fg = Color::Rgb {
-            r: 110,
-            g: 115,
-            b: 130,
-        };
+        let code_bg = self.theme.code_bg;
+        let border_fg = self.theme.code_border;
+        let label_fg = self.theme.code_label;
 
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -230,8 +193,12 @@ impl Renderer {
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
         };
 
-        let theme = &self.theme_set.themes["base16-ocean.dark"];
-        let mut highlighter = HighlightLines::new(syntax, theme);
+        let syntect_theme = self
+            .theme_set
+            .themes
+            .get(self.theme.syntect_theme)
+            .unwrap_or_else(|| &self.theme_set.themes["base16-ocean.dark"]);
+        let mut highlighter = HighlightLines::new(syntax, syntect_theme);
 
         // Measure content to size the box
         let code_lines: Vec<&str> = code.lines().collect();
@@ -357,16 +324,8 @@ impl Renderer {
     }
 
     fn emit_table(&mut self) {
-        let border_fg = Color::Rgb {
-            r: 55,
-            g: 58,
-            b: 65,
-        };
-        let header_fg = Color::Rgb {
-            r: 138,
-            g: 180,
-            b: 248,
-        };
+        let border_fg = self.theme.table_border;
+        let header_fg = self.theme.table_header;
 
         let all_rows: Vec<&Vec<Vec<StyledSpan>>> = std::iter::once(&self.table_head)
             .chain(self.table_rows.iter())
@@ -389,14 +348,11 @@ impl Renderer {
         }
 
         // Constrain to available width
-        // Table line: "  │ cell │ cell │ ... │"
-        // Overhead = 2 (indent) + (num_cols+1) (borders) + num_cols*2 (padding)
         let overhead = 3 + 3 * num_cols;
         let total_natural: usize = col_widths.iter().sum();
         let available = self.width.saturating_sub(overhead);
 
         if available > 0 && total_natural > available {
-            // Keep small columns at natural width, shrink only the wide ones
             let fair_share = available / num_cols;
             let mut fixed_width = 0usize;
             let mut flex_natural = 0usize;
@@ -561,16 +517,11 @@ impl Renderer {
                     // Major sections (H1/H2) get a visible separator line
                     if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
                         self.push_empty_line();
-                        let sep_fg = Color::Rgb {
-                            r: 45,
-                            g: 48,
-                            b: 58,
-                        };
                         self.lines.push(Line {
                             spans: vec![StyledSpan {
                                 text: "─".repeat(self.width.min(60)),
                                 style: Style {
-                                    fg: Some(sep_fg),
+                                    fg: Some(self.theme.heading_separator),
                                     dim: true,
                                     ..Default::default()
                                 },
@@ -588,11 +539,8 @@ impl Renderer {
                         self.push_span(
                             "▸ ",
                             Style {
-                                fg: Some(Color::Rgb {
-                                    r: 130,
-                                    g: 100,
-                                    b: 170,
-                                }),
+                                fg: Some(self.theme.h3),
+                                dim: true,
                                 ..Default::default()
                             },
                         );
@@ -601,11 +549,8 @@ impl Renderer {
                         self.push_span(
                             "  ▸ ",
                             Style {
-                                fg: Some(Color::Rgb {
-                                    r: 100,
-                                    g: 160,
-                                    b: 100,
-                                }),
+                                fg: Some(self.theme.h4),
+                                dim: true,
                                 ..Default::default()
                             },
                         );
@@ -614,11 +559,8 @@ impl Renderer {
                         self.push_span(
                             "    ▸ ",
                             Style {
-                                fg: Some(Color::Rgb {
-                                    r: 180,
-                                    g: 140,
-                                    b: 60,
-                                }),
+                                fg: Some(self.theme.h5),
+                                dim: true,
                                 ..Default::default()
                             },
                         );
@@ -627,11 +569,7 @@ impl Renderer {
                         self.push_span(
                             "      ▸ ",
                             Style {
-                                fg: Some(Color::Rgb {
-                                    r: 100,
-                                    g: 100,
-                                    b: 110,
-                                }),
+                                fg: Some(self.theme.h6),
                                 dim: true,
                                 ..Default::default()
                             },
@@ -640,8 +578,24 @@ impl Renderer {
                     _ => {}
                 }
             }
-            Event::End(TagEnd::Heading(_)) => {
+            Event::End(TagEnd::Heading(level)) => {
                 self.flush_line();
+                // Add subtle underline decoration for H1
+                if matches!(level, HeadingLevel::H1) {
+                    let last_w = self.lines.last().map(|l| l.display_width()).unwrap_or(0);
+                    if last_w > 0 {
+                        self.lines.push(Line {
+                            spans: vec![StyledSpan {
+                                text: "━".repeat(last_w.min(self.width)),
+                                style: Style {
+                                    fg: Some(self.theme.h1),
+                                    dim: true,
+                                    ..Default::default()
+                                },
+                            }],
+                        });
+                    }
+                }
                 self.heading_level = None;
                 self.push_empty_line();
             }
@@ -710,11 +664,7 @@ impl Renderer {
                 self.push_span(
                     &bullet,
                     Style {
-                        fg: Some(Color::Rgb {
-                            r: 120,
-                            g: 120,
-                            b: 120,
-                        }),
+                        fg: Some(self.theme.bullet),
                         ..Default::default()
                     },
                 );
@@ -736,11 +686,7 @@ impl Renderer {
                 self.push_span(
                     &format!(" {}", url),
                     Style {
-                        fg: Some(Color::Rgb {
-                            r: 90,
-                            g: 90,
-                            b: 90,
-                        }),
+                        fg: Some(self.theme.link_url),
                         ..Default::default()
                     },
                 );
@@ -795,11 +741,7 @@ impl Renderer {
                     self.code_block_content.push_str(&text);
                 } else if self.in_link {
                     let mut style = self.current_style();
-                    style.fg = Some(Color::Rgb {
-                        r: 120,
-                        g: 170,
-                        b: 240,
-                    });
+                    style.fg = Some(self.theme.link);
                     style.underline = true;
                     self.push_span(&text, style);
                 } else {
@@ -810,29 +752,13 @@ impl Renderer {
 
             Event::Code(code) => {
                 let tick_style = Style {
-                    fg: Some(Color::Rgb {
-                        r: 70,
-                        g: 70,
-                        b: 80,
-                    }),
-                    bg: Some(Color::Rgb {
-                        r: 40,
-                        g: 42,
-                        b: 48,
-                    }),
+                    fg: Some(self.theme.inline_code_tick),
+                    bg: Some(self.theme.inline_code_bg),
                     ..Default::default()
                 };
                 let code_style = Style {
-                    fg: Some(Color::Rgb {
-                        r: 230,
-                        g: 175,
-                        b: 110,
-                    }),
-                    bg: Some(Color::Rgb {
-                        r: 40,
-                        g: 42,
-                        b: 48,
-                    }),
+                    fg: Some(self.theme.inline_code_fg),
+                    bg: Some(self.theme.inline_code_bg),
                     ..Default::default()
                 };
                 if self.in_table {
@@ -869,11 +795,7 @@ impl Renderer {
                     spans: vec![StyledSpan {
                         text: "─".repeat(40),
                         style: Style {
-                            fg: Some(Color::Rgb {
-                                r: 60,
-                                g: 60,
-                                b: 60,
-                            }),
+                            fg: Some(self.theme.rule),
                             ..Default::default()
                         },
                     }],
@@ -883,23 +805,9 @@ impl Renderer {
 
             Event::TaskListMarker(checked) => {
                 let (marker, color) = if checked {
-                    (
-                        "✓ ",
-                        Color::Rgb {
-                            r: 120,
-                            g: 200,
-                            b: 120,
-                        },
-                    )
+                    ("✓ ", self.theme.task_done)
                 } else {
-                    (
-                        "○ ",
-                        Color::Rgb {
-                            r: 100,
-                            g: 100,
-                            b: 100,
-                        },
-                    )
+                    ("○ ", self.theme.task_pending)
                 };
                 self.push_span(
                     marker,
@@ -1057,8 +965,8 @@ fn syntect_to_style(syn: SynStyle) -> Style {
     }
 }
 
-pub fn render(input: &str, width: usize) -> Vec<Line> {
-    let mut renderer = Renderer::new(width);
+pub fn render(input: &str, width: usize, theme: &Theme) -> Vec<Line> {
+    let mut renderer = Renderer::new(width, theme);
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);

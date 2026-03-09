@@ -1,5 +1,6 @@
 mod markdown;
 mod style;
+mod theme;
 mod viewer;
 
 use std::io::IsTerminal;
@@ -30,7 +31,8 @@ fn main() {
         let width = crossterm::terminal::size()
             .map(|(c, _)| c as usize)
             .unwrap_or(80);
-        let lines = markdown::render(&content, width);
+        let t = theme::Theme::dark();
+        let lines = markdown::render(&content, width, &t);
         viewer::print_lines(&lines);
     }
 }
