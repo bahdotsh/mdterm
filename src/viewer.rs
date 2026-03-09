@@ -423,23 +423,37 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             }
         }
         Event::Mouse(me) => match me.kind {
-            MouseEventKind::ScrollDown => {
-                if state.slide_mode {
+            MouseEventKind::ScrollDown => match state.mode {
+                ViewMode::Toc => {
+                    handle_toc(state, KeyCode::Down);
+                }
+                ViewMode::FuzzyHeading => {
+                    handle_fuzzy(state, KeyCode::Down, KeyModifiers::empty());
+                }
+                _ if state.slide_mode => {
                     if state.current_slide + 1 < state.slide_boundaries.len() {
                         state.current_slide += 1;
                     }
-                } else {
+                }
+                _ => {
                     let max = state.max_offset();
                     state.offset = (state.offset + 3).min(max);
                 }
-            }
-            MouseEventKind::ScrollUp => {
-                if state.slide_mode {
+            },
+            MouseEventKind::ScrollUp => match state.mode {
+                ViewMode::Toc => {
+                    handle_toc(state, KeyCode::Up);
+                }
+                ViewMode::FuzzyHeading => {
+                    handle_fuzzy(state, KeyCode::Up, KeyModifiers::empty());
+                }
+                _ if state.slide_mode => {
                     state.current_slide = state.current_slide.saturating_sub(1);
-                } else {
+                }
+                _ => {
                     state.offset = state.offset.saturating_sub(3);
                 }
-            }
+            },
             _ => {}
         },
         Event::Resize(c, r) => {
@@ -512,6 +526,14 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                     if entry.line_idx <= state.offset {
                         state.toc_selected = i;
                     }
+                }
+                // Ensure scroll shows the selected entry
+                let viewport = state.viewport();
+                let count = state.toc_entries.len();
+                let box_h = (count + 2).min(viewport.saturating_sub(4));
+                let visible_entries = box_h.saturating_sub(2);
+                if visible_entries > 0 && state.toc_selected >= visible_entries {
+                    state.toc_scroll = state.toc_selected - visible_entries + 1;
                 }
                 state.mode = ViewMode::Toc;
             }
@@ -692,8 +714,8 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
     }
 
     let viewport = state.viewport();
-    let box_h = (count + 2).min(viewport.saturating_sub(4));
-    let visible_entries = box_h.saturating_sub(2);
+    let box_h = (count + 2).min(viewport.saturating_sub(4).max(3));
+    let visible_entries = box_h.saturating_sub(2).max(1);
 
     match code {
         KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => {
@@ -706,6 +728,12 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
             if state.toc_selected + 1 < count {
                 state.toc_selected += 1;
             }
+        }
+        KeyCode::PageUp => {
+            state.toc_selected = state.toc_selected.saturating_sub(visible_entries);
+        }
+        KeyCode::PageDown => {
+            state.toc_selected = (state.toc_selected + visible_entries).min(count - 1);
         }
         KeyCode::Home | KeyCode::Char('g') => {
             state.toc_selected = 0;
@@ -723,12 +751,10 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
     }
 
     // Update scroll to keep selection visible
-    if visible_entries > 0 {
-        if state.toc_selected >= state.toc_scroll + visible_entries {
-            state.toc_scroll = state.toc_selected - visible_entries + 1;
-        } else if state.toc_selected < state.toc_scroll {
-            state.toc_scroll = state.toc_selected;
-        }
+    if state.toc_selected >= state.toc_scroll + visible_entries {
+        state.toc_scroll = state.toc_selected - visible_entries + 1;
+    } else if state.toc_selected < state.toc_scroll {
+        state.toc_scroll = state.toc_selected;
     }
 }
 
@@ -760,25 +786,36 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
 
 fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
     let viewport = state.viewport();
-    let max_visible = viewport.saturating_sub(6);
+    let max_visible = viewport.saturating_sub(6).max(1);
 
     // Ctrl+n / Ctrl+p for navigation without conflicting with typing
     let is_nav_down = code == KeyCode::Down
+        || code == KeyCode::PageDown
         || (code == KeyCode::Char('n') && mods.contains(KeyModifiers::CONTROL));
-    let is_nav_up =
-        code == KeyCode::Up || (code == KeyCode::Char('p') && mods.contains(KeyModifiers::CONTROL));
+    let is_nav_up = code == KeyCode::Up
+        || code == KeyCode::PageUp
+        || (code == KeyCode::Char('p') && mods.contains(KeyModifiers::CONTROL));
 
     if is_nav_up {
-        state.fuzzy_selected = state.fuzzy_selected.saturating_sub(1);
+        let step = if code == KeyCode::PageUp {
+            max_visible
+        } else {
+            1
+        };
+        state.fuzzy_selected = state.fuzzy_selected.saturating_sub(step);
     } else if is_nav_down {
-        let count = fuzzy_filter(&state.toc_entries, &state.fuzzy_input).len();
-        if state.fuzzy_selected + 1 < count {
-            state.fuzzy_selected += 1;
-        }
+        let step = if code == KeyCode::PageDown {
+            max_visible
+        } else {
+            1
+        };
+        state.fuzzy_selected += step;
+        // Will be clamped below
     } else {
         match code {
             KeyCode::Esc => {
                 state.mode = ViewMode::Normal;
+                return;
             }
             KeyCode::Char(c) => {
                 state.fuzzy_input.push(c);
@@ -798,26 +835,24 @@ fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
                     state.offset = target.min(max);
                 }
                 state.mode = ViewMode::Normal;
+                return;
             }
             _ => {}
         }
     }
 
-    // Clamp selected to filtered results
+    // Clamp selected to filtered results and update scroll
     let count = fuzzy_filter(&state.toc_entries, &state.fuzzy_input).len();
     if count == 0 {
         state.fuzzy_selected = 0;
         state.fuzzy_scroll = 0;
     } else {
         state.fuzzy_selected = state.fuzzy_selected.min(count - 1);
-        // Update scroll to keep selection visible
         let visible = count.min(max_visible);
-        if visible > 0 {
-            if state.fuzzy_selected >= state.fuzzy_scroll + visible {
-                state.fuzzy_scroll = state.fuzzy_selected - visible + 1;
-            } else if state.fuzzy_selected < state.fuzzy_scroll {
-                state.fuzzy_scroll = state.fuzzy_selected;
-            }
+        if state.fuzzy_selected >= state.fuzzy_scroll + visible {
+            state.fuzzy_scroll = state.fuzzy_selected - visible + 1;
+        } else if state.fuzzy_selected < state.fuzzy_scroll {
+            state.fuzzy_scroll = state.fuzzy_selected;
         }
     }
 }
@@ -1392,8 +1427,8 @@ fn render_toc_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resul
     let viewport = state.viewport();
 
     let box_w = (width * 2 / 3).max(30).min(width.saturating_sub(6));
-    let box_h = (entries.len() + 2).min(viewport.saturating_sub(4));
-    let visible_entries = box_h.saturating_sub(2);
+    let box_h = (entries.len() + 2).min(viewport.saturating_sub(4).max(3));
+    let visible_entries = box_h.saturating_sub(2).max(1);
     let x_off = (width.saturating_sub(box_w)) / 2;
     let y_off = (viewport.saturating_sub(box_h)) / 2 + 1;
 
@@ -1502,8 +1537,18 @@ fn render_toc_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resul
         }
     }
 
-    let footer = " j/k navigate · Enter jump · Esc close ";
-    let footer_len = footer.chars().count();
+    // Scroll indicators
+    let has_above = scroll > 0;
+    let has_below = scroll + visible_entries < entries.len();
+    let scroll_hint = match (has_above, has_below) {
+        (true, true) => " ▲▼ ",
+        (true, false) => " ▲ ",
+        (false, true) => " ▼ ",
+        (false, false) => "",
+    };
+
+    let footer = " j/k ↑↓ navigate · Enter jump · Esc close ";
+    let footer_len = footer.chars().count() + scroll_hint.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
 
     queue!(
@@ -1514,6 +1559,16 @@ fn render_toc_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resul
         Print("╰─"),
         SetForegroundColor(theme.overlay_muted),
         Print(footer),
+    )?;
+    if !scroll_hint.is_empty() {
+        queue!(
+            stdout,
+            SetForegroundColor(theme.overlay_text),
+            Print(scroll_hint),
+        )?;
+    }
+    queue!(
+        stdout,
         SetForegroundColor(theme.overlay_border),
         Print(format!("{}╯", "─".repeat(bot_dashes))),
         SetAttribute(Attribute::Reset),
@@ -1628,7 +1683,7 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
     let total = filtered.len();
 
     let box_w = (width * 2 / 3).max(30).min(width.saturating_sub(6));
-    let max_entries = viewport.saturating_sub(6);
+    let max_entries = viewport.saturating_sub(6).max(1);
     // Show at least 1 row for "no results" message
     let visible = if total == 0 {
         1
@@ -1650,6 +1705,22 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
         format!("{}/{} ", state.fuzzy_selected + 1, total)
     };
     let input_display = format!(" > {}█ ", state.fuzzy_input);
+    // Truncate input display if it would overflow the box
+    let input_display = if input_display.chars().count() > box_w.saturating_sub(6) {
+        let max_input_len = box_w.saturating_sub(10); // leave room for borders + count
+        let suffix: String = state
+            .fuzzy_input
+            .chars()
+            .rev()
+            .take(max_input_len.saturating_sub(5))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!(" > …{}█ ", suffix)
+    } else {
+        input_display
+    };
     let input_len = input_display.chars().count();
     let count_len = count_label.chars().count();
     let top_dashes = box_w.saturating_sub(3 + input_len + count_len + 1);
@@ -1774,8 +1845,18 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
         }
     }
 
+    // Scroll indicators
+    let has_above = scroll > 0;
+    let has_below = total > 0 && scroll + visible < total;
+    let scroll_hint = match (has_above, has_below) {
+        (true, true) => " ▲▼ ",
+        (true, false) => " ▲ ",
+        (false, true) => " ▼ ",
+        (false, false) => "",
+    };
+
     let footer = " type to filter · ↑↓ select · Enter jump · Esc ";
-    let footer_len = footer.chars().count();
+    let footer_len = footer.chars().count() + scroll_hint.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
 
     queue!(
@@ -1786,6 +1867,16 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
         Print("╰─"),
         SetForegroundColor(theme.overlay_muted),
         Print(footer),
+    )?;
+    if !scroll_hint.is_empty() {
+        queue!(
+            stdout,
+            SetForegroundColor(theme.overlay_text),
+            Print(scroll_hint),
+        )?;
+    }
+    queue!(
+        stdout,
         SetForegroundColor(theme.overlay_border),
         Print(format!("{}╯", "─".repeat(bot_dashes))),
         SetAttribute(Attribute::Reset),
