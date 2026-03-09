@@ -207,8 +207,7 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
                         KeyCode::Char('t') => {
                             theme = theme.toggle();
                             let content_width = (cols as usize).saturating_sub(4);
-                            let lines =
-                                crate::markdown::render(content, content_width, &theme);
+                            let lines = crate::markdown::render(content, content_width, &theme);
                             wrapped = wrap_lines(&lines, content_width);
                             if search.has_results() {
                                 search.find_matches(&wrapped);
@@ -535,11 +534,7 @@ fn render_position_bar(
     )?;
 
     if show_hint {
-        queue!(
-            stdout,
-            SetForegroundColor(theme.help_hint),
-            Print(hint),
-        )?;
+        queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint),)?;
     }
 
     queue!(
