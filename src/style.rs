@@ -30,6 +30,13 @@ pub enum LineMeta {
         block_id: usize,
     },
     SlideBreak,
+    #[allow(dead_code)]
+    Image {
+        url: String,
+        alt: String,
+        row: usize,
+        total_rows: usize,
+    },
 }
 
 #[derive(Clone, Debug, Default)]

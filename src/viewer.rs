@@ -45,7 +45,7 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         let max_offset = state.max_offset();
         state.offset = state.offset.min(max_offset);
 
-        render_frame(&mut stdout, &state)?;
+        render_frame(&mut stdout, &mut state)?;
 
         // Clear transient status after rendering so it shows for one frame
         state.status_msg = None;
@@ -72,8 +72,26 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
 pub fn print_lines(lines: &[Line]) {
     let mut stdout = io::stdout();
     for line in lines {
-        for span in &line.spans {
-            let _ = write_span(&mut stdout, span, None);
+        if let LineMeta::Image {
+            ref url,
+            ref alt,
+            row,
+            ..
+        } = line.meta
+        {
+            if row == 0 {
+                let _ = write!(
+                    stdout,
+                    "\x1b[38;2;166;227;161m\x1b[2m[img: {}] ({})\x1b[0m",
+                    alt, url
+                );
+            } else {
+                continue;
+            }
+        } else {
+            for span in &line.spans {
+                let _ = write_span(&mut stdout, span, None);
+            }
         }
         let _ = writeln!(stdout);
     }
@@ -82,8 +100,22 @@ pub fn print_lines(lines: &[Line]) {
 pub fn print_lines_plain(lines: &[Line]) {
     let mut stdout = io::stdout();
     for line in lines {
-        for span in &line.spans {
-            let _ = write!(stdout, "{}", span.text);
+        if let LineMeta::Image {
+            ref url,
+            ref alt,
+            row,
+            ..
+        } = line.meta
+        {
+            if row == 0 {
+                let _ = write!(stdout, "[img: {}] ({})", alt, url);
+            } else {
+                continue;
+            }
+        } else {
+            for span in &line.spans {
+                let _ = write!(stdout, "{}", span.text);
+            }
         }
         let _ = writeln!(stdout);
     }
@@ -167,6 +199,9 @@ struct ViewerState {
 
     // Status message
     status_msg: Option<String>,
+
+    // Image cache
+    image_cache: crate::image::ImageCache,
 }
 
 #[derive(Clone)]
@@ -231,6 +266,7 @@ impl ViewerState {
             slide_boundaries: Vec::new(),
             last_mtime,
             status_msg: None,
+            image_cache: crate::image::ImageCache::new(),
         }
     }
 
@@ -292,6 +328,59 @@ impl ViewerState {
                     });
                 }
             }
+        }
+
+        // Fetch images, pre-render, and adjust placeholder rows
+        {
+            let mut seen = std::collections::HashSet::new();
+            for line in &self.wrapped {
+                if let LineMeta::Image {
+                    ref url, row: 0, ..
+                } = line.meta
+                    && seen.insert(url.clone())
+                {
+                    self.image_cache.fetch_if_missing(url);
+                }
+            }
+            self.image_cache.pre_render(cw);
+
+            // Adjust image placeholder rows to match actual image aspect ratio
+            let mut new_wrapped = Vec::with_capacity(self.wrapped.len());
+            let mut i = 0;
+            while i < self.wrapped.len() {
+                if let LineMeta::Image {
+                    ref url,
+                    row: 0,
+                    total_rows,
+                    ref alt,
+                } = self.wrapped[i].meta
+                {
+                    let url = url.clone();
+                    let alt = alt.clone();
+                    let actual_rows = self
+                        .image_cache
+                        .ideal_rows(&url, cw)
+                        .unwrap_or(total_rows);
+
+                    for r in 0..actual_rows {
+                        new_wrapped.push(Line {
+                            spans: vec![],
+                            meta: LineMeta::Image {
+                                url: url.clone(),
+                                alt: alt.clone(),
+                                row: r,
+                                total_rows: actual_rows,
+                            },
+                        });
+                    }
+                    // Skip the original placeholder rows
+                    i += total_rows;
+                } else {
+                    new_wrapped.push(self.wrapped[i].clone());
+                    i += 1;
+                }
+            }
+            self.wrapped = new_wrapped;
         }
 
         // Build slide boundaries
@@ -459,6 +548,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
         Event::Resize(c, r) => {
             state.cols = c;
             state.rows = r;
+            state.image_cache.update_cell_aspect();
             state.rebuild();
         }
         _ => {}
@@ -1089,7 +1179,7 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-fn render_frame(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
+fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<()> {
     let width = state.cols as usize;
     let viewport = state.viewport();
     let content_width = width.saturating_sub(4);
@@ -1249,6 +1339,9 @@ fn render_frame(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> 
     // Status bar
     render_status_bar(stdout, state)?;
 
+    // Render images (queued into same buffer as text, flushed together at end)
+    render_images(stdout, state)?;
+
     // Overlays (rendered on top)
     match state.mode {
         ViewMode::Toc => render_toc_overlay(stdout, state)?,
@@ -1258,6 +1351,56 @@ fn render_frame(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> 
     }
 
     stdout.flush()
+}
+
+fn render_images(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<()> {
+    // Kitty: transmit new images once (data stored by ID in terminal memory),
+    // then clear old placements. Subsequent frames only send tiny placement commands.
+    state.image_cache.ensure_kitty_transmitted(stdout)?;
+    state.image_cache.clear_kitty_placements(stdout)?;
+
+    let viewport = state.viewport();
+    let content_width = state.content_width();
+
+    for row in 0..viewport {
+        let line_idx = if state.slide_mode {
+            let start = state
+                .slide_boundaries
+                .get(state.current_slide)
+                .copied()
+                .unwrap_or(0);
+            start + row
+        } else {
+            state.offset + row
+        };
+
+        if let Some(line) = state.wrapped.get(line_idx)
+            && let LineMeta::Image {
+                ref url,
+                row: 0,
+                total_rows,
+                ..
+            } = line.meta
+            && state.image_cache.has_image(url)
+        {
+            let visible_rows = total_rows.min(viewport.saturating_sub(row));
+            if visible_rows > 0 {
+                let screen_y = (row + 1) as u16; // +1 for title bar
+                let screen_x = 2u16; // after "│ "
+                // Ignore errors from image rendering — don't crash the viewer
+                let _ = state.image_cache.render_to(
+                    stdout,
+                    url,
+                    screen_x,
+                    screen_y,
+                    content_width,
+                    visible_rows,
+                    state.theme.bg,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {

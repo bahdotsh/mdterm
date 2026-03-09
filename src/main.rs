@@ -1,6 +1,7 @@
 mod config;
 mod diagram;
 mod export;
+mod image;
 mod markdown;
 mod style;
 mod theme;

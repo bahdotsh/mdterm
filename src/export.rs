@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use crossterm::style::Color;
 
 use crate::markdown;
-use crate::style::wrap_lines;
+use crate::style::{LineMeta, wrap_lines};
 use crate::theme::Theme;
 
 pub fn to_html(content: &str, width: usize, theme: &Theme) {
@@ -23,6 +23,25 @@ pub fn to_html(content: &str, width: usize, theme: &Theme) {
     let _ = writeln!(out, "</head><body>");
 
     for line in &wrapped {
+        // Handle image placeholder lines
+        if let LineMeta::Image {
+            ref url,
+            ref alt,
+            row,
+            ..
+        } = line.meta
+        {
+            if row == 0 {
+                let _ = writeln!(
+                    out,
+                    "<div class='line'><img src='{}' alt='{}' style='max-width:100%;height:auto;'></div>",
+                    html_escape(url),
+                    html_escape(alt)
+                );
+            }
+            continue;
+        }
+
         let _ = write!(out, "<div class='line'>");
         if line.spans.is_empty() {
             let _ = write!(out, "&nbsp;");

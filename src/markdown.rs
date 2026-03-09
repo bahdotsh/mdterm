@@ -891,24 +891,42 @@ impl<'a> Renderer<'a> {
                     std::mem::take(&mut self.image_alt)
                 };
                 let url = std::mem::take(&mut self.image_url);
+
+                // Flush any pending content
+                self.flush_line();
+
+                let total_rows = crate::image::IMAGE_ROWS;
+
+                // Push placeholder lines for the image
+                for row in 0..total_rows {
+                    self.lines.push(Line {
+                        spans: vec![],
+                        meta: LineMeta::Image {
+                            url: url.clone(),
+                            alt: alt.clone(),
+                            row,
+                            total_rows,
+                        },
+                    });
+                }
+
+                // Caption line below the image
                 self.push_span(
-                    &format!("[img: {}]", alt),
+                    &format!("  {}", alt),
                     Style {
                         fg: Some(self.theme.image_fg),
                         dim: true,
+                        italic: true,
+                        link_url: if url.is_empty() {
+                            None
+                        } else {
+                            Some(url.clone())
+                        },
                         ..Default::default()
                     },
                 );
-                if !url.is_empty() {
-                    self.push_span(
-                        &format!(" ({})", url),
-                        Style {
-                            fg: Some(self.theme.overlay_muted),
-                            dim: true,
-                            ..Default::default()
-                        },
-                    );
-                }
+                self.flush_line();
+
                 self.in_image = false;
             }
 
