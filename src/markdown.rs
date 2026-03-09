@@ -5,6 +5,7 @@ use syntect::highlighting::{FontStyle, Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use crate::diagram;
 use crate::style::{CodeBlockContent, DocumentInfo, Line, LineMeta, Style, StyledSpan};
 use crate::theme::Theme;
 
@@ -227,6 +228,14 @@ impl<'a> Renderer<'a> {
         // Check for special diagram blocks
         let is_diagram = matches!(lang.as_str(), "mermaid" | "plantuml" | "dot" | "graphviz");
 
+        // Try to render mermaid diagrams visually
+        if lang == "mermaid"
+            && let Some((diagram_rows, diagram_width)) = diagram::render_mermaid(&code, self.theme)
+        {
+            self.emit_diagram_block(block_id, &diagram_rows, diagram_width);
+            return;
+        }
+
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
         } else {
@@ -362,6 +371,107 @@ impl<'a> Renderer<'a> {
             }
 
             let padding = content_width.saturating_sub(char_count) + 1;
+            spans.push(StyledSpan {
+                text: " ".repeat(padding),
+                style: Style {
+                    bg: Some(code_bg),
+                    ..Default::default()
+                },
+            });
+            spans.push(StyledSpan {
+                text: "│".to_string(),
+                style: Style {
+                    fg: Some(border_fg),
+                    ..Default::default()
+                },
+            });
+
+            self.lines.push(Line {
+                spans,
+                meta: LineMeta::CodeContent { block_id },
+            });
+        }
+
+        // Bottom border
+        self.lines.push(Line {
+            spans: vec![StyledSpan {
+                text: format!("  ╰{}╯", "─".repeat(inner_width)),
+                style: Style {
+                    fg: Some(border_fg),
+                    ..Default::default()
+                },
+            }],
+            meta: LineMeta::CodeContent { block_id },
+        });
+    }
+
+    fn emit_diagram_block(
+        &mut self,
+        block_id: usize,
+        diagram_rows: &[Vec<StyledSpan>],
+        diagram_width: usize,
+    ) {
+        let border_fg = self.theme.code_border;
+        let label_fg = self.theme.code_label;
+        let code_bg = self.theme.code_bg;
+
+        let content_width = diagram_width.max(40);
+        let inner_width = content_width + 2;
+
+        // Top border with label
+        let label = " mermaid (diagram) ";
+        let label_len = label.chars().count();
+        let dashes_after = inner_width.saturating_sub(1 + label_len);
+        self.lines.push(Line {
+            spans: vec![
+                StyledSpan {
+                    text: "  ╭─".to_string(),
+                    style: Style {
+                        fg: Some(border_fg),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: label.to_string(),
+                    style: Style {
+                        fg: Some(label_fg),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: format!("{}╮", "─".repeat(dashes_after)),
+                    style: Style {
+                        fg: Some(border_fg),
+                        ..Default::default()
+                    },
+                },
+            ],
+            meta: LineMeta::CodeContent { block_id },
+        });
+
+        // Diagram content rows
+        for row_spans in diagram_rows {
+            let mut spans = vec![
+                StyledSpan {
+                    text: "  │".to_string(),
+                    style: Style {
+                        fg: Some(border_fg),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: " ".to_string(),
+                    style: Style {
+                        bg: Some(code_bg),
+                        ..Default::default()
+                    },
+                },
+            ];
+
+            let row_width: usize = row_spans.iter().map(|s| s.text.chars().count()).sum();
+            spans.extend(row_spans.iter().cloned());
+
+            let padding = content_width.saturating_sub(row_width) + 1;
             spans.push(StyledSpan {
                 text: " ".repeat(padding),
                 style: Style {

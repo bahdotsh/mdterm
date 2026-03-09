@@ -1,4 +1,5 @@
 mod config;
+mod diagram;
 mod export;
 mod markdown;
 mod style;
