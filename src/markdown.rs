@@ -68,12 +68,12 @@ impl Renderer {
         if let Some(level) = self.heading_level {
             style.bold = true;
             style.fg = Some(match level {
-                HeadingLevel::H1 => Color::Cyan,
-                HeadingLevel::H2 => Color::Green,
-                HeadingLevel::H3 => Color::Yellow,
-                HeadingLevel::H4 => Color::Magenta,
-                HeadingLevel::H5 => Color::Blue,
-                HeadingLevel::H6 => Color::Red,
+                HeadingLevel::H1 => Color::White,
+                HeadingLevel::H2 => Color::Rgb { r: 138, g: 180, b: 248 },
+                HeadingLevel::H3 => Color::Rgb { r: 190, g: 145, b: 230 },
+                HeadingLevel::H4 => Color::Rgb { r: 129, g: 199, b: 132 },
+                HeadingLevel::H5 => Color::Rgb { r: 255, g: 183, b: 77 },
+                HeadingLevel::H6 => Color::Rgb { r: 150, g: 150, b: 150 },
             });
         }
 
@@ -87,7 +87,7 @@ impl Renderer {
             style.strikethrough = true;
         }
         if self.in_blockquote {
-            style.dim = true;
+            style.italic = true;
         }
 
         style
@@ -105,9 +105,9 @@ impl Renderer {
             let mut spans = Vec::new();
             if self.in_blockquote {
                 spans.push(StyledSpan {
-                    text: "  │ ".to_string(),
+                    text: "  ┃ ".to_string(),
                     style: Style {
-                        fg: Some(Color::DarkGrey),
+                        fg: Some(Color::Rgb { r: 100, g: 130, b: 180 }),
                         ..Default::default()
                     },
                 });
@@ -121,9 +121,9 @@ impl Renderer {
         if self.in_blockquote {
             self.lines.push(Line {
                 spans: vec![StyledSpan {
-                    text: "  │".to_string(),
+                    text: "  ┃".to_string(),
                     style: Style {
-                        fg: Some(Color::DarkGrey),
+                        fg: Some(Color::Rgb { r: 100, g: 130, b: 180 }),
                         ..Default::default()
                     },
                 }],
@@ -136,6 +136,8 @@ impl Renderer {
     fn emit_code_block(&mut self) {
         let lang = self.code_block_lang.trim().to_string();
         let code = std::mem::take(&mut self.code_block_content);
+        let code_bg = Color::Rgb { r: 35, g: 38, b: 46 };
+        let border_fg = Color::Rgb { r: 65, g: 65, b: 70 };
 
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -148,7 +150,7 @@ impl Renderer {
         let theme = &self.theme_set.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
-        // Top border
+        // Top border with language label
         let label = if lang.is_empty() {
             String::new()
         } else {
@@ -159,7 +161,7 @@ impl Renderer {
             spans: vec![StyledSpan {
                 text: format!("  ╭─{}{}╮", label, "─".repeat(border_width)),
                 style: Style {
-                    fg: Some(Color::DarkGrey),
+                    fg: Some(border_fg),
                     ..Default::default()
                 },
             }],
@@ -169,7 +171,8 @@ impl Renderer {
             let mut spans = vec![StyledSpan {
                 text: "  │ ".to_string(),
                 style: Style {
-                    fg: Some(Color::DarkGrey),
+                    fg: Some(border_fg),
+                    bg: Some(code_bg),
                     ..Default::default()
                 },
             }];
@@ -178,9 +181,11 @@ impl Renderer {
                 for (syn_style, text) in ranges {
                     let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
                     if !trimmed.is_empty() {
+                        let mut style = syntect_to_style(syn_style);
+                        style.bg = Some(code_bg);
                         spans.push(StyledSpan {
                             text: trimmed.to_string(),
-                            style: syntect_to_style(syn_style),
+                            style,
                         });
                     }
                 }
@@ -190,7 +195,10 @@ impl Renderer {
                         .trim_end_matches('\n')
                         .trim_end_matches('\r')
                         .to_string(),
-                    style: Style::default(),
+                    style: Style {
+                        bg: Some(code_bg),
+                        ..Default::default()
+                    },
                 });
             }
 
@@ -202,7 +210,7 @@ impl Renderer {
             spans: vec![StyledSpan {
                 text: format!("  ╰{}╯", "─".repeat(border_width + label.len() + 1)),
                 style: Style {
-                    fg: Some(Color::DarkGrey),
+                    fg: Some(border_fg),
                     ..Default::default()
                 },
             }],
@@ -228,10 +236,9 @@ impl Renderer {
                         let w = self.lines.last().map(|l| l.display_width()).unwrap_or(20);
                         self.lines.push(Line {
                             spans: vec![StyledSpan {
-                                text: "═".repeat(w.max(20)),
+                                text: "━".repeat(w.max(20)),
                                 style: Style {
-                                    fg: Some(Color::Cyan),
-                                    bold: true,
+                                    fg: Some(Color::Rgb { r: 100, g: 100, b: 100 }),
                                     ..Default::default()
                                 },
                             }],
@@ -243,7 +250,7 @@ impl Renderer {
                             spans: vec![StyledSpan {
                                 text: "─".repeat(w.max(20)),
                                 style: Style {
-                                    fg: Some(Color::Green),
+                                    fg: Some(Color::Rgb { r: 70, g: 70, b: 70 }),
                                     ..Default::default()
                                 },
                             }],
@@ -309,8 +316,7 @@ impl Renderer {
                 self.push_span(
                     &bullet,
                     Style {
-                        fg: Some(Color::Cyan),
-                        bold: true,
+                        fg: Some(Color::Rgb { r: 120, g: 120, b: 120 }),
                         ..Default::default()
                     },
                 );
@@ -326,9 +332,9 @@ impl Renderer {
             Event::End(TagEnd::Link) => {
                 let url = std::mem::take(&mut self.link_url);
                 self.push_span(
-                    &format!(" ({})", url),
+                    &format!(" {}", url),
                     Style {
-                        fg: Some(Color::DarkGrey),
+                        fg: Some(Color::Rgb { r: 90, g: 90, b: 90 }),
                         ..Default::default()
                     },
                 );
@@ -340,7 +346,7 @@ impl Renderer {
                     self.code_block_content.push_str(&text);
                 } else if self.in_link {
                     let mut style = self.current_style();
-                    style.fg = Some(Color::Blue);
+                    style.fg = Some(Color::Rgb { r: 120, g: 170, b: 240 });
                     style.underline = true;
                     self.push_span(&text, style);
                 } else {
@@ -353,7 +359,8 @@ impl Renderer {
                 self.push_span(
                     &format!(" {} ", code),
                     Style {
-                        fg: Some(Color::Yellow),
+                        fg: Some(Color::Rgb { r: 240, g: 185, b: 120 }),
+                        bg: Some(Color::Rgb { r: 45, g: 45, b: 50 }),
                         ..Default::default()
                     },
                 );
@@ -371,9 +378,9 @@ impl Renderer {
             Event::Rule => {
                 self.lines.push(Line {
                     spans: vec![StyledSpan {
-                        text: "─".repeat(60),
+                        text: "─".repeat(40),
                         style: Style {
-                            fg: Some(Color::DarkGrey),
+                            fg: Some(Color::Rgb { r: 60, g: 60, b: 60 }),
                             ..Default::default()
                         },
                     }],
@@ -382,11 +389,15 @@ impl Renderer {
             }
 
             Event::TaskListMarker(checked) => {
-                let marker = if checked { "☑ " } else { "☐ " };
+                let (marker, color) = if checked {
+                    ("✓ ", Color::Rgb { r: 120, g: 200, b: 120 })
+                } else {
+                    ("○ ", Color::Rgb { r: 100, g: 100, b: 100 })
+                };
                 self.push_span(
                     marker,
                     Style {
-                        fg: Some(Color::Cyan),
+                        fg: Some(color),
                         ..Default::default()
                     },
                 );

@@ -129,16 +129,20 @@ fn render_frame(
                 col += span.text.chars().count();
             }
             if col < width {
-                queue!(stdout, Print(" ".repeat(width - col)))?;
+                let line_bg = line.spans.iter().find_map(|s| s.style.bg);
+                if let Some(bg) = line_bg {
+                    queue!(
+                        stdout,
+                        SetBackgroundColor(bg),
+                        Print(" ".repeat(width - col)),
+                        SetAttribute(Attribute::Reset)
+                    )?;
+                } else {
+                    queue!(stdout, Print(" ".repeat(width - col)))?;
+                }
             }
         } else {
-            queue!(
-                stdout,
-                SetForegroundColor(Color::DarkGrey),
-                Print("~"),
-                SetAttribute(Attribute::Reset),
-                Print(" ".repeat(width.saturating_sub(1)))
-            )?;
+            queue!(stdout, Print(" ".repeat(width)))?;
         }
     }
 
@@ -153,26 +157,39 @@ fn render_frame(
         let pct = (offset + viewport) * 100 / lines.len();
         format!("{}%", pct)
     };
-    let status = format!(" {} │ {} │ q:quit j/k:↑↓ space:pgdn ", filename, position);
-    let padded = if status.chars().count() < width {
-        format!(
-            "{}{}",
-            status,
-            " ".repeat(width - status.chars().count())
-        )
-    } else {
-        status.chars().take(width).collect()
-    };
+    let bar_bg = Color::Rgb { r: 35, g: 38, b: 46 };
+    let left = format!(" {}", filename);
+    let right = format!("{} ", position);
+    let left_w = left.chars().count();
+    let right_w = right.chars().count();
 
     queue!(
         stdout,
         MoveTo(0, viewport as u16),
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::White),
-        SetAttribute(Attribute::Bold),
-        Print(&padded),
-        SetAttribute(Attribute::Reset),
+        SetBackgroundColor(bar_bg),
     )?;
+
+    if left_w + right_w <= width {
+        let gap = width - left_w - right_w;
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Rgb { r: 180, g: 180, b: 190 }),
+            Print(&left),
+            SetForegroundColor(Color::Rgb { r: 90, g: 90, b: 100 }),
+            Print(" ".repeat(gap)),
+            Print(&right),
+        )?;
+    } else {
+        let truncated: String = left.chars().take(width).collect();
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Rgb { r: 180, g: 180, b: 190 }),
+            Print(&truncated),
+            Print(" ".repeat(width.saturating_sub(truncated.chars().count()))),
+        )?;
+    }
+
+    queue!(stdout, SetAttribute(Attribute::Reset))?;
 
     stdout.flush()
 }
