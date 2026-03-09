@@ -7,7 +7,7 @@ use crossterm::{
         MouseEventKind, read,
     },
     execute, queue,
-    style::{Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
@@ -332,6 +332,7 @@ fn render_frame(
     queue!(
         stdout,
         MoveTo(0, 0),
+        SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.border),
         Print("╭─"),
         SetForegroundColor(theme.title),
@@ -348,9 +349,11 @@ fn render_frame(
         // Left border
         queue!(
             stdout,
+            SetBackgroundColor(theme.bg),
             SetForegroundColor(theme.border),
             Print("│ "),
             SetAttribute(Attribute::Reset),
+            SetBackgroundColor(theme.bg),
         )?;
 
         if let Some(line) = lines.get(offset + row) {
@@ -365,7 +368,7 @@ fn render_frame(
 
             let mut col = 0;
             for span in spans {
-                write_span(stdout, span)?;
+                write_span(stdout, span, Some(theme.bg))?;
                 col += span.text.chars().count();
             }
             if col < content_width {
@@ -382,7 +385,8 @@ fn render_frame(
                         stdout,
                         SetBackgroundColor(bg),
                         Print(" ".repeat(content_width - col)),
-                        SetAttribute(Attribute::Reset)
+                        SetAttribute(Attribute::Reset),
+                        SetBackgroundColor(theme.bg),
                     )?;
                 } else {
                     queue!(stdout, Print(" ".repeat(content_width - col)))?;
@@ -413,6 +417,7 @@ fn render_frame(
                 SetAttribute(Attribute::Reset),
             )?;
         }
+        // No restore needed — right border is the last content on the row
     }
 
     // ── Bottom border ──
@@ -442,6 +447,7 @@ fn render_search_bar(
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
+        SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.border),
         Print("╰─"),
         SetForegroundColor(theme.search_prompt),
@@ -482,6 +488,7 @@ fn render_results_bar(
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
+        SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.border),
         Print("╰─"),
         SetForegroundColor(search_info_fg),
@@ -522,6 +529,7 @@ fn render_position_bar(
     queue!(
         stdout,
         MoveTo(0, (viewport + 1) as u16),
+        SetBackgroundColor(theme.bg),
         SetForegroundColor(theme.border),
         Print("╰─"),
     )?;
@@ -623,7 +631,11 @@ fn apply_search_highlights(
     result
 }
 
-fn write_span(stdout: &mut io::Stdout, span: &StyledSpan) -> io::Result<()> {
+fn write_span(
+    stdout: &mut io::Stdout,
+    span: &StyledSpan,
+    restore_bg: Option<Color>,
+) -> io::Result<()> {
     let s = &span.style;
 
     if let Some(fg) = s.fg {
@@ -649,6 +661,9 @@ fn write_span(stdout: &mut io::Stdout, span: &StyledSpan) -> io::Result<()> {
     }
 
     queue!(stdout, Print(&span.text), SetAttribute(Attribute::Reset))?;
+    if let Some(bg) = restore_bg {
+        queue!(stdout, SetBackgroundColor(bg))?;
+    }
     Ok(())
 }
 
@@ -657,7 +672,7 @@ pub fn print_lines(lines: &[Line]) {
     let mut stdout = io::stdout();
     for line in lines {
         for span in &line.spans {
-            let _ = write_span(&mut stdout, span);
+            let _ = write_span(&mut stdout, span, None);
         }
         let _ = writeln!(stdout);
     }

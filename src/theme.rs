@@ -2,6 +2,10 @@ use crossterm::style::Color;
 
 #[derive(Clone)]
 pub struct Theme {
+    // Main background / foreground
+    pub bg: Color,
+    pub fg: Color,
+
     // Frame / chrome
     pub border: Color,
     pub title: Color,
@@ -64,6 +68,9 @@ impl Theme {
         Self {
             is_dark: true,
 
+            bg: Color::Rgb { r: 30, g: 30, b: 46 },
+            fg: Color::Rgb { r: 205, g: 214, b: 244 },
+
             border: Color::Rgb { r: 68, g: 71, b: 90 },
             title: Color::Rgb { r: 147, g: 153, b: 178 },
             position: Color::Rgb { r: 108, g: 112, b: 134 },
@@ -113,6 +120,9 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             is_dark: false,
+
+            bg: Color::Rgb { r: 239, g: 241, b: 245 },
+            fg: Color::Rgb { r: 76, g: 79, b: 105 },
 
             border: Color::Rgb { r: 172, g: 176, b: 190 },
             title: Color::Rgb { r: 92, g: 95, b: 119 },

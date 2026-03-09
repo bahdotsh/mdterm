@@ -86,7 +86,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn current_style(&self) -> Style {
-        let mut style = Style::default();
+        let mut style = Style {
+            fg: Some(self.theme.fg),
+            ..Default::default()
+        };
 
         if let Some(level) = self.heading_level {
             style.bold = true;
