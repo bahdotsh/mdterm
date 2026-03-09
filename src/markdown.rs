@@ -92,21 +92,41 @@ impl Renderer {
                     style.fg = Some(Color::White);
                 }
                 HeadingLevel::H2 => {
-                    style.fg = Some(Color::Rgb { r: 138, g: 180, b: 248 });
+                    style.fg = Some(Color::Rgb {
+                        r: 138,
+                        g: 180,
+                        b: 248,
+                    });
                 }
                 HeadingLevel::H3 => {
-                    style.fg = Some(Color::Rgb { r: 190, g: 145, b: 230 });
+                    style.fg = Some(Color::Rgb {
+                        r: 190,
+                        g: 145,
+                        b: 230,
+                    });
                 }
                 HeadingLevel::H4 => {
-                    style.fg = Some(Color::Rgb { r: 129, g: 199, b: 132 });
+                    style.fg = Some(Color::Rgb {
+                        r: 129,
+                        g: 199,
+                        b: 132,
+                    });
                     style.bold = false;
                 }
                 HeadingLevel::H5 => {
-                    style.fg = Some(Color::Rgb { r: 255, g: 183, b: 77 });
+                    style.fg = Some(Color::Rgb {
+                        r: 255,
+                        g: 183,
+                        b: 77,
+                    });
                     style.bold = false;
                 }
                 HeadingLevel::H6 => {
-                    style.fg = Some(Color::Rgb { r: 130, g: 130, b: 140 });
+                    style.fg = Some(Color::Rgb {
+                        r: 130,
+                        g: 130,
+                        b: 140,
+                    });
                     style.bold = false;
                     style.dim = true;
                 }
@@ -143,7 +163,11 @@ impl Renderer {
                 spans.push(StyledSpan {
                     text: "  ┃ ".to_string(),
                     style: Style {
-                        fg: Some(Color::Rgb { r: 100, g: 130, b: 180 }),
+                        fg: Some(Color::Rgb {
+                            r: 100,
+                            g: 130,
+                            b: 180,
+                        }),
                         ..Default::default()
                     },
                 });
@@ -155,17 +179,21 @@ impl Renderer {
 
     fn push_empty_line(&mut self) {
         // Avoid consecutive empty lines
-        if let Some(last) = self.lines.last() {
-            if last.spans.is_empty() {
-                return;
-            }
+        if let Some(last) = self.lines.last()
+            && last.spans.is_empty()
+        {
+            return;
         }
         if self.in_blockquote {
             self.lines.push(Line {
                 spans: vec![StyledSpan {
                     text: "  ┃".to_string(),
                     style: Style {
-                        fg: Some(Color::Rgb { r: 100, g: 130, b: 180 }),
+                        fg: Some(Color::Rgb {
+                            r: 100,
+                            g: 130,
+                            b: 180,
+                        }),
                         ..Default::default()
                     },
                 }],
@@ -178,9 +206,21 @@ impl Renderer {
     fn emit_code_block(&mut self) {
         let lang = self.code_block_lang.trim().to_string();
         let code = std::mem::take(&mut self.code_block_content);
-        let code_bg = Color::Rgb { r: 30, g: 33, b: 40 };
-        let border_fg = Color::Rgb { r: 55, g: 58, b: 65 };
-        let label_fg = Color::Rgb { r: 110, g: 115, b: 130 };
+        let code_bg = Color::Rgb {
+            r: 30,
+            g: 33,
+            b: 40,
+        };
+        let border_fg = Color::Rgb {
+            r: 55,
+            g: 58,
+            b: 65,
+        };
+        let label_fg = Color::Rgb {
+            r: 110,
+            g: 115,
+            b: 130,
+        };
 
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -273,9 +313,7 @@ impl Renderer {
                     }
                 }
             } else {
-                let trimmed = line_str
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r');
+                let trimmed = line_str.trim_end_matches('\n').trim_end_matches('\r');
                 char_count = trimmed.chars().count();
                 spans.push(StyledSpan {
                     text: trimmed.to_string(),
@@ -319,8 +357,16 @@ impl Renderer {
     }
 
     fn emit_table(&mut self) {
-        let border_fg = Color::Rgb { r: 55, g: 58, b: 65 };
-        let header_fg = Color::Rgb { r: 138, g: 180, b: 248 };
+        let border_fg = Color::Rgb {
+            r: 55,
+            g: 58,
+            b: 65,
+        };
+        let header_fg = Color::Rgb {
+            r: 138,
+            g: 180,
+            b: 248,
+        };
 
         let all_rows: Vec<&Vec<Vec<StyledSpan>>> = std::iter::once(&self.table_head)
             .chain(self.table_rows.iter())
@@ -439,7 +485,10 @@ impl Renderer {
                     let cell_lines = wrapped_cells.get(col_idx);
                     let cell_line = cell_lines.and_then(|cl| cl.get(vline));
 
-                    let alignment = self.table_alignments.get(col_idx).unwrap_or(&Alignment::None);
+                    let alignment = self
+                        .table_alignments
+                        .get(col_idx)
+                        .unwrap_or(&Alignment::None);
 
                     if let Some(spans_in_line) = cell_line {
                         let content_width: usize =
@@ -512,7 +561,11 @@ impl Renderer {
                     // Major sections (H1/H2) get a visible separator line
                     if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
                         self.push_empty_line();
-                        let sep_fg = Color::Rgb { r: 45, g: 48, b: 58 };
+                        let sep_fg = Color::Rgb {
+                            r: 45,
+                            g: 48,
+                            b: 58,
+                        };
                         self.lines.push(Line {
                             spans: vec![StyledSpan {
                                 text: "─".repeat(self.width.min(60)),
@@ -532,29 +585,57 @@ impl Renderer {
                 // Add a subtle level prefix for H3+
                 match level {
                     HeadingLevel::H3 => {
-                        self.push_span("▸ ", Style {
-                            fg: Some(Color::Rgb { r: 130, g: 100, b: 170 }),
-                            ..Default::default()
-                        });
+                        self.push_span(
+                            "▸ ",
+                            Style {
+                                fg: Some(Color::Rgb {
+                                    r: 130,
+                                    g: 100,
+                                    b: 170,
+                                }),
+                                ..Default::default()
+                            },
+                        );
                     }
                     HeadingLevel::H4 => {
-                        self.push_span("  ▸ ", Style {
-                            fg: Some(Color::Rgb { r: 100, g: 160, b: 100 }),
-                            ..Default::default()
-                        });
+                        self.push_span(
+                            "  ▸ ",
+                            Style {
+                                fg: Some(Color::Rgb {
+                                    r: 100,
+                                    g: 160,
+                                    b: 100,
+                                }),
+                                ..Default::default()
+                            },
+                        );
                     }
                     HeadingLevel::H5 => {
-                        self.push_span("    ▸ ", Style {
-                            fg: Some(Color::Rgb { r: 180, g: 140, b: 60 }),
-                            ..Default::default()
-                        });
+                        self.push_span(
+                            "    ▸ ",
+                            Style {
+                                fg: Some(Color::Rgb {
+                                    r: 180,
+                                    g: 140,
+                                    b: 60,
+                                }),
+                                ..Default::default()
+                            },
+                        );
                     }
                     HeadingLevel::H6 => {
-                        self.push_span("      ▸ ", Style {
-                            fg: Some(Color::Rgb { r: 100, g: 100, b: 110 }),
-                            dim: true,
-                            ..Default::default()
-                        });
+                        self.push_span(
+                            "      ▸ ",
+                            Style {
+                                fg: Some(Color::Rgb {
+                                    r: 100,
+                                    g: 100,
+                                    b: 110,
+                                }),
+                                dim: true,
+                                ..Default::default()
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -629,7 +710,11 @@ impl Renderer {
                 self.push_span(
                     &bullet,
                     Style {
-                        fg: Some(Color::Rgb { r: 120, g: 120, b: 120 }),
+                        fg: Some(Color::Rgb {
+                            r: 120,
+                            g: 120,
+                            b: 120,
+                        }),
                         ..Default::default()
                     },
                 );
@@ -651,7 +736,11 @@ impl Renderer {
                 self.push_span(
                     &format!(" {}", url),
                     Style {
-                        fg: Some(Color::Rgb { r: 90, g: 90, b: 90 }),
+                        fg: Some(Color::Rgb {
+                            r: 90,
+                            g: 90,
+                            b: 90,
+                        }),
                         ..Default::default()
                     },
                 );
@@ -684,13 +773,15 @@ impl Renderer {
                 self.table_current_row.clear();
             }
             Event::End(TagEnd::TableRow) => {
-                self.table_rows.push(std::mem::take(&mut self.table_current_row));
+                self.table_rows
+                    .push(std::mem::take(&mut self.table_current_row));
             }
             Event::Start(Tag::TableCell) => {
                 self.table_cell_spans.clear();
             }
             Event::End(TagEnd::TableCell) => {
-                self.table_current_row.push(std::mem::take(&mut self.table_cell_spans));
+                self.table_current_row
+                    .push(std::mem::take(&mut self.table_cell_spans));
             }
 
             Event::Text(text) => {
@@ -704,7 +795,11 @@ impl Renderer {
                     self.code_block_content.push_str(&text);
                 } else if self.in_link {
                     let mut style = self.current_style();
-                    style.fg = Some(Color::Rgb { r: 120, g: 170, b: 240 });
+                    style.fg = Some(Color::Rgb {
+                        r: 120,
+                        g: 170,
+                        b: 240,
+                    });
                     style.underline = true;
                     self.push_span(&text, style);
                 } else {
@@ -715,19 +810,44 @@ impl Renderer {
 
             Event::Code(code) => {
                 let tick_style = Style {
-                    fg: Some(Color::Rgb { r: 70, g: 70, b: 80 }),
-                    bg: Some(Color::Rgb { r: 40, g: 42, b: 48 }),
+                    fg: Some(Color::Rgb {
+                        r: 70,
+                        g: 70,
+                        b: 80,
+                    }),
+                    bg: Some(Color::Rgb {
+                        r: 40,
+                        g: 42,
+                        b: 48,
+                    }),
                     ..Default::default()
                 };
                 let code_style = Style {
-                    fg: Some(Color::Rgb { r: 230, g: 175, b: 110 }),
-                    bg: Some(Color::Rgb { r: 40, g: 42, b: 48 }),
+                    fg: Some(Color::Rgb {
+                        r: 230,
+                        g: 175,
+                        b: 110,
+                    }),
+                    bg: Some(Color::Rgb {
+                        r: 40,
+                        g: 42,
+                        b: 48,
+                    }),
                     ..Default::default()
                 };
                 if self.in_table {
-                    self.table_cell_spans.push(StyledSpan { text: "`".to_string(), style: tick_style.clone() });
-                    self.table_cell_spans.push(StyledSpan { text: code.to_string(), style: code_style });
-                    self.table_cell_spans.push(StyledSpan { text: "`".to_string(), style: tick_style });
+                    self.table_cell_spans.push(StyledSpan {
+                        text: "`".to_string(),
+                        style: tick_style.clone(),
+                    });
+                    self.table_cell_spans.push(StyledSpan {
+                        text: code.to_string(),
+                        style: code_style,
+                    });
+                    self.table_cell_spans.push(StyledSpan {
+                        text: "`".to_string(),
+                        style: tick_style,
+                    });
                 } else {
                     self.push_span("`", tick_style.clone());
                     self.push_span(&code, code_style);
@@ -749,7 +869,11 @@ impl Renderer {
                     spans: vec![StyledSpan {
                         text: "─".repeat(40),
                         style: Style {
-                            fg: Some(Color::Rgb { r: 60, g: 60, b: 60 }),
+                            fg: Some(Color::Rgb {
+                                r: 60,
+                                g: 60,
+                                b: 60,
+                            }),
                             ..Default::default()
                         },
                     }],
@@ -759,9 +883,23 @@ impl Renderer {
 
             Event::TaskListMarker(checked) => {
                 let (marker, color) = if checked {
-                    ("✓ ", Color::Rgb { r: 120, g: 200, b: 120 })
+                    (
+                        "✓ ",
+                        Color::Rgb {
+                            r: 120,
+                            g: 200,
+                            b: 120,
+                        },
+                    )
                 } else {
-                    ("○ ", Color::Rgb { r: 100, g: 100, b: 100 })
+                    (
+                        "○ ",
+                        Color::Rgb {
+                            r: 100,
+                            g: 100,
+                            b: 100,
+                        },
+                    )
                 };
                 self.push_span(
                     marker,
@@ -826,10 +964,7 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
         let is_ws = seg.text.starts_with(|c: char| c.is_whitespace());
         if is_ws {
             if !word_segs.is_empty() {
-                units.push(WrapUnit::Word(
-                    std::mem::take(&mut word_segs),
-                    word_width,
-                ));
+                units.push(WrapUnit::Word(std::mem::take(&mut word_segs), word_width));
                 word_width = 0;
             }
             units.push(WrapUnit::Whitespace(seg));
@@ -860,10 +995,10 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
                 // Would overflow: wrap to next line
                 if col + ww > width && col > 0 {
                     // Remove trailing whitespace
-                    if let Some(last) = current.last() {
-                        if last.text.chars().all(|c| c.is_whitespace()) {
-                            current.pop();
-                        }
+                    if let Some(last) = current.last()
+                        && last.text.chars().all(|c| c.is_whitespace())
+                    {
+                        current.pop();
                     }
                     lines.push(std::mem::take(&mut current));
                     col = 0;

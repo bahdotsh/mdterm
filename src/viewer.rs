@@ -3,17 +3,17 @@ use std::io::{self, Write};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        read, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind, read,
     },
     execute, queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
-        disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
 
-use crate::style::{wrap_lines, Line, StyledSpan};
+use crate::style::{Line, StyledSpan, wrap_lines};
 
 /// RAII guard to restore terminal state on drop (including panics).
 struct TerminalGuard;
@@ -21,12 +21,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            DisableMouseCapture,
-            Show,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -35,12 +30,7 @@ pub fn run(content: &str, filename: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
 
     enable_raw_mode()?;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        Hide,
-        EnableMouseCapture
-    )?;
+    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let _guard = TerminalGuard;
 
     let (mut cols, mut rows) = size()?;
@@ -122,9 +112,21 @@ fn render_frame(
     viewport: usize,
     filename: &str,
 ) -> io::Result<()> {
-    let border_fg = Color::Rgb { r: 55, g: 58, b: 65 };
-    let label_fg = Color::Rgb { r: 120, g: 125, b: 140 };
-    let pos_fg = Color::Rgb { r: 90, g: 95, b: 110 };
+    let border_fg = Color::Rgb {
+        r: 55,
+        g: 58,
+        b: 65,
+    };
+    let label_fg = Color::Rgb {
+        r: 120,
+        g: 125,
+        b: 140,
+    };
+    let pos_fg = Color::Rgb {
+        r: 90,
+        g: 95,
+        b: 110,
+    };
     let content_width = width.saturating_sub(4); // │ + space + content + space + │
 
     // ── Top border: ╭─ filename ──...──╮ ──

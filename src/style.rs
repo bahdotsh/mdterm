@@ -86,10 +86,10 @@ fn word_wrap(line: &Line, width: usize) -> Vec<Line> {
 
         if !is_ws && col + seg_width > width && col > 0 {
             // Remove trailing whitespace from current line
-            if let Some(last) = current.last() {
-                if last.text.chars().all(|c| c.is_whitespace()) {
-                    current.pop();
-                }
+            if let Some(last) = current.last()
+                && last.text.chars().all(|c| c.is_whitespace())
+            {
+                current.pop();
             }
             lines.push(Line {
                 spans: std::mem::take(&mut current),
