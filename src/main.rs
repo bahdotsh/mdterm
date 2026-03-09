@@ -21,14 +21,16 @@ fn main() {
         }
     };
 
-    let lines = markdown::render(&content);
-
     if std::io::stdout().is_terminal() {
-        if let Err(e) = viewer::run(lines, path) {
+        if let Err(e) = viewer::run(&content, path) {
             eprintln!("Viewer error: {}", e);
             process::exit(1);
         }
     } else {
+        let width = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80);
+        let lines = markdown::render(&content, width);
         viewer::print_lines(&lines);
     }
 }

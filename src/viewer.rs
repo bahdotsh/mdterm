@@ -31,7 +31,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(lines: Vec<Line>, filename: &str) -> io::Result<()> {
+pub fn run(content: &str, filename: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
 
     enable_raw_mode()?;
@@ -44,7 +44,9 @@ pub fn run(lines: Vec<Line>, filename: &str) -> io::Result<()> {
     let _guard = TerminalGuard;
 
     let (mut cols, mut rows) = size()?;
-    let mut wrapped = wrap_lines(&lines, (cols as usize).saturating_sub(4));
+    let content_width = (cols as usize).saturating_sub(4);
+    let lines = crate::markdown::render(content, content_width);
+    let mut wrapped = wrap_lines(&lines, content_width);
     let mut offset: usize = 0;
 
     loop {
@@ -100,7 +102,9 @@ pub fn run(lines: Vec<Line>, filename: &str) -> io::Result<()> {
             Event::Resize(c, r) => {
                 cols = c;
                 rows = r;
-                wrapped = wrap_lines(&lines, (cols as usize).saturating_sub(4));
+                let content_width = (cols as usize).saturating_sub(4);
+                let lines = crate::markdown::render(content, content_width);
+                wrapped = wrap_lines(&lines, content_width);
             }
             _ => {}
         }
