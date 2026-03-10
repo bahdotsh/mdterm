@@ -382,7 +382,12 @@ impl ViewerState {
                 {
                     let url = url.clone();
                     let alt = alt.clone();
-                    let actual_rows = self.image_cache.ideal_rows(&url, cw).unwrap_or(total_rows);
+                    // Use ideal rows if image loaded, otherwise 0 (just show caption/link)
+                    let actual_rows = if self.image_cache.has_image(&url) {
+                        self.image_cache.ideal_rows(&url, cw).unwrap_or(total_rows)
+                    } else {
+                        0
+                    };
 
                     for r in 0..actual_rows {
                         new_wrapped.push(Line {

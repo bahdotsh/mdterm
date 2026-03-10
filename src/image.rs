@@ -10,8 +10,9 @@ use image::{DynamicImage, GenericImageView, imageops::FilterType};
 pub enum ImageProtocol {
     Kitty,
     Iterm2,
-    /// No inline image protocol available; images are not rendered.
-    None,
+    /// Universal fallback: render images using Unicode half-block characters (▀)
+    /// with foreground/background colors. Works in any terminal with color support.
+    HalfBlock,
 }
 
 pub fn detect_protocol() -> ImageProtocol {
@@ -35,7 +36,7 @@ pub fn detect_protocol() -> ImageProtocol {
     if std::env::var("LC_TERMINAL").ok().as_deref() == Some("iTerm2") {
         return ImageProtocol::Iterm2;
     }
-    ImageProtocol::None
+    ImageProtocol::HalfBlock
 }
 
 // ── Cell metrics ────────────────────────────────────────────────────────────
@@ -193,6 +194,15 @@ struct Iterm2Image {
     crop_cache: Option<(usize, usize, String)>,
 }
 
+/// Pre-rendered half-block image: uses Unicode ▀ with fg/bg colors to render
+/// two vertical pixels per terminal cell. Works in any terminal.
+struct HalfBlockImage {
+    cols: usize,
+    rows: usize,
+    /// Image resized to cols × (rows * 2) pixels for half-block rendering.
+    resized: DynamicImage,
+}
+
 pub struct ImageCache {
     images: HashMap<String, Option<DynamicImage>>,
     protocol: ImageProtocol,
@@ -203,6 +213,9 @@ pub struct ImageCache {
 
     // iTerm2: pre-cropped strips cached per image
     iterm2_images: HashMap<String, Iterm2Image>,
+
+    // Half-block: resized images for Unicode block rendering
+    halfblock_images: HashMap<String, HalfBlockImage>,
 
     last_render_width: usize,
     cell_metrics: CellMetrics,
@@ -217,6 +230,7 @@ impl ImageCache {
             kitty_images: HashMap::new(),
             next_kitty_id: 0,
             iterm2_images: HashMap::new(),
+            halfblock_images: HashMap::new(),
             last_render_width: 0,
             cell_metrics: get_cell_metrics(),
         }
@@ -235,6 +249,7 @@ impl ImageCache {
             self.cell_metrics = new;
             self.kitty_images.clear();
             self.iterm2_images.clear();
+            self.halfblock_images.clear();
         } else {
             self.cell_metrics = new;
         }
@@ -282,6 +297,7 @@ impl ImageCache {
         if content_width != self.last_render_width {
             self.kitty_images.clear();
             self.iterm2_images.clear();
+            self.halfblock_images.clear();
             self.last_render_width = content_width;
         }
 
@@ -350,12 +366,29 @@ impl ImageCache {
                         }
                     });
                 }
-                ImageProtocol::None => {}
+                ImageProtocol::HalfBlock => {
+                    self.halfblock_images.entry(url).or_insert_with(|| {
+                        let (img_w, img_h) = img.dimensions();
+                        let (cols, rows) = calc_display_cells(
+                            img_w,
+                            img_h,
+                            content_width,
+                            MAX_IMAGE_ROWS,
+                            cell_aspect,
+                        );
+                        // Half-block: each cell = 1 column wide, 2 vertical pixels
+                        let target_w = (cols as u32).max(1);
+                        let target_h = (rows as u32 * 2).max(1);
+                        let resized =
+                            img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+                        HalfBlockImage { cols, rows, resized }
+                    });
+                }
             }
         }
     }
 
-    /// Render a single image row (Kitty only). Returns true if the row was rendered.
+    /// Render a single image row. Returns true if the row was rendered inline.
     /// iTerm2 uses `render_iterm2_block` instead (called separately in a second pass).
     pub fn render_image_row(
         &self,
@@ -363,11 +396,14 @@ impl ImageCache {
         url: &str,
         image_row: usize,
         content_width: usize,
-        _bg: crossterm::style::Color,
+        bg: crossterm::style::Color,
     ) -> io::Result<bool> {
         match self.protocol {
             ImageProtocol::Kitty => self.render_kitty_row(stdout, url, image_row, content_width),
-            ImageProtocol::Iterm2 | ImageProtocol::None => Ok(false),
+            ImageProtocol::HalfBlock => {
+                self.render_halfblock_row(stdout, url, image_row, content_width, bg)
+            }
+            ImageProtocol::Iterm2 => Ok(false),
         }
     }
 
@@ -407,6 +443,63 @@ impl ImageCache {
         place_kitty_image(stdout, ki.id, ki.cols, src_y, ki.target_w, src_h)?;
         // Kitty doesn't advance cursor — write spaces to fill the content width
         write!(stdout, "{}", " ".repeat(content_width - x_offset))?;
+        Ok(true)
+    }
+
+    fn render_halfblock_row(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        content_width: usize,
+        bg: crossterm::style::Color,
+    ) -> io::Result<bool> {
+        let hb = match self.halfblock_images.get(url) {
+            Some(hb) => hb,
+            None => return Ok(false),
+        };
+        if image_row >= hb.rows {
+            return Ok(false);
+        }
+
+        let bg_rgb = color_to_rgb(bg);
+        let x_offset = content_width.saturating_sub(hb.cols) / 2;
+        if x_offset > 0 {
+            write!(stdout, "{}", " ".repeat(x_offset))?;
+        }
+
+        let top_y = (image_row * 2) as u32;
+        let bot_y = top_y + 1;
+
+        for col in 0..hb.cols as u32 {
+            let tp = hb.resized.get_pixel(col, top_y);
+            let (tr, tg, tb) = blend_alpha(tp, bg_rgb);
+
+            let (br, bkg, bb) = if bot_y < hb.resized.height() {
+                let bp = hb.resized.get_pixel(col, bot_y);
+                blend_alpha(bp, bg_rgb)
+            } else {
+                bg_rgb
+            };
+
+            write!(
+                stdout,
+                "\x1b[38;2;{};{};{};48;2;{};{};{}m\u{2580}",
+                tr, tg, tb, br, bkg, bb
+            )?;
+        }
+
+        // Restore background color and fill remaining space
+        write!(
+            stdout,
+            "\x1b[0m\x1b[48;2;{};{};{}m",
+            bg_rgb.0, bg_rgb.1, bg_rgb.2
+        )?;
+        let used = x_offset + hb.cols;
+        if used < content_width {
+            write!(stdout, "{}", " ".repeat(content_width - used))?;
+        }
+
         Ok(true)
     }
 
@@ -458,6 +551,26 @@ impl ImageCache {
 
         Ok(())
     }
+}
+
+// ── Half-block helpers ──────────────────────────────────────────────────────
+
+fn color_to_rgb(c: crossterm::style::Color) -> (u8, u8, u8) {
+    match c {
+        crossterm::style::Color::Rgb { r, g, b } => (r, g, b),
+        _ => (0, 0, 0),
+    }
+}
+
+fn blend_alpha(pixel: image::Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    let a = pixel[3] as f32 / 255.0;
+    if a >= 1.0 {
+        return (pixel[0], pixel[1], pixel[2]);
+    }
+    let r = (pixel[0] as f32 * a + bg.0 as f32 * (1.0 - a)) as u8;
+    let g = (pixel[1] as f32 * a + bg.1 as f32 * (1.0 - a)) as u8;
+    let b = (pixel[2] as f32 * a + bg.2 as f32 * (1.0 - a)) as u8;
+    (r, g, b)
 }
 
 // ── Fetching ────────────────────────────────────────────────────────────────
