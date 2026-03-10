@@ -6,7 +6,8 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 
 - **Interactive TUI** — Scroll, navigate with keyboard and mouse
 - **Syntax highlighting** — Code blocks highlighted via syntect (base16-ocean.dark / InspiredGitHub themes)
-- **Rich formatting** — Headings, bold, italic, strikethrough, lists, blockquotes, tables, task lists, images
+- **Rich formatting** — Headings, bold, italic, strikethrough, lists, blockquotes, tables, task lists
+- **Inline images** — Renders images in the terminal via Kitty, iTerm2, or Unicode half-block fallback
 - **Clickable links** — OSC 8 hyperlinks in supporting terminals
 - **In-document search** — `/` to search with regex support, `n`/`N` to jump between matches
 - **Table of contents** — Press `o` to browse and jump to any heading
