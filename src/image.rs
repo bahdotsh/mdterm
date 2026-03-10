@@ -593,11 +593,49 @@ fn fetch_image(url: &str) -> Option<DynamicImage> {
     if url.starts_with("http://") || url.starts_with("https://") {
         fetch_image_http(url)
     } else {
+        // Only allow relative paths and paths under the current directory;
+        // reject absolute paths to prevent reading arbitrary local files.
+        let path = std::path::Path::new(url);
+        if path.is_absolute() {
+            return None;
+        }
+        // Reject paths that escape the working directory via ".."
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return None;
+            }
+        }
         image::open(url).ok()
     }
 }
 
 fn fetch_image_http(url: &str) -> Option<DynamicImage> {
+    // Block requests to private/loopback/link-local/metadata IPs to prevent SSRF
+    if let Some(host) = extract_host(url) {
+        let blocked = [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "0.0.0.0",
+            "169.254.169.254",
+            "metadata.google.internal",
+        ];
+        let host_lower = host.to_lowercase();
+        if blocked.iter().any(|b| host_lower == *b)
+            || host_lower.starts_with("10.")
+            || host_lower.starts_with("192.168.")
+            || host_lower.starts_with("172.16.")
+            || host_lower.starts_with("172.17.")
+            || host_lower.starts_with("172.18.")
+            || host_lower.starts_with("172.19.")
+            || host_lower.starts_with("172.2")
+            || host_lower.starts_with("172.30.")
+            || host_lower.starts_with("172.31.")
+        {
+            return None;
+        }
+    }
     let output = std::process::Command::new("curl")
         .args(["-sL", "--max-time", "10", "--max-filesize", "10485760", url])
         .output()
@@ -607,4 +645,19 @@ fn fetch_image_http(url: &str) -> Option<DynamicImage> {
     } else {
         None
     }
+}
+
+/// Extract the host portion from an HTTP(S) URL.
+fn extract_host(url: &str) -> Option<&str> {
+    let after_scheme = url.strip_prefix("https://").or(url.strip_prefix("http://"))?;
+    let authority = after_scheme.split('/').next()?;
+    // Strip optional userinfo (user:pass@)
+    let host_port = authority.rsplit('@').next()?;
+    // Strip port
+    Some(if host_port.starts_with('[') {
+        // IPv6: [::1]:port
+        host_port.split(']').next().map(|s| &s[1..])?
+    } else {
+        host_port.split(':').next()?
+    })
 }

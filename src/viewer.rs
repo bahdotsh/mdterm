@@ -892,8 +892,16 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
                 && num <= state.link_entries.len()
             {
                 let url = state.link_entries[num - 1].url.clone();
-                let _ = open::that(&url);
-                state.status_msg = Some(format!("Opened: {}", url));
+                if url.starts_with("http://")
+                    || url.starts_with("https://")
+                    || url.starts_with("mailto:")
+                {
+                    let _ = open::that(&url);
+                    state.status_msg = Some(format!("Opened: {}", url));
+                } else {
+                    state.status_msg =
+                        Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+                }
             }
             state.mode = ViewMode::Normal;
         }
