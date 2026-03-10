@@ -379,9 +379,12 @@ impl ImageCache {
                         // Half-block: each cell = 1 column wide, 2 vertical pixels
                         let target_w = (cols as u32).max(1);
                         let target_h = (rows as u32 * 2).max(1);
-                        let resized =
-                            img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        HalfBlockImage { cols, rows, resized }
+                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+                        HalfBlockImage {
+                            cols,
+                            rows,
+                            resized,
+                        }
                     });
                 }
             }
