@@ -73,8 +73,6 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
                 coalesced = true;
             }
 
-            // Mark fast scrolling so render_frame can skip expensive image
-            // re-encoding for non-Kitty protocols (iTerm2, HalfBlock)
             state.fast_scrolling = coalesced;
 
             if quit {
@@ -1308,26 +1306,21 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
         let mut drew_inline_image = false;
         if let Some(line) = state.wrapped.get(line_idx) {
-            // Render image pixels inline. During rapid scrolling, skip
-            // expensive HalfBlock rendering (re-sends color data each frame).
-            // Kitty is cheap (tiny placement commands) so always renders.
+            // Render image pixels inline (Kitty / iTerm2).
             if let LineMeta::Image {
                 ref url,
                 row: image_row,
                 ..
             } = line.meta
+                && state.image_cache.has_image(url)
             {
-                let skip = state.fast_scrolling
-                    && state.image_cache.protocol() == crate::image::ImageProtocol::HalfBlock;
-                if !skip && state.image_cache.has_image(url) {
-                    drew_inline_image = state.image_cache.render_image_row(
-                        stdout,
-                        url,
-                        image_row,
-                        content_width,
-                        theme.bg,
-                    )?;
-                }
+                drew_inline_image = state.image_cache.render_image_row(
+                    stdout,
+                    url,
+                    image_row,
+                    content_width,
+                    theme.bg,
+                )?;
             }
 
             if !drew_inline_image {
@@ -1374,7 +1367,6 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             queue!(stdout, Print(" ".repeat(content_width)))?;
         }
 
-        // Reset attributes after content (needed after halfblock raw ANSI output)
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
@@ -1404,8 +1396,72 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         }
     }
 
-    // Images are rendered inline during the content loop (like code blocks),
-    // so no separate overlay pass is needed.
+    // iTerm2: overlay images in a second pass (1 escape sequence per image,
+    // not per-row, so scrolling stays smooth).
+    if state.image_cache.protocol() == crate::image::ImageProtocol::Iterm2 {
+        let mut row = 0;
+        while row < viewport {
+            let line_idx = if state.slide_mode {
+                let start = state
+                    .slide_boundaries
+                    .get(state.current_slide)
+                    .copied()
+                    .unwrap_or(0);
+                start + row
+            } else {
+                state.offset + row
+            };
+
+            if let Some(line) = state.wrapped.get(line_idx)
+                && let LineMeta::Image {
+                    ref url,
+                    row: image_row,
+                    ..
+                } = line.meta
+                && state.image_cache.has_image(url)
+            {
+                let first_image_row = image_row;
+                let first_screen_row = row;
+                let url = url.clone();
+                let mut count = 1;
+                while first_screen_row + count < viewport {
+                    let next_idx = if state.slide_mode {
+                        let start = state
+                            .slide_boundaries
+                            .get(state.current_slide)
+                            .copied()
+                            .unwrap_or(0);
+                        start + first_screen_row + count
+                    } else {
+                        state.offset + first_screen_row + count
+                    };
+                    if let Some(next) = state.wrapped.get(next_idx) {
+                        if let LineMeta::Image { url: ref u2, .. } = next.meta
+                            && *u2 == url
+                        {
+                            count += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // +1 for title bar row
+                state.image_cache.render_iterm2_block(
+                    stdout,
+                    &url,
+                    first_image_row,
+                    count,
+                    content_width,
+                    (first_screen_row + 1) as u16,
+                )?;
+                row += count;
+                continue;
+            }
+            row += 1;
+        }
+    }
 
     // Status bar
     render_status_bar(stdout, state)?;
