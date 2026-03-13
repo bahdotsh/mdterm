@@ -33,6 +33,10 @@ pub fn detect_protocol() -> ImageProtocol {
     if std::env::var("TERM").ok().as_deref() == Some("xterm-ghostty") {
         return ImageProtocol::Kitty;
     }
+    // Konsole supports the Kitty graphics protocol since version 22.04
+    if std::env::var("KONSOLE_VERSION").is_ok() {
+        return ImageProtocol::Kitty;
+    }
     if std::env::var("LC_TERMINAL").ok().as_deref() == Some("iTerm2") {
         return ImageProtocol::Iterm2;
     }
