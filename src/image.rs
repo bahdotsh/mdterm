@@ -263,6 +263,18 @@ impl ImageCache {
         self.images.get(url).is_some_and(|o| o.is_some())
     }
 
+    /// Returns true if a fetch has already been attempted for this URL
+    /// (regardless of whether it succeeded), so we don't re-queue it.
+    pub fn has_attempted(&self, url: &str) -> bool {
+        self.images.contains_key(url)
+    }
+
+    /// Insert a pre-loaded image directly (used in tests).
+    #[cfg(test)]
+    fn insert(&mut self, url: &str, img: Option<image::DynamicImage>) {
+        self.images.insert(url.to_string(), img);
+    }
+
     pub fn image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
         self.images.get(url)?.as_ref().map(|img| img.dimensions())
     }
@@ -666,4 +678,121 @@ fn extract_host(url: &str) -> Option<&str> {
     } else {
         host_port.split(':').next()?
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── has_attempted / has_image ────────────────────────────────────────────
+
+    #[test]
+    fn has_attempted_false_for_unknown_url() {
+        let cache = ImageCache::new();
+        assert!(!cache.has_attempted("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_attempted_true_after_failed_fetch() {
+        // A None entry means the fetch ran but produced no image.
+        let mut cache = ImageCache::new();
+        cache.insert("http://example.com/img.png", None);
+        assert!(cache.has_attempted("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_attempted_true_after_successful_fetch() {
+        let mut cache = ImageCache::new();
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        cache.insert("http://example.com/img.png", Some(img));
+        assert!(cache.has_attempted("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_image_false_for_unknown_url() {
+        let cache = ImageCache::new();
+        assert!(!cache.has_image("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_image_false_after_failed_fetch() {
+        let mut cache = ImageCache::new();
+        cache.insert("http://example.com/img.png", None);
+        // Attempted but failed — has_image must stay false.
+        assert!(!cache.has_image("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_image_true_after_successful_fetch() {
+        let mut cache = ImageCache::new();
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        cache.insert("http://example.com/img.png", Some(img));
+        assert!(cache.has_image("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn has_attempted_and_has_image_are_independent() {
+        // has_attempted subsumes has_image: any URL where has_image is true
+        // must also satisfy has_attempted, but not vice-versa.
+        let mut cache = ImageCache::new();
+        let img = image::DynamicImage::new_rgb8(1, 1);
+        cache.insert("ok", Some(img));
+        cache.insert("fail", None);
+
+        assert!(cache.has_attempted("ok"));
+        assert!(cache.has_image("ok"));
+
+        assert!(cache.has_attempted("fail"));
+        assert!(!cache.has_image("fail"));
+    }
+
+    // ── fetch_if_missing idempotency ─────────────────────────────────────────
+
+    #[test]
+    fn fetch_if_missing_does_not_overwrite_existing_entry() {
+        // If a URL is already in the cache (even as None), fetch_if_missing
+        // must leave it untouched — it must not issue a second fetch.
+        let mut cache = ImageCache::new();
+        cache.insert("local_nonexistent.png", None);
+        cache.fetch_if_missing("local_nonexistent.png");
+        // Still None — was not replaced by a fresh (failed) attempt.
+        assert!(!cache.has_image("local_nonexistent.png"));
+        assert!(cache.has_attempted("local_nonexistent.png"));
+    }
+
+    // ── extract_host ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_host_https() {
+        assert_eq!(
+            extract_host("https://example.com/path"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn extract_host_http_with_port() {
+        assert_eq!(
+            extract_host("http://example.com:8080/path"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn extract_host_strips_userinfo() {
+        assert_eq!(
+            extract_host("https://user:pass@example.com/path"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn extract_host_ipv6() {
+        assert_eq!(extract_host("http://[::1]/path"), Some("::1"));
+    }
+
+    #[test]
+    fn extract_host_returns_none_for_non_http() {
+        assert_eq!(extract_host("ftp://example.com/file"), None);
+    }
 }
