@@ -2136,16 +2136,18 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
 
 // ── Help overlay ────────────────────────────────────────────────────────────
 
-fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
-    let theme = &state.theme;
-    let width = state.cols as usize;
-    let viewport = state.viewport();
+/// A section in the help overlay: section title + list of (key, description) pairs.
+pub(crate) struct HelpSection {
+    pub title: &'static str,
+    pub entries: &'static [(&'static str, &'static str)],
+}
 
-    // Two-column table: (key, description)
-    let sections: &[(&str, &[(&str, &str)])] = &[
-        (
-            "Navigation",
-            &[
+/// Returns the help sections data used by the F1 help overlay.
+pub(crate) fn help_sections() -> &'static [HelpSection] {
+    static SECTIONS: &[HelpSection] = &[
+        HelpSection {
+            title: "Navigation",
+            entries: &[
                 ("j / ↓", "Scroll down one line"),
                 ("k / ↑", "Scroll up one line"),
                 ("d / Ctrl+d", "Scroll down half page"),
@@ -2159,10 +2161,10 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
                 ("Tab", "Next file"),
                 ("Shift+Tab", "Previous file"),
             ],
-        ),
-        (
-            "Modes",
-            &[
+        },
+        HelpSection {
+            title: "Modes",
+            entries: &[
                 ("/", "Search (regex auto-detected)"),
                 ("n", "Next search match"),
                 ("N", "Previous search match"),
@@ -2171,49 +2173,67 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
                 (":", "Fuzzy heading jump"),
                 ("F1", "This help screen"),
             ],
-        ),
-        (
-            "Actions",
-            &[
+        },
+        HelpSection {
+            title: "Actions",
+            entries: &[
                 ("y", "Copy current section to clipboard"),
                 ("Y", "Copy full document to clipboard"),
                 ("c", "Copy nearest code block"),
                 ("t", "Toggle dark / light theme"),
                 ("l", "Toggle line numbers"),
             ],
-        ),
-        (
-            "Quit",
-            &[
+        },
+        HelpSection {
+            title: "Quit",
+            entries: &[
                 ("q", "Quit"),
                 ("Esc", "Quit / clear search"),
                 ("Ctrl+c", "Quit"),
             ],
-        ),
+        },
     ];
+    SECTIONS
+}
 
-    // Measure widest key and description so we can size the box
+/// Compute the help overlay box dimensions.
+/// Returns (key_col_width, desc_col_width, box_width, box_height, visible_rows).
+pub(crate) fn help_box_dimensions(
+    term_width: usize,
+    viewport: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let sections = help_sections();
     let key_col = sections
         .iter()
-        .flat_map(|(_, entries)| entries.iter().map(|(k, _)| k.chars().count()))
+        .flat_map(|s| s.entries.iter().map(|(k, _)| k.chars().count()))
         .max()
         .unwrap_or(0);
     let desc_col = sections
         .iter()
-        .flat_map(|(_, entries)| entries.iter().map(|(_, d)| d.chars().count()))
+        .flat_map(|s| s.entries.iter().map(|(_, d)| d.chars().count()))
         .max()
         .unwrap_or(0);
-    let inner_w = key_col + desc_col + 3; // " key  desc "
-    let box_w = (inner_w + 2).max(40).min(width.saturating_sub(4));
-
-    // Count rows: section header + entries + blank between sections
+    let inner_w = key_col + desc_col + 3;
+    let box_w = (inner_w + 2).max(40).min(term_width.saturating_sub(4));
     let total_rows: usize = sections
         .iter()
-        .map(|(_, rows)| rows.len() + 2)
+        .map(|s| s.entries.len() + 2)
         .sum::<usize>()
         - 1;
     let box_h = (total_rows + 2).min(viewport.saturating_sub(2));
     let visible_rows = box_h.saturating_sub(2);
+    (key_col, desc_col, box_w, box_h, visible_rows)
+}
+
+fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
+    let theme = &state.theme;
+    let width = state.cols as usize;
+    let viewport = state.viewport();
+
+    let sections = help_sections();
+
+    let (key_col, desc_col, box_w, box_h, visible_rows) =
+        help_box_dimensions(width, viewport);
 
     let x_off = width.saturating_sub(box_w) / 2;
     let y_off = viewport.saturating_sub(box_h) / 2 + 1;
@@ -2237,12 +2257,12 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
 
     // Build the flat list of rows to render (section headers + entries)
     let mut rows: Vec<(bool, &str, &str)> = Vec::new(); // (is_header, left, right)
-    for (i, (section, entries)) in sections.iter().enumerate() {
+    for (i, section) in sections.iter().enumerate() {
         if i > 0 {
             rows.push((false, "", "")); // blank separator
         }
-        rows.push((true, section, ""));
-        for (key, desc) in *entries {
+        rows.push((true, section.title, ""));
+        for (key, desc) in section.entries {
             rows.push((false, key, desc));
         }
     }
@@ -2451,4 +2471,71 @@ fn write_span(
         queue!(stdout, SetBackgroundColor(bg))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_sections_non_empty() {
+        let sections = help_sections();
+        assert!(sections.len() >= 3, "expected at least 3 help sections");
+        for section in sections {
+            assert!(!section.title.is_empty());
+            assert!(!section.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn help_sections_no_duplicate_keys() {
+        let sections = help_sections();
+        let mut seen = std::collections::HashSet::new();
+        for section in sections {
+            for (key, _) in section.entries {
+                assert!(
+                    seen.insert(key),
+                    "duplicate help key: {:?} in section {:?}",
+                    key,
+                    section.title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_sections_entries_have_content() {
+        let sections = help_sections();
+        for section in sections {
+            for (key, desc) in section.entries {
+                assert!(!key.is_empty(), "empty key in section {}", section.title);
+                assert!(!desc.is_empty(), "empty desc for key {} in section {}", key, section.title);
+            }
+        }
+    }
+
+    #[test]
+    fn help_box_dimensions_reasonable_80x24() {
+        let (key_col, desc_col, box_w, box_h, visible_rows) = help_box_dimensions(80, 24);
+        assert!(key_col > 0);
+        assert!(desc_col > 0);
+        assert!(box_w >= 40, "box_w should be at least 40");
+        assert!(box_w <= 80, "box_w should fit terminal");
+        assert!(box_h <= 24, "box_h should fit viewport");
+        assert!(visible_rows <= box_h);
+    }
+
+    #[test]
+    fn help_box_dimensions_narrow_terminal() {
+        let (_, _, box_w, box_h, _) = help_box_dimensions(50, 20);
+        assert!(box_w <= 46, "box_w should be constrained by narrow terminal");
+        assert!(box_h <= 20);
+    }
+
+    #[test]
+    fn help_box_dimensions_short_viewport() {
+        let (_, _, _, box_h, visible_rows) = help_box_dimensions(120, 10);
+        assert!(box_h <= 8, "box_h should be constrained by short viewport");
+        assert!(visible_rows <= box_h);
+    }
 }
