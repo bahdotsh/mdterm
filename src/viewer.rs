@@ -740,14 +740,10 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         KeyCode::Char(' ') | KeyCode::PageDown => {
             state.offset = (state.offset + viewport).min(max_offset);
         }
-        KeyCode::Char('d')
-            if mods.is_empty() || mods == KeyModifiers::CONTROL =>
-        {
+        KeyCode::Char('d') if mods.is_empty() || mods == KeyModifiers::CONTROL => {
             state.offset = (state.offset + viewport / 2).min(max_offset);
         }
-        KeyCode::Char('u')
-            if mods.is_empty() || mods == KeyModifiers::CONTROL =>
-        {
+        KeyCode::Char('u') if mods.is_empty() || mods == KeyModifiers::CONTROL => {
             state.offset = state.offset.saturating_sub(viewport / 2);
         }
         KeyCode::Char('b') | KeyCode::PageUp => {
