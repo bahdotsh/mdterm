@@ -2215,11 +2215,7 @@ pub(crate) fn help_box_dimensions(
         .unwrap_or(0);
     let inner_w = key_col + desc_col + 3;
     let box_w = (inner_w + 2).max(40).min(term_width.saturating_sub(4));
-    let total_rows: usize = sections
-        .iter()
-        .map(|s| s.entries.len() + 2)
-        .sum::<usize>()
-        - 1;
+    let total_rows: usize = sections.iter().map(|s| s.entries.len() + 2).sum::<usize>() - 1;
     let box_h = (total_rows + 2).min(viewport.saturating_sub(2));
     let visible_rows = box_h.saturating_sub(2);
     (key_col, desc_col, box_w, box_h, visible_rows)
@@ -2232,8 +2228,7 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
 
     let sections = help_sections();
 
-    let (key_col, desc_col, box_w, box_h, visible_rows) =
-        help_box_dimensions(width, viewport);
+    let (key_col, desc_col, box_w, box_h, visible_rows) = help_box_dimensions(width, viewport);
 
     let x_off = width.saturating_sub(box_w) / 2;
     let y_off = viewport.saturating_sub(box_h) / 2 + 1;
@@ -2509,7 +2504,12 @@ mod tests {
         for section in sections {
             for (key, desc) in section.entries {
                 assert!(!key.is_empty(), "empty key in section {}", section.title);
-                assert!(!desc.is_empty(), "empty desc for key {} in section {}", key, section.title);
+                assert!(
+                    !desc.is_empty(),
+                    "empty desc for key {} in section {}",
+                    key,
+                    section.title
+                );
             }
         }
     }
@@ -2528,7 +2528,10 @@ mod tests {
     #[test]
     fn help_box_dimensions_narrow_terminal() {
         let (_, _, box_w, box_h, _) = help_box_dimensions(50, 20);
-        assert!(box_w <= 46, "box_w should be constrained by narrow terminal");
+        assert!(
+            box_w <= 46,
+            "box_w should be constrained by narrow terminal"
+        );
         assert!(box_h <= 20);
     }
 
