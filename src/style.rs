@@ -281,7 +281,10 @@ mod tests {
     fn multiple_lines_wrapped_independently() {
         let lines = vec![plain_line("aaa bbb"), plain_line("ccc ddd")];
         let wrapped = wrap_lines(&lines, 4);
-        // Each input line should produce 2 output lines
-        assert!(wrapped.len() >= 4);
+        assert_eq!(wrapped.len(), 4);
+        assert_eq!(line_text(&wrapped[0]).trim(), "aaa");
+        assert_eq!(line_text(&wrapped[1]).trim(), "bbb");
+        assert_eq!(line_text(&wrapped[2]).trim(), "ccc");
+        assert_eq!(line_text(&wrapped[3]).trim(), "ddd");
     }
 }

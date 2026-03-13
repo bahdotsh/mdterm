@@ -1546,10 +1546,11 @@ mod tests {
         let heading = lines
             .iter()
             .find(|l| matches!(&l.meta, LineMeta::Heading { level: 1, .. }));
-        assert!(heading.is_some(), "expected LineMeta::Heading level 1");
-        if let LineMeta::Heading { text, .. } = &heading.unwrap().meta {
-            assert_eq!(text, "Hello");
-        }
+        let heading = heading.expect("expected LineMeta::Heading level 1");
+        let LineMeta::Heading { text, .. } = &heading.meta else {
+            panic!("expected LineMeta::Heading");
+        };
+        assert_eq!(text, "Hello");
     }
 
     #[test]
@@ -1558,10 +1559,11 @@ mod tests {
         let heading = lines
             .iter()
             .find(|l| matches!(&l.meta, LineMeta::Heading { level: 2, .. }));
-        assert!(heading.is_some());
-        if let LineMeta::Heading { text, .. } = &heading.unwrap().meta {
-            assert_eq!(text, "Section");
-        }
+        let heading = heading.expect("expected LineMeta::Heading level 2");
+        let LineMeta::Heading { text, .. } = &heading.meta else {
+            panic!("expected LineMeta::Heading");
+        };
+        assert_eq!(text, "Section");
     }
 
     #[test]
@@ -1624,12 +1626,13 @@ mod tests {
             "expected IMAGE_ROWS placeholder lines"
         );
         // Check URL and alt are propagated
-        if let LineMeta::Image { url, alt, row, total_rows } = &image_lines[0].meta {
-            assert_eq!(url, "http://example.com/img.png");
-            assert_eq!(alt, "alt text");
-            assert_eq!(*row, 0);
-            assert_eq!(*total_rows, crate::image::IMAGE_ROWS);
-        }
+        let LineMeta::Image { url, alt, row, total_rows } = &image_lines[0].meta else {
+            panic!("expected LineMeta::Image");
+        };
+        assert_eq!(url, "http://example.com/img.png");
+        assert_eq!(alt, "alt text");
+        assert_eq!(*row, 0);
+        assert_eq!(*total_rows, crate::image::IMAGE_ROWS);
     }
 
     #[test]
@@ -1639,10 +1642,11 @@ mod tests {
         let image_line = lines
             .iter()
             .find(|l| matches!(&l.meta, LineMeta::Image { .. }));
-        assert!(image_line.is_some());
-        if let LineMeta::Image { alt, .. } = &image_line.unwrap().meta {
-            assert_eq!(alt, "image");
-        }
+        let image_line = image_line.expect("expected LineMeta::Image");
+        let LineMeta::Image { alt, .. } = &image_line.meta else {
+            panic!("expected LineMeta::Image");
+        };
+        assert_eq!(alt, "image");
     }
 
     // ── Lists ───────────────────────────────────────────────────────────────
