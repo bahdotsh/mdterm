@@ -51,11 +51,20 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         // Clear transient status after rendering so it shows for one frame
         state.status_msg = None;
 
-        let timeout = if !state.pending_image_urls.is_empty() {
-            // Images waiting to load — don't block so we fetch between frames
-            Duration::ZERO
+        // Poll for completed background fetches
+        if state.image_cache.poll_completed() {
+            state.rebuild();
+        }
+
+        // Dispatch all pending URLs as background fetches (non-blocking)
+        while let Some(url) = state.pending_image_urls.pop_front() {
+            state.image_cache.start_fetch(&url);
+        }
+
+        let timeout = if state.image_cache.has_in_flight() {
+            // Check for completions frequently while fetches are in flight
+            Duration::from_millis(50)
         } else if state.fast_scrolling {
-            // Short timeout so images re-appear quickly after scroll stops
             Duration::from_millis(50)
         } else if state.follow_mode {
             Duration::from_millis(500)
@@ -86,11 +95,6 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             state.fast_scrolling = false;
             if state.follow_mode {
                 state.check_file_changed();
-            }
-            // Fetch the next queued image then rebuild to update placeholder heights
-            if let Some(url) = state.pending_image_urls.pop_front() {
-                state.image_cache.fetch_if_missing(&url);
-                state.rebuild();
             }
         }
     }
@@ -1678,7 +1682,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     let pos_label = format!(" {} ", position);
     let pos_len = pos_label.chars().count();
 
-    let pending = state.pending_image_urls.len();
+    let pending = state.image_cache.in_flight_count();
     let loading_label = if pending > 0 {
         let noun = if pending == 1 { "image" } else { "images" };
         format!(" loading {pending} {noun} ")

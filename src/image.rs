@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Write};
+use std::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
@@ -223,11 +224,17 @@ pub struct ImageCache {
 
     last_render_width: usize,
     cell_metrics: CellMetrics,
+
+    // Background fetch infrastructure
+    sender: mpsc::Sender<(String, Option<DynamicImage>)>,
+    receiver: mpsc::Receiver<(String, Option<DynamicImage>)>,
+    in_flight: HashSet<String>,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
         let protocol = detect_protocol();
+        let (sender, receiver) = mpsc::channel();
         ImageCache {
             images: HashMap::new(),
             protocol,
@@ -237,6 +244,9 @@ impl ImageCache {
             halfblock_images: HashMap::new(),
             last_render_width: 0,
             cell_metrics: get_cell_metrics(),
+            sender,
+            receiver,
+            in_flight: HashSet::new(),
         }
     }
 
@@ -264,9 +274,50 @@ impl ImageCache {
     }
 
     /// Returns true if a fetch has already been attempted for this URL
-    /// (regardless of whether it succeeded), so we don't re-queue it.
+    /// (regardless of whether it succeeded) or is currently in flight,
+    /// so we don't re-queue it.
     pub fn has_attempted(&self, url: &str) -> bool {
-        self.images.contains_key(url)
+        self.images.contains_key(url) || self.in_flight.contains(url)
+    }
+
+    /// Spawn a background thread to fetch `url` if not already cached or in flight.
+    pub fn start_fetch(&mut self, url: &str) {
+        if self.images.contains_key(url) || self.in_flight.contains(url) {
+            return;
+        }
+        self.in_flight.insert(url.to_string());
+        let sender = self.sender.clone();
+        let url_owned = url.to_string();
+        std::thread::spawn(move || {
+            let img = fetch_image(&url_owned).map(|img| downscale(img, MAX_SOURCE_DIM));
+            let _ = sender.send((url_owned, img));
+        });
+    }
+
+    /// Poll for completed background fetches. Returns true if any new images arrived.
+    pub fn poll_completed(&mut self) -> bool {
+        let mut any = false;
+        loop {
+            match self.receiver.try_recv() {
+                Ok((url, img)) => {
+                    self.in_flight.remove(&url);
+                    self.images.insert(url, img);
+                    any = true;
+                }
+                Err(_) => break,
+            }
+        }
+        any
+    }
+
+    /// Returns true if any fetches are currently in flight.
+    pub fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Number of fetches currently in flight.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Insert a pre-loaded image directly (used in tests).
@@ -300,7 +351,8 @@ impl ImageCache {
         Some(rows)
     }
 
-    pub fn fetch_if_missing(&mut self, url: &str) {
+    #[cfg(test)]
+    fn fetch_if_missing(&mut self, url: &str) {
         if self.images.contains_key(url) {
             return;
         }
@@ -652,15 +704,13 @@ fn fetch_image_http(url: &str) -> Option<DynamicImage> {
             return None;
         }
     }
-    let output = std::process::Command::new("curl")
-        .args(["-sL", "--max-time", "10", "--max-filesize", "10485760", url])
-        .output()
-        .ok()?;
-    if output.status.success() && !output.stdout.is_empty() {
-        image::load_from_memory(&output.stdout).ok()
-    } else {
-        None
-    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut resp = agent.get(url).call().ok()?;
+    let buf = resp.body_mut().read_to_vec().ok()?;
+    image::load_from_memory(&buf).ok()
 }
 
 /// Extract the host portion from an HTTP(S) URL.

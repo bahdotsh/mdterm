@@ -21,3 +21,4 @@ dirs = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 libc = "0.2"
 base64 = "0.22"
+ureq = "3"
