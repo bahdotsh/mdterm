@@ -73,7 +73,7 @@ mdterm README.md | less -R
 | `k` / `Up` | Scroll up one line |
 | `Space` / `Page Down` | Page down |
 | `b` / `Page Up` | Page up |
-| `d` / `u` | Half-page down / up |
+| `d` / `u` (or `Ctrl+d` / `Ctrl+u`) | Half-page down / up |
 | `g` / `Home` | Jump to top |
 | `G` / `End` | Jump to bottom |
 | `[` / `]` | Previous / next heading |
