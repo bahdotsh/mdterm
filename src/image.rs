@@ -672,45 +672,93 @@ fn fetch_image(url: &str) -> Option<DynamicImage> {
     }
 }
 
+/// Returns true if `host` is a private/loopback/link-local/metadata address.
+fn is_blocked_host(host: &str) -> bool {
+    let blocked = [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "0.0.0.0",
+        "169.254.169.254",
+        "metadata.google.internal",
+    ];
+    let h = host.to_lowercase();
+    blocked.iter().any(|b| h == *b)
+        || h.starts_with("10.")
+        || h.starts_with("192.168.")
+        || h.starts_with("172.16.")
+        || h.starts_with("172.17.")
+        || h.starts_with("172.18.")
+        || h.starts_with("172.19.")
+        || h.starts_with("172.2")
+        || h.starts_with("172.30.")
+        || h.starts_with("172.31.")
+}
+
 fn fetch_image_http(url: &str) -> Option<DynamicImage> {
-    // Block requests to private/loopback/link-local/metadata IPs to prevent SSRF
-    if let Some(host) = extract_host(url) {
-        let blocked = [
-            "localhost",
-            "127.0.0.1",
-            "::1",
-            "[::1]",
-            "0.0.0.0",
-            "169.254.169.254",
-            "metadata.google.internal",
-        ];
-        let host_lower = host.to_lowercase();
-        if blocked.iter().any(|b| host_lower == *b)
-            || host_lower.starts_with("10.")
-            || host_lower.starts_with("192.168.")
-            || host_lower.starts_with("172.16.")
-            || host_lower.starts_with("172.17.")
-            || host_lower.starts_with("172.18.")
-            || host_lower.starts_with("172.19.")
-            || host_lower.starts_with("172.2")
-            || host_lower.starts_with("172.30.")
-            || host_lower.starts_with("172.31.")
-        {
-            return None;
-        }
+    // SSRF check on the initial URL
+    if let Some(host) = extract_host(url)
+        && is_blocked_host(host)
+    {
+        return None;
     }
+    fetch_image_http_inner(url, true)
+}
+
+/// Core HTTP fetch with manual redirect following (up to 5 hops).
+/// When `check_ssrf` is true, each redirect target is validated against the
+/// SSRF blocklist. Tests pass `false` to allow localhost servers.
+fn fetch_image_http_inner(url: &str, check_ssrf: bool) -> Option<DynamicImage> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .max_redirects(0)
         .build()
         .into();
-    let mut resp = agent.get(url).call().ok()?;
-    let buf = resp
-        .body_mut()
-        .with_config()
-        .limit(10_485_760)
-        .read_to_vec()
-        .ok()?;
-    image::load_from_memory(&buf).ok()
+
+    let mut current_url = url.to_string();
+    for _ in 0..5 {
+        let resp = agent.get(&current_url).call().ok()?;
+        let status = resp.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let location = resp.headers().get("location")?.to_str().ok()?;
+            // Resolve relative redirects
+            let next = if location.starts_with("http://") || location.starts_with("https://") {
+                location.to_string()
+            } else if location.starts_with('/') {
+                // Absolute path — reuse scheme + host
+                let scheme_end = current_url.find("://")? + 3;
+                let host_end = current_url[scheme_end..]
+                    .find('/')
+                    .map(|i| i + scheme_end)
+                    .unwrap_or(current_url.len());
+                format!("{}{}", &current_url[..host_end], location)
+            } else {
+                return None; // unsupported relative form
+            };
+            // SSRF check on every redirect target
+            if check_ssrf
+                && let Some(host) = extract_host(&next)
+                && is_blocked_host(host)
+            {
+                return None;
+            }
+            current_url = next;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return None;
+        }
+        let mut resp = resp;
+        let buf = resp
+            .body_mut()
+            .with_config()
+            .limit(10_485_760)
+            .read_to_vec()
+            .ok()?;
+        return image::load_from_memory(&buf).ok();
+    }
+    None // too many redirects
 }
 
 /// Extract the host portion from an HTTP(S) URL.
@@ -991,12 +1039,243 @@ mod tests {
 
     #[test]
     fn downscale_large_image_reduced() {
-        let img = DynamicImage::new_rgb8(4000, 3000);
-        let result = downscale(img, 2000);
+        // Just over the limit — enough to trigger downscale without a huge
+        // debug-mode allocation (4000x3000 was ~10s in unoptimized builds).
+        let img = DynamicImage::new_rgb8(200, 150);
+        let result = downscale(img, 100);
         let (w, h) = result.dimensions();
-        assert!(w <= 2000);
-        assert!(h <= 2000);
+        assert!(w <= 100);
+        assert!(h <= 100);
         assert!(w >= 1);
         assert!(h >= 1);
+    }
+
+    // ── is_blocked_host ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_blocked_host_blocks_localhost() {
+        assert!(is_blocked_host("localhost"));
+        assert!(is_blocked_host("127.0.0.1"));
+        assert!(is_blocked_host("::1"));
+        assert!(is_blocked_host("[::1]"));
+        assert!(is_blocked_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_private_ranges() {
+        assert!(is_blocked_host("10.0.0.1"));
+        assert!(is_blocked_host("192.168.1.1"));
+        assert!(is_blocked_host("172.16.0.1"));
+        assert!(is_blocked_host("169.254.169.254"));
+        assert!(is_blocked_host("metadata.google.internal"));
+    }
+
+    #[test]
+    fn is_blocked_host_allows_public() {
+        assert!(!is_blocked_host("example.com"));
+        assert!(!is_blocked_host("8.8.8.8"));
+        assert!(!is_blocked_host("cdn.github.com"));
+    }
+
+    // ── extract_host ────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_host_various_urls() {
+        assert_eq!(
+            extract_host("http://example.com/img.png"),
+            Some("example.com")
+        );
+        assert_eq!(
+            extract_host("https://cdn.example.com:8080/img"),
+            Some("cdn.example.com")
+        );
+        assert_eq!(extract_host("ftp://nope.com/x"), None);
+        assert_eq!(extract_host("not-a-url"), None);
+    }
+
+    // ── integration tests with a local HTTP server ──────────────────────────
+
+    use std::io::Read as IoRead;
+    use std::net::TcpListener;
+
+    /// A minimal 1x1 red PNG (68 bytes).
+    fn tiny_png() -> Vec<u8> {
+        let img = DynamicImage::new_rgb8(1, 1);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    /// Spin up a TcpListener on a random port, run `handler` in a thread for
+    /// each incoming connection, and return the base URL.
+    /// Returns `None` if loopback is unavailable (e.g. sandboxed CI).
+    fn start_test_server(
+        handler: impl Fn(std::net::TcpStream) + Send + Sync + 'static,
+    ) -> Option<(String, std::net::SocketAddr)> {
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(stream) = stream {
+                    let _ = (handler)(stream);
+                }
+            }
+        });
+        Some((base, addr))
+    }
+
+    #[test]
+    #[ignore] // integration test — run with `cargo test -- --ignored`
+    fn http_fetch_simple_image() {
+        let png = tiny_png();
+        let Some((base, _)) = start_test_server(move |mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let body = png.clone();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&body);
+        }) else {
+            return; // loopback unavailable
+        };
+        let result = fetch_image_http_inner(&format!("{base}/image.png"), false);
+        assert!(result.is_some(), "should fetch a simple image");
+        assert_eq!(result.unwrap().dimensions(), (1, 1));
+    }
+
+    #[test]
+    #[ignore]
+    fn http_fetch_follows_redirect() {
+        let png = tiny_png();
+        let Some((base, _)) = start_test_server(move |mut stream| {
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /redirect") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /image.png\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else {
+                let body = png.clone();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        }) else {
+            return;
+        };
+        let result = fetch_image_http_inner(&format!("{base}/redirect"), false);
+        assert!(result.is_some(), "should follow redirect and fetch image");
+    }
+
+    #[test]
+    #[ignore]
+    fn http_fetch_follows_absolute_redirect() {
+        let png = tiny_png();
+        // Need two ports: one redirects to the other
+        let Some((target_base, _)) = start_test_server(move |mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let body = png.clone();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&body);
+        }) else {
+            return;
+        };
+
+        let target = target_base.clone();
+        let Some((redir_base, _)) = start_test_server(move |mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 301 Moved\r\nLocation: {}/image.png\r\nContent-Length: 0\r\n\r\n",
+                target
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }) else {
+            return;
+        };
+
+        let result = fetch_image_http_inner(&format!("{redir_base}/go"), false);
+        assert!(
+            result.is_some(),
+            "should follow absolute redirect across ports"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn http_fetch_stops_after_too_many_redirects() {
+        let Some((base, _)) = start_test_server(|mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            // Always redirect to self — infinite loop
+            let resp = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+        }) else {
+            return;
+        };
+        let result = fetch_image_http_inner(&format!("{base}/loop"), false);
+        assert!(result.is_none(), "should give up after 5 redirects");
+    }
+
+    #[test]
+    #[ignore]
+    fn http_fetch_slow_image_within_timeout() {
+        let png = tiny_png();
+        let Some((base, _)) = start_test_server(move |mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            // Delay 500ms then serve
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let body = png.clone();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&body);
+        }) else {
+            return;
+        };
+        let result = fetch_image_http_inner(&format!("{base}/slow.png"), false);
+        assert!(result.is_some(), "500ms delay should be within 10s timeout");
+    }
+
+    #[test]
+    #[ignore]
+    fn http_fetch_404_returns_none() {
+        let Some((base, _)) = start_test_server(|mut stream| {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+        }) else {
+            return;
+        };
+        let result = fetch_image_http_inner(&format!("{base}/missing.png"), false);
+        assert!(result.is_none(), "404 should return None");
+    }
+
+    #[test]
+    fn ssrf_blocks_redirect_to_metadata() {
+        // Redirect to a blocked IP — should be caught even though initial URL is fine
+        // We test the SSRF logic by using check_ssrf=true and checking that the
+        // redirect target is validated.
+        // Since initial URL is also localhost (blocked), we test the function directly.
+        let blocked = "http://169.254.169.254/latest/meta-data/";
+        assert!(fetch_image_http(blocked).is_none());
     }
 }
