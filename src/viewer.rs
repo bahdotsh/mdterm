@@ -203,6 +203,9 @@ struct ViewerState {
     toc_selected: usize,
     toc_scroll: usize,
 
+    // Help overlay
+    help_scroll: usize,
+
     // Link picker
     link_entries: Vec<LinkEntry>,
     link_input: String,
@@ -282,6 +285,7 @@ impl ViewerState {
             toc_entries: Vec::new(),
             toc_selected: 0,
             toc_scroll: 0,
+            help_scroll: 0,
             link_entries: Vec::new(),
             link_input: String::new(),
             fuzzy_input: String::new(),
@@ -536,13 +540,49 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 state.mode = if state.mode == ViewMode::Help {
                     ViewMode::Normal
                 } else {
+                    state.help_scroll = 0;
                     ViewMode::Help
                 };
                 return false;
             }
             if state.mode == ViewMode::Help {
-                if ke.code == KeyCode::Esc || ke.code == KeyCode::Char('q') {
-                    state.mode = ViewMode::Normal;
+                match ke.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        state.mode = ViewMode::Normal;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let total = help_total_rows();
+                        let (_, _, _, _, visible) =
+                            help_box_dimensions(state.cols as usize, state.viewport());
+                        if state.help_scroll + visible < total {
+                            state.help_scroll += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.help_scroll = state.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        let total = help_total_rows();
+                        let (_, _, _, _, visible) =
+                            help_box_dimensions(state.cols as usize, state.viewport());
+                        state.help_scroll =
+                            (state.help_scroll + visible).min(total.saturating_sub(visible));
+                    }
+                    KeyCode::PageUp | KeyCode::Char('b') => {
+                        let (_, _, _, _, visible) =
+                            help_box_dimensions(state.cols as usize, state.viewport());
+                        state.help_scroll = state.help_scroll.saturating_sub(visible);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        state.help_scroll = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        let total = help_total_rows();
+                        let (_, _, _, _, visible) =
+                            help_box_dimensions(state.cols as usize, state.viewport());
+                        state.help_scroll = total.saturating_sub(visible);
+                    }
+                    _ => {}
                 }
                 return false;
             }
@@ -557,6 +597,15 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
         }
         Event::Mouse(me) => match me.kind {
             MouseEventKind::ScrollDown => match state.mode {
+                ViewMode::Help => {
+                    let total = help_total_rows();
+                    let (_, _, _, _, visible) =
+                        help_box_dimensions(state.cols as usize, state.viewport());
+                    if state.help_scroll + visible < total {
+                        state.help_scroll =
+                            (state.help_scroll + 3).min(total.saturating_sub(visible));
+                    }
+                }
                 ViewMode::Toc => {
                     handle_toc(state, KeyCode::Down);
                 }
@@ -574,6 +623,9 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 }
             },
             MouseEventKind::ScrollUp => match state.mode {
+                ViewMode::Help => {
+                    state.help_scroll = state.help_scroll.saturating_sub(3);
+                }
                 ViewMode::Toc => {
                     handle_toc(state, KeyCode::Up);
                 }
@@ -1243,7 +1295,10 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
     // Clear stale Kitty image placements before redrawing, then upload any
     // pending images (transmitted once, placed cheaply per-frame).
-    if state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
+    // Skip image rendering entirely when an overlay (Help) is visible so
+    // images don't bleed through the overlay.
+    let suppress_images = state.mode == ViewMode::Help;
+    if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
         crate::image::kitty_delete_all(stdout)?;
         state.image_cache.transmit_pending_kitty(stdout)?;
     }
@@ -1337,11 +1392,13 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         let mut drew_inline_image = false;
         if let Some(line) = state.wrapped.get(line_idx) {
             // Render image pixels inline (Kitty / iTerm2).
-            if let LineMeta::Image {
-                ref url,
-                row: image_row,
-                ..
-            } = line.meta
+            // Suppressed when an overlay is active to prevent images bleeding through.
+            if !suppress_images
+                && let LineMeta::Image {
+                    ref url,
+                    row: image_row,
+                    ..
+                } = line.meta
                 && state.image_cache.has_image(url)
             {
                 drew_inline_image = state.image_cache.render_image_row(
@@ -1428,7 +1485,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
     // iTerm2: overlay images in a second pass (1 escape sequence per image,
     // not per-row, so scrolling stays smooth).
-    if state.image_cache.protocol() == crate::image::ImageProtocol::Iterm2 {
+    if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Iterm2 {
         let mut row = 0;
         while row < viewport {
             let line_idx = if state.slide_mode {
@@ -2196,6 +2253,12 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
     SECTIONS
 }
 
+/// Total number of content rows in the help overlay (headers + entries + separators).
+pub(crate) fn help_total_rows() -> usize {
+    let sections = help_sections();
+    sections.iter().map(|s| s.entries.len() + 2).sum::<usize>() - 1
+}
+
 /// Compute the help overlay box dimensions.
 /// Returns (key_col_width, desc_col_width, box_width, box_height, visible_rows).
 pub(crate) fn help_box_dimensions(
@@ -2215,7 +2278,7 @@ pub(crate) fn help_box_dimensions(
         .unwrap_or(0);
     let inner_w = key_col + desc_col + 3;
     let box_w = (inner_w + 2).max(40).min(term_width.saturating_sub(4));
-    let total_rows: usize = sections.iter().map(|s| s.entries.len() + 2).sum::<usize>() - 1;
+    let total_rows = help_total_rows();
     let box_h = (total_rows + 2).min(viewport.saturating_sub(2));
     let visible_rows = box_h.saturating_sub(2);
     (key_col, desc_col, box_w, box_h, visible_rows)
@@ -2262,6 +2325,11 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
         }
     }
 
+    let scroll = state.help_scroll;
+    let total_rows = rows.len();
+    let can_scroll_up = scroll > 0;
+    let can_scroll_down = scroll + visible_rows < total_rows;
+
     for row_i in 0..visible_rows {
         let screen_y = (y_off + 1 + row_i) as u16;
         queue!(
@@ -2273,7 +2341,7 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
         )?;
 
         let inner = box_w.saturating_sub(2);
-        if let Some(&(is_header, left, right)) = rows.get(row_i) {
+        if let Some(&(is_header, left, right)) = rows.get(scroll + row_i) {
             if is_header {
                 // Section heading
                 let label = format!(" {} ", left);
@@ -2323,9 +2391,25 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
         queue!(stdout, SetForegroundColor(theme.overlay_border), Print("│"),)?;
     }
 
+    // Scroll indicators on title/footer lines
+    if can_scroll_up {
+        let indicator = " ▲ ";
+        let ind_len = indicator.chars().count();
+        queue!(
+            stdout,
+            MoveTo((x_off + box_w - 1 - ind_len) as u16, y_off as u16),
+            SetBackgroundColor(theme.overlay_bg),
+            SetForegroundColor(theme.overlay_muted),
+            Print(indicator),
+            SetForegroundColor(theme.overlay_border),
+            Print("╮"),
+        )?;
+    }
+
     // Footer
+    let scroll_hint = if can_scroll_down { " ▼ more " } else { "" };
     let footer = " F1 / Esc / q  close ";
-    let footer_len = footer.chars().count();
+    let footer_len = footer.chars().count() + scroll_hint.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
     queue!(
         stdout,
@@ -2335,6 +2419,16 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
         Print("╰─"),
         SetForegroundColor(theme.overlay_muted),
         Print(footer),
+    )?;
+    if can_scroll_down {
+        queue!(
+            stdout,
+            SetForegroundColor(theme.overlay_muted),
+            Print(scroll_hint),
+        )?;
+    }
+    queue!(
+        stdout,
         SetForegroundColor(theme.overlay_border),
         Print(format!("{}╯", "─".repeat(bot_dashes))),
         SetAttribute(Attribute::Reset),
@@ -2540,5 +2634,24 @@ mod tests {
         let (_, _, _, box_h, visible_rows) = help_box_dimensions(120, 10);
         assert!(box_h <= 8, "box_h should be constrained by short viewport");
         assert!(visible_rows <= box_h);
+    }
+
+    #[test]
+    fn help_total_rows_matches_sections() {
+        let total = help_total_rows();
+        let sections = help_sections();
+        let expected: usize = sections.iter().map(|s| s.entries.len() + 2).sum::<usize>() - 1;
+        assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn help_scroll_truncated_viewport() {
+        // With a very short viewport, visible_rows < total_rows means scrolling is needed.
+        let total = help_total_rows();
+        let (_, _, _, _, visible) = help_box_dimensions(80, 10);
+        assert!(
+            visible < total,
+            "short viewport should truncate help: visible={visible}, total={total}"
+        );
     }
 }
