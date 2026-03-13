@@ -52,7 +52,8 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         state.status_msg = None;
 
         // Poll for completed background fetches
-        if state.image_cache.poll_completed() {
+        let new_images = state.image_cache.poll_completed();
+        if new_images {
             state.rebuild();
         }
 
@@ -63,6 +64,12 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             } else {
                 break;
             }
+        }
+
+        // If new images arrived, loop back to render them immediately.
+        // This comes after dispatch so pending URLs still get queued.
+        if new_images {
+            continue;
         }
 
         let timeout = if state.image_cache.has_in_flight() {
