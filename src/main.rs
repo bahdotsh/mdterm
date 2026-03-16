@@ -80,11 +80,19 @@ fn main() {
             eprintln!("Try 'mdterm --help' for more information.");
             process::exit(1);
         }
+        const MAX_STDIN_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
         let mut buf = String::new();
-        io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-            eprintln!("Error reading stdin: {}", e);
+        let n = io::stdin()
+            .take(MAX_STDIN_BYTES + 1)
+            .read_to_string(&mut buf)
+            .unwrap_or_else(|e| {
+                eprintln!("Error reading stdin: {}", e);
+                process::exit(1);
+            });
+        if n as u64 > MAX_STDIN_BYTES {
+            eprintln!("Error: stdin input exceeds 100 MB limit");
             process::exit(1);
-        });
+        }
         (buf, "<stdin>".to_string())
     } else {
         let path = &cli.files[0];

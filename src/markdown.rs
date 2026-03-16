@@ -4,6 +4,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthStr;
 
 use crate::diagram;
 use crate::style::{CodeBlockContent, DocumentInfo, Line, LineMeta, Style, StyledSpan};
@@ -259,7 +260,7 @@ impl<'a> Renderer<'a> {
         };
         let max_line_len = code_lines
             .iter()
-            .map(|l| l.chars().count())
+            .map(|l| UnicodeWidthStr::width(*l))
             .max()
             .unwrap_or(0);
         let content_width = (max_line_len
@@ -279,7 +280,7 @@ impl<'a> Renderer<'a> {
         } else {
             format!(" {} ", lang)
         };
-        let label_len = label.chars().count();
+        let label_len = UnicodeWidthStr::width(label.as_str());
 
         // Top border
         let dashes_after = inner_width.saturating_sub(1 + label_len);
@@ -334,7 +335,7 @@ impl<'a> Renderer<'a> {
             let mut char_count = 0;
             if self.line_numbers {
                 let num_str = format!("{:>width$} │ ", line_num + 1, width = line_num_width);
-                char_count += num_str.chars().count();
+                char_count += UnicodeWidthStr::width(num_str.as_str());
                 spans.push(StyledSpan {
                     text: num_str,
                     style: Style {
@@ -349,7 +350,7 @@ impl<'a> Renderer<'a> {
                 for (syn_style, text) in ranges {
                     let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
                     if !trimmed.is_empty() {
-                        char_count += trimmed.chars().count();
+                        char_count += UnicodeWidthStr::width(trimmed);
                         let mut style = syntect_to_style(syn_style);
                         style.bg = Some(code_bg);
                         spans.push(StyledSpan {
@@ -360,7 +361,7 @@ impl<'a> Renderer<'a> {
                 }
             } else {
                 let trimmed = line_str.trim_end_matches('\n').trim_end_matches('\r');
-                char_count = trimmed.chars().count();
+                char_count = UnicodeWidthStr::width(trimmed);
                 spans.push(StyledSpan {
                     text: trimmed.to_string(),
                     style: Style {
@@ -420,7 +421,7 @@ impl<'a> Renderer<'a> {
 
         // Top border with label
         let label = " mermaid (diagram) ";
-        let label_len = label.chars().count();
+        let label_len = UnicodeWidthStr::width(label);
         let dashes_after = inner_width.saturating_sub(1 + label_len);
         self.lines.push(Line {
             spans: vec![
@@ -468,7 +469,7 @@ impl<'a> Renderer<'a> {
                 },
             ];
 
-            let row_width: usize = row_spans.iter().map(|s| s.text.chars().count()).sum();
+            let row_width: usize = row_spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
             spans.extend(row_spans.iter().cloned());
 
             let padding = content_width.saturating_sub(row_width) + 1;
@@ -523,7 +524,7 @@ impl<'a> Renderer<'a> {
         for row in &all_rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < num_cols {
-                    let w: usize = cell.iter().map(|s| s.text.chars().count()).sum();
+                    let w: usize = cell.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
                     col_widths[i] = col_widths[i].max(w);
                 }
             }
@@ -623,7 +624,7 @@ impl<'a> Renderer<'a> {
 
                     if let Some(spans_in_line) = cell_line {
                         let content_width: usize =
-                            spans_in_line.iter().map(|s| s.text.chars().count()).sum();
+                            spans_in_line.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
                         let pad = cw.saturating_sub(content_width);
 
                         let (pad_left, pad_right) = match alignment {
@@ -1106,7 +1107,7 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
         return vec![spans.to_vec()];
     }
 
-    let total: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+    let total: usize = spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
     if total <= width {
         return vec![spans.to_vec()];
     }
@@ -1149,7 +1150,7 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
             }
             units.push(WrapUnit::Whitespace(seg));
         } else {
-            word_width += seg.text.chars().count();
+            word_width += UnicodeWidthStr::width(seg.text.as_str());
             word_segs.push(seg);
         }
     }
@@ -1167,7 +1168,7 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
                 if col == 0 && !lines.is_empty() {
                     continue;
                 }
-                col += seg.text.chars().count();
+                col += UnicodeWidthStr::width(seg.text.as_str());
                 current.push(seg.clone());
             }
             WrapUnit::Word(segs, ww) => {
@@ -1183,7 +1184,7 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
 
                 if *ww <= width {
                     for seg in segs {
-                        col += seg.text.chars().count();
+                        col += UnicodeWidthStr::width(seg.text.as_str());
                         current.push(seg.clone());
                     }
                 } else {
@@ -1191,19 +1192,27 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
                         let chars: Vec<char> = seg.text.chars().collect();
                         let mut i = 0;
                         while i < chars.len() {
-                            let avail = if col < width { width - col } else { width };
                             if col >= width {
                                 lines.push(std::mem::take(&mut current));
                                 col = 0;
                                 continue;
                             }
-                            let take = avail.min(chars.len() - i);
+                            let mut chunk = String::new();
+                            let mut chunk_w = 0;
+                            while i < chars.len() {
+                                let cw = unicode_width::UnicodeWidthChar::width(chars[i]).unwrap_or(0);
+                                if chunk_w + cw > width - col && chunk_w > 0 {
+                                    break;
+                                }
+                                chunk.push(chars[i]);
+                                chunk_w += cw;
+                                i += 1;
+                            }
+                            col += chunk_w;
                             current.push(StyledSpan {
-                                text: chars[i..i + take].iter().collect(),
+                                text: chunk,
                                 style: seg.style.clone(),
                             });
-                            col += take;
-                            i += take;
                         }
                     }
                 }

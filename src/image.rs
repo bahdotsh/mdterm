@@ -109,11 +109,11 @@ fn calc_display_cells(
 
 // ── PNG encoding helper ─────────────────────────────────────────────────────
 
-fn encode_png(img: &DynamicImage) -> Vec<u8> {
+fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-        .expect("PNG encoding failed");
-    bytes
+        .ok()?;
+    Some(bytes)
 }
 
 // ── Kitty graphics protocol ─────────────────────────────────────────────────
@@ -406,8 +406,22 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = encode_png(&resized);
-                        self.next_kitty_id += 1;
+                        let png = match encode_png(&resized) {
+                            Some(data) => data,
+                            None => return KittyImage {
+                                id: 0,
+                                cols: 0,
+                                rows: 0,
+                                target_w: 0,
+                                target_h: 0,
+                                cell_h_px: 0,
+                                pending_png: None,
+                            },
+                        };
+                        self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
+                        if self.next_kitty_id == 0 {
+                            self.next_kitty_id = 1;
+                        }
                         KittyImage {
                             id: self.next_kitty_id,
                             cols,
@@ -432,7 +446,18 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let full_base64 = BASE64.encode(encode_png(&resized));
+                        let png = match encode_png(&resized) {
+                            Some(data) => data,
+                            None => return Iterm2Image {
+                                cols: 0,
+                                total_rows: 0,
+                                cell_h_px: 0,
+                                resized: DynamicImage::new_rgb8(1, 1),
+                                full_base64: String::new(),
+                                crop_cache: None,
+                            },
+                        };
+                        let full_base64 = BASE64.encode(png);
 
                         Iterm2Image {
                             cols,
@@ -617,7 +642,11 @@ impl ImageCache {
                     .min(ii.resized.height().saturating_sub(y))
                     .max(1);
                 let cropped = ii.resized.crop_imm(0, y, ii.resized.width(), h);
-                ii.crop_cache = Some((first_row, num_rows, BASE64.encode(encode_png(&cropped))));
+                let png = match encode_png(&cropped) {
+                    Some(data) => data,
+                    None => return Ok(()),
+                };
+                ii.crop_cache = Some((first_row, num_rows, BASE64.encode(png)));
             }
             &ii.crop_cache.as_ref().unwrap().2
         };
@@ -713,7 +742,14 @@ fn is_blocked_host(host: &str) -> bool {
     blocked.iter().any(|b| h == *b)
         || h.starts_with("10.")
         || h.starts_with("192.168.")
+        || h.starts_with("0.")
         || is_rfc1918_172(&h)
+        || h.ends_with(".local")
+        || h.ends_with(".localhost")
+        || h == "localhost"
+        || h.ends_with(".internal")
+        || h.starts_with("[::ffff:")
+        || h.starts_with("::ffff:")
 }
 
 fn fetch_image_http(url: &str) -> Option<DynamicImage> {
@@ -1127,6 +1163,25 @@ mod tests {
         assert!(!is_blocked_host("example.com"));
         assert!(!is_blocked_host("8.8.8.8"));
         assert!(!is_blocked_host("cdn.github.com"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_zero_prefix() {
+        assert!(is_blocked_host("0.0.0.0"));
+        assert!(is_blocked_host("0.1.2.3"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_local_tlds() {
+        assert!(is_blocked_host("printer.local"));
+        assert!(is_blocked_host("app.localhost"));
+        assert!(is_blocked_host("service.internal"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_ipv6_mapped() {
+        assert!(is_blocked_host("::ffff:127.0.0.1"));
+        assert!(is_blocked_host("[::ffff:10.0.0.1]"));
     }
 
     // ── extract_host ────────────────────────────────────────────────────────
