@@ -977,17 +977,24 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
 /// Convert heading text to a GitHub-style anchor slug.
 /// Note: when duplicate headings exist, callers match the first occurrence.
 fn heading_to_slug(text: &str) -> String {
-    text.chars()
-        .filter_map(|c| {
-            if c.is_alphanumeric() {
-                Some(c.to_lowercase().next().unwrap_or(c))
-            } else if c == ' ' || c == '-' {
-                Some('-')
-            } else {
-                None
+    let mut result = String::with_capacity(text.len());
+    let mut prev_hyphen = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                result.push(lc);
             }
-        })
-        .collect()
+            prev_hyphen = false;
+        } else if (c == ' ' || c == '-') && !prev_hyphen && !result.is_empty() {
+            result.push('-');
+            prev_hyphen = true;
+        }
+    }
+    // Trim trailing hyphen
+    if result.ends_with('-') {
+        result.pop();
+    }
+    result
 }
 
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
@@ -2805,15 +2812,32 @@ mod tests {
     }
 
     #[test]
-    fn slug_consecutive_hyphens_preserved() {
-        assert_eq!(heading_to_slug("foo--bar"), "foo--bar");
-        assert_eq!(heading_to_slug("a  b"), "a--b");
+    fn slug_consecutive_hyphens_collapsed() {
+        assert_eq!(heading_to_slug("foo--bar"), "foo-bar");
+        assert_eq!(heading_to_slug("a  b"), "a-b");
     }
 
     #[test]
     fn slug_unicode() {
         assert_eq!(heading_to_slug("café"), "café");
         assert_eq!(heading_to_slug("Über"), "über");
+    }
+
+    #[test]
+    fn slug_multi_char_lowercase() {
+        assert_eq!(heading_to_slug("straße"), "straße");
+    }
+
+    #[test]
+    fn slug_leading_trailing_trimmed() {
+        assert_eq!(heading_to_slug(" Hello "), "hello");
+        assert_eq!(heading_to_slug("- - -"), "");
+        assert_eq!(heading_to_slug("--foo--"), "foo");
+    }
+
+    #[test]
+    fn slug_mixed_unicode_punctuation() {
+        assert_eq!(heading_to_slug("Héllo, World!"), "héllo-world");
     }
 
     #[test]
