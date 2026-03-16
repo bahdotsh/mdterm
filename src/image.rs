@@ -109,11 +109,11 @@ fn calc_display_cells(
 
 // ── PNG encoding helper ─────────────────────────────────────────────────────
 
-fn encode_png(img: &DynamicImage) -> Vec<u8> {
+fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-        .expect("PNG encoding failed");
-    bytes
+        .ok()?;
+    Some(bytes)
 }
 
 // ── Kitty graphics protocol ─────────────────────────────────────────────────
@@ -212,12 +212,12 @@ pub struct ImageCache {
     images: HashMap<String, Option<DynamicImage>>,
     protocol: ImageProtocol,
 
-    // Kitty: image uploaded once, placed per-frame
-    kitty_images: HashMap<String, KittyImage>,
+    // Kitty: image uploaded once, placed per-frame (None = encode failed)
+    kitty_images: HashMap<String, Option<KittyImage>>,
     next_kitty_id: u32,
 
-    // iTerm2: pre-cropped strips cached per image
-    iterm2_images: HashMap<String, Iterm2Image>,
+    // iTerm2: pre-cropped strips cached per image (None = encode failed)
+    iterm2_images: HashMap<String, Option<Iterm2Image>>,
 
     // Half-block: resized images for Unicode block rendering
     halfblock_images: HashMap<String, HalfBlockImage>,
@@ -239,6 +239,8 @@ impl ImageCache {
             images: HashMap::new(),
             protocol,
             kitty_images: HashMap::new(),
+            // Starts at 0; wrapping_add(1) before first use ensures IDs begin at 1.
+            // ID 0 is reserved in the Kitty protocol ("the last image").
             next_kitty_id: 0,
             iterm2_images: HashMap::new(),
             halfblock_images: HashMap::new(),
@@ -406,9 +408,12 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = encode_png(&resized);
-                        self.next_kitty_id += 1;
-                        KittyImage {
+                        let png = encode_png(&resized)?;
+                        self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
+                        if self.next_kitty_id == 0 {
+                            self.next_kitty_id = 1;
+                        }
+                        Some(KittyImage {
                             id: self.next_kitty_id,
                             cols,
                             rows,
@@ -416,7 +421,7 @@ impl ImageCache {
                             target_h,
                             cell_h_px,
                             pending_png: Some(png),
-                        }
+                        })
                     });
                 }
                 ImageProtocol::Iterm2 => {
@@ -432,16 +437,17 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let full_base64 = BASE64.encode(encode_png(&resized));
+                        let png = encode_png(&resized)?;
+                        let full_base64 = BASE64.encode(png);
 
-                        Iterm2Image {
+                        Some(Iterm2Image {
                             cols,
                             total_rows: rows,
                             cell_h_px,
                             resized,
                             full_base64,
                             crop_cache: None,
-                        }
+                        })
                     });
                 }
                 ImageProtocol::HalfBlock => {
@@ -491,7 +497,7 @@ impl ImageCache {
     /// Transmit any Kitty images that haven't been uploaded to the terminal yet.
     /// Call this once per frame, before placing images.
     pub fn transmit_pending_kitty(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        for ki in self.kitty_images.values_mut() {
+        for ki in self.kitty_images.values_mut().flatten() {
             if let Some(png_data) = ki.pending_png.take() {
                 transmit_kitty_image(stdout, &png_data, ki.id)?;
             }
@@ -506,7 +512,7 @@ impl ImageCache {
         image_row: usize,
         content_width: usize,
     ) -> io::Result<bool> {
-        let ki = match self.kitty_images.get(url) {
+        let ki = match self.kitty_images.get(url).and_then(|o| o.as_ref()) {
             Some(ki) => ki,
             None => return Ok(false),
         };
@@ -596,7 +602,7 @@ impl ImageCache {
         content_width: usize,
         screen_y: u16,
     ) -> io::Result<()> {
-        let ii = match self.iterm2_images.get_mut(url) {
+        let ii = match self.iterm2_images.get_mut(url).and_then(|o| o.as_mut()) {
             Some(ii) => ii,
             None => return Ok(()),
         };
@@ -617,7 +623,11 @@ impl ImageCache {
                     .min(ii.resized.height().saturating_sub(y))
                     .max(1);
                 let cropped = ii.resized.crop_imm(0, y, ii.resized.width(), h);
-                ii.crop_cache = Some((first_row, num_rows, BASE64.encode(encode_png(&cropped))));
+                let png = match encode_png(&cropped) {
+                    Some(data) => data,
+                    None => return Ok(()),
+                };
+                ii.crop_cache = Some((first_row, num_rows, BASE64.encode(png)));
             }
             &ii.crop_cache.as_ref().unwrap().2
         };
@@ -705,6 +715,8 @@ fn is_blocked_host(host: &str) -> bool {
         "127.0.0.1",
         "::1",
         "[::1]",
+        "[0:0:0:0:0:0:0:1]",
+        "0:0:0:0:0:0:0:1",
         "0.0.0.0",
         "169.254.169.254",
         "metadata.google.internal",
@@ -713,7 +725,13 @@ fn is_blocked_host(host: &str) -> bool {
     blocked.iter().any(|b| h == *b)
         || h.starts_with("10.")
         || h.starts_with("192.168.")
+        || h.starts_with("0.")
         || is_rfc1918_172(&h)
+        || h.ends_with(".local")
+        || h.ends_with(".localhost")
+        || h.ends_with(".internal")
+        || h.starts_with("[::ffff:")
+        || h.starts_with("::ffff:")
 }
 
 fn fetch_image_http(url: &str) -> Option<DynamicImage> {
@@ -1127,6 +1145,31 @@ mod tests {
         assert!(!is_blocked_host("example.com"));
         assert!(!is_blocked_host("8.8.8.8"));
         assert!(!is_blocked_host("cdn.github.com"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_zero_prefix() {
+        assert!(is_blocked_host("0.0.0.0"));
+        assert!(is_blocked_host("0.1.2.3"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_local_tlds() {
+        assert!(is_blocked_host("printer.local"));
+        assert!(is_blocked_host("app.localhost"));
+        assert!(is_blocked_host("service.internal"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_ipv6_mapped() {
+        assert!(is_blocked_host("::ffff:127.0.0.1"));
+        assert!(is_blocked_host("[::ffff:10.0.0.1]"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_ipv6_expanded() {
+        assert!(is_blocked_host("[0:0:0:0:0:0:0:1]"));
+        assert!(is_blocked_host("0:0:0:0:0:0:0:1"));
     }
 
     // ── extract_host ────────────────────────────────────────────────────────

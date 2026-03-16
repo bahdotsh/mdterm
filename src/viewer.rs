@@ -1267,41 +1267,54 @@ fn scroll_to_match(search: &SearchState, offset: &mut usize, viewport: usize, ma
 
 // ── Clipboard ───────────────────────────────────────────────────────────────
 
+fn run_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    // Drop stdin (already taken above) to signal EOF, then wait with timeout
+    let timeout = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                } else {
+                    return Err(io::Error::other(format!("{cmd} exited with {status}")));
+                }
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Clipboard command timed out",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(ref mut stdin) = child.stdin {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
+        run_clipboard_cmd("pbcopy", &[], text)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Try xclip, then xsel
-        if let Ok(mut child) = std::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(text.as_bytes())?;
-            }
-            child.wait()?;
+        if run_clipboard_cmd("xclip", &["-selection", "clipboard"], text).is_ok() {
             return Ok(());
         }
-        if let Ok(mut child) = std::process::Command::new("xsel")
-            .arg("--clipboard")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(text.as_bytes())?;
-            }
-            child.wait()?;
+        if run_clipboard_cmd("xsel", &["--clipboard"], text).is_ok() {
             return Ok(());
         }
         Err(io::Error::new(

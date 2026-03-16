@@ -147,11 +147,14 @@ fn parse_node_ref(s: &str) -> Option<(String, Option<(String, NodeShape)>, &str)
 }
 
 fn find_matching(s: &str, open: char, close: char) -> Option<usize> {
-    let mut depth = 0;
+    let mut depth: usize = 0;
     for (i, c) in s.char_indices() {
         if c == open {
             depth += 1;
         } else if c == close {
+            if depth == 0 {
+                continue;
+            }
             depth -= 1;
             if depth == 0 {
                 return Some(i);

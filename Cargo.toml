@@ -22,3 +22,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 base64 = "0.22"
 ureq = "3"
+unicode-width = "0.2"

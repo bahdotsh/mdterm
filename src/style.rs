@@ -1,4 +1,5 @@
 use crossterm::style::Color;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Style {
@@ -54,7 +55,10 @@ impl Line {
     }
 
     pub fn display_width(&self) -> usize {
-        self.spans.iter().map(|s| s.text.chars().count()).sum()
+        self.spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+            .sum()
     }
 }
 
@@ -116,7 +120,7 @@ fn word_wrap(line: &Line, width: usize) -> Vec<Line> {
     let mut col: usize = 0;
 
     for seg in &segments {
-        let seg_width = seg.text.chars().count();
+        let seg_width = UnicodeWidthStr::width(seg.text.as_str());
         let is_ws = seg
             .text
             .chars()
@@ -145,15 +149,22 @@ fn word_wrap(line: &Line, width: usize) -> Vec<Line> {
             let chars: Vec<char> = seg.text.chars().collect();
             let mut i = 0;
             while i < chars.len() {
-                let avail = width - col;
-                let take = avail.min(chars.len() - i);
-                let chunk: String = chars[i..i + take].iter().collect();
+                let mut chunk = String::new();
+                let mut chunk_w = 0;
+                while i < chars.len() {
+                    let cw = unicode_width::UnicodeWidthChar::width(chars[i]).unwrap_or(0);
+                    if chunk_w + cw > width && chunk_w > 0 {
+                        break;
+                    }
+                    chunk.push(chars[i]);
+                    chunk_w += cw;
+                    i += 1;
+                }
+                col += chunk_w;
                 current.push(StyledSpan {
                     text: chunk,
                     style: seg.style.clone(),
                 });
-                col += take;
-                i += take;
                 if col >= width && i < chars.len() {
                     lines.push(Line {
                         spans: std::mem::take(&mut current),
@@ -312,6 +323,42 @@ mod tests {
         assert!(aaa_pos < bbb_pos);
         assert!(bbb_pos < ccc_pos);
         assert!(ccc_pos < ddd_pos);
+    }
+
+    #[test]
+    fn cjk_characters_count_as_double_width() {
+        // Each CJK character is 2 columns wide; with width=6, at most 3 CJK chars fit per line
+        let lines = vec![plain_line("你好世界测试")]; // 6 chars, 12 columns
+        let wrapped = wrap_lines(&lines, 6);
+        assert!(
+            wrapped.len() >= 2,
+            "CJK text should wrap based on display width, not char count"
+        );
+        for line in &wrapped {
+            assert!(
+                line.display_width() <= 6,
+                "each line should be at most 6 columns, got {}",
+                line.display_width()
+            );
+        }
+        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        assert_eq!(all, "你好世界测试");
+    }
+
+    #[test]
+    fn emoji_display_width_respected() {
+        // Emoji are typically 2 columns wide
+        let lines = vec![plain_line("🎉🎊🎈")]; // 3 emoji, 6 columns
+        let wrapped = wrap_lines(&lines, 4);
+        assert!(
+            wrapped.len() >= 2,
+            "emoji text should wrap based on display width"
+        );
+        for line in &wrapped {
+            assert!(line.display_width() <= 4);
+        }
+        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        assert_eq!(all, "🎉🎊🎈");
     }
 
     #[test]
