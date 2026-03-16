@@ -239,6 +239,8 @@ impl ImageCache {
             images: HashMap::new(),
             protocol,
             kitty_images: HashMap::new(),
+            // Starts at 0; wrapping_add(1) before first use ensures IDs begin at 1.
+            // ID 0 is reserved in the Kitty protocol ("the last image").
             next_kitty_id: 0,
             iterm2_images: HashMap::new(),
             halfblock_images: HashMap::new(),
@@ -408,15 +410,17 @@ impl ImageCache {
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
                         let png = match encode_png(&resized) {
                             Some(data) => data,
-                            None => return KittyImage {
-                                id: 0,
-                                cols: 0,
-                                rows: 0,
-                                target_w: 0,
-                                target_h: 0,
-                                cell_h_px: 0,
-                                pending_png: None,
-                            },
+                            None => {
+                                return KittyImage {
+                                    id: 0,
+                                    cols: 0,
+                                    rows: 0,
+                                    target_w: 0,
+                                    target_h: 0,
+                                    cell_h_px: 0,
+                                    pending_png: None,
+                                };
+                            }
                         };
                         self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
                         if self.next_kitty_id == 0 {
@@ -448,14 +452,16 @@ impl ImageCache {
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
                         let png = match encode_png(&resized) {
                             Some(data) => data,
-                            None => return Iterm2Image {
-                                cols: 0,
-                                total_rows: 0,
-                                cell_h_px: 0,
-                                resized: DynamicImage::new_rgb8(1, 1),
-                                full_base64: String::new(),
-                                crop_cache: None,
-                            },
+                            None => {
+                                return Iterm2Image {
+                                    cols: 0,
+                                    total_rows: 0,
+                                    cell_h_px: 0,
+                                    resized: DynamicImage::new_rgb8(1, 1),
+                                    full_base64: String::new(),
+                                    crop_cache: None,
+                                };
+                            }
                         };
                         let full_base64 = BASE64.encode(png);
 
@@ -517,6 +523,11 @@ impl ImageCache {
     /// Call this once per frame, before placing images.
     pub fn transmit_pending_kitty(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         for ki in self.kitty_images.values_mut() {
+            // Skip sentinel images produced by encode_png failure (id 0 has
+            // special meaning in the Kitty protocol — "the last image").
+            if ki.id == 0 {
+                continue;
+            }
             if let Some(png_data) = ki.pending_png.take() {
                 transmit_kitty_image(stdout, &png_data, ki.id)?;
             }
@@ -532,8 +543,8 @@ impl ImageCache {
         content_width: usize,
     ) -> io::Result<bool> {
         let ki = match self.kitty_images.get(url) {
-            Some(ki) => ki,
-            None => return Ok(false),
+            Some(ki) if ki.id != 0 && ki.cols > 0 => ki,
+            _ => return Ok(false),
         };
         if image_row >= ki.rows {
             return Ok(false);
@@ -622,8 +633,8 @@ impl ImageCache {
         screen_y: u16,
     ) -> io::Result<()> {
         let ii = match self.iterm2_images.get_mut(url) {
-            Some(ii) => ii,
-            None => return Ok(()),
+            Some(ii) if ii.cols > 0 => ii,
+            _ => return Ok(()),
         };
 
         let x_col = 2 + content_width.saturating_sub(ii.cols) / 2;

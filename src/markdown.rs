@@ -469,7 +469,10 @@ impl<'a> Renderer<'a> {
                 },
             ];
 
-            let row_width: usize = row_spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
+            let row_width: usize = row_spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum();
             spans.extend(row_spans.iter().cloned());
 
             let padding = content_width.saturating_sub(row_width) + 1;
@@ -524,7 +527,10 @@ impl<'a> Renderer<'a> {
         for row in &all_rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < num_cols {
-                    let w: usize = cell.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
+                    let w: usize = cell
+                        .iter()
+                        .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                        .sum();
                     col_widths[i] = col_widths[i].max(w);
                 }
             }
@@ -623,8 +629,10 @@ impl<'a> Renderer<'a> {
                         .unwrap_or(&Alignment::None);
 
                     if let Some(spans_in_line) = cell_line {
-                        let content_width: usize =
-                            spans_in_line.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
+                        let content_width: usize = spans_in_line
+                            .iter()
+                            .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                            .sum();
                         let pad = cw.saturating_sub(content_width);
 
                         let (pad_left, pad_right) = match alignment {
@@ -1107,7 +1115,10 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
         return vec![spans.to_vec()];
     }
 
-    let total: usize = spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum();
+    let total: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+        .sum();
     if total <= width {
         return vec![spans.to_vec()];
     }
@@ -1200,7 +1211,8 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
                             let mut chunk = String::new();
                             let mut chunk_w = 0;
                             while i < chars.len() {
-                                let cw = unicode_width::UnicodeWidthChar::width(chars[i]).unwrap_or(0);
+                                let cw =
+                                    unicode_width::UnicodeWidthChar::width(chars[i]).unwrap_or(0);
                                 if chunk_w + cw > width - col && chunk_w > 0 {
                                     break;
                                 }

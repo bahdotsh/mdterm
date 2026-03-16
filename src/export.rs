@@ -40,11 +40,7 @@ pub fn to_html(content: &str, width: usize, theme: &Theme) {
                         html_escape(alt)
                     );
                 } else {
-                    let _ = writeln!(
-                        out,
-                        "<div class='line'>{}</div>",
-                        html_escape(alt)
-                    );
+                    let _ = writeln!(out, "<div class='line'>{}</div>", html_escape(alt));
                 }
             }
             continue;
@@ -128,9 +124,18 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Strip ASCII control characters (0x00–0x1F except tab/newline) that browsers
+/// silently ignore when parsing URL schemes, which could bypass scheme checks.
+fn strip_control_chars(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\t' || *c == '\n' || *c == '\r')
+        .collect()
+}
+
 /// Returns true if the URL scheme is safe for use in `<a href>`.
 fn is_safe_url(url: &str) -> bool {
-    let trimmed = url.trim();
+    let cleaned = strip_control_chars(url);
+    let trimmed = cleaned.trim();
     let lower = trimmed.to_lowercase();
     // Allow common safe schemes, anchors, and relative paths
     if lower.starts_with("http://")
@@ -153,7 +158,8 @@ fn is_safe_url(url: &str) -> bool {
 
 /// Returns true if the URL is safe for use in `<img src>`.
 fn is_safe_img_src(url: &str) -> bool {
-    let trimmed = url.trim();
+    let cleaned = strip_control_chars(url);
+    let trimmed = cleaned.trim();
     let lower = trimmed.to_lowercase();
     if lower.starts_with("http://")
         || lower.starts_with("https://")
@@ -170,4 +176,121 @@ fn is_safe_img_src(url: &str) -> bool {
     }
     // Allow relative paths
     !lower.split('/').next().unwrap_or("").contains(':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_safe_url ─────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_url_allows_http() {
+        assert!(is_safe_url("http://example.com"));
+        assert!(is_safe_url("https://example.com/page"));
+    }
+
+    #[test]
+    fn safe_url_allows_mailto() {
+        assert!(is_safe_url("mailto:user@example.com"));
+    }
+
+    #[test]
+    fn safe_url_allows_anchor() {
+        assert!(is_safe_url("#section-1"));
+    }
+
+    #[test]
+    fn safe_url_allows_relative_paths() {
+        assert!(is_safe_url("./foo/bar.html"));
+        assert!(is_safe_url("images/photo.png"));
+        assert!(is_safe_url("../other.md"));
+    }
+
+    #[test]
+    fn safe_url_blocks_javascript() {
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("JAVASCRIPT:alert(1)"));
+        assert!(!is_safe_url("JavaScript:void(0)"));
+    }
+
+    #[test]
+    fn safe_url_blocks_vbscript() {
+        assert!(!is_safe_url("vbscript:exec"));
+        assert!(!is_safe_url("VBSCRIPT:MsgBox"));
+    }
+
+    #[test]
+    fn safe_url_blocks_data() {
+        assert!(!is_safe_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn safe_url_blocks_control_char_bypass() {
+        assert!(!is_safe_url("java\x01script:alert(1)"));
+        assert!(!is_safe_url("java\x0Bscript:alert(1)"));
+        assert!(!is_safe_url("\x00javascript:alert(1)"));
+    }
+
+    #[test]
+    fn safe_url_handles_whitespace() {
+        assert!(is_safe_url("  https://example.com  "));
+        assert!(!is_safe_url("  javascript:alert(1)  "));
+    }
+
+    #[test]
+    fn safe_url_handles_empty() {
+        // Empty/whitespace-only: no colon before slash → treated as relative
+        assert!(is_safe_url(""));
+        assert!(is_safe_url("   "));
+    }
+
+    // ── is_safe_img_src ─────────────────────────────────────────────────
+
+    #[test]
+    fn safe_img_allows_http() {
+        assert!(is_safe_img_src("http://example.com/img.png"));
+        assert!(is_safe_img_src("https://cdn.example.com/photo.jpg"));
+    }
+
+    #[test]
+    fn safe_img_allows_data_image() {
+        assert!(is_safe_img_src("data:image/png;base64,iVBOR..."));
+        assert!(is_safe_img_src("data:image/jpeg;base64,/9j/4..."));
+    }
+
+    #[test]
+    fn safe_img_blocks_data_non_image() {
+        assert!(!is_safe_img_src("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_safe_img_src("data:application/pdf,stuff"));
+    }
+
+    #[test]
+    fn safe_img_blocks_javascript() {
+        assert!(!is_safe_img_src("javascript:alert(1)"));
+        assert!(!is_safe_img_src("JAVASCRIPT:alert(1)"));
+    }
+
+    #[test]
+    fn safe_img_blocks_vbscript() {
+        assert!(!is_safe_img_src("vbscript:exec"));
+    }
+
+    #[test]
+    fn safe_img_allows_relative_paths() {
+        assert!(is_safe_img_src("./images/photo.png"));
+        assert!(is_safe_img_src("photo.jpg"));
+    }
+
+    #[test]
+    fn safe_img_blocks_control_char_bypass() {
+        assert!(!is_safe_img_src("java\x01script:alert(1)"));
+        assert!(!is_safe_img_src("\x00javascript:alert(1)"));
+    }
+
+    #[test]
+    fn safe_img_handles_empty() {
+        assert!(is_safe_img_src(""));
+        assert!(is_safe_img_src("   "));
+    }
 }
