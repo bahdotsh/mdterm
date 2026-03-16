@@ -745,6 +745,8 @@ fn is_blocked_host(host: &str) -> bool {
         "127.0.0.1",
         "::1",
         "[::1]",
+        "[0:0:0:0:0:0:0:1]",
+        "0:0:0:0:0:0:0:1",
         "0.0.0.0",
         "169.254.169.254",
         "metadata.google.internal",
@@ -1192,6 +1194,12 @@ mod tests {
     fn is_blocked_host_blocks_ipv6_mapped() {
         assert!(is_blocked_host("::ffff:127.0.0.1"));
         assert!(is_blocked_host("[::ffff:10.0.0.1]"));
+    }
+
+    #[test]
+    fn is_blocked_host_blocks_ipv6_expanded() {
+        assert!(is_blocked_host("[0:0:0:0:0:0:0:1]"));
+        assert!(is_blocked_host("0:0:0:0:0:0:0:1"));
     }
 
     // ── extract_host ────────────────────────────────────────────────────────

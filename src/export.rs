@@ -161,15 +161,24 @@ fn is_safe_img_src(url: &str) -> bool {
     let cleaned = strip_control_chars(url);
     let trimmed = cleaned.trim();
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("data:image/png")
-        || lower.starts_with("data:image/jpeg")
-        || lower.starts_with("data:image/gif")
-        || lower.starts_with("data:image/webp")
-        || lower.starts_with("data:image/bmp")
-    {
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         return true;
+    }
+    // Allow only specific raster image data URIs (MIME must be followed by `;` or `,`)
+    let safe_data_prefixes = [
+        "data:image/png",
+        "data:image/jpeg",
+        "data:image/gif",
+        "data:image/webp",
+        "data:image/bmp",
+    ];
+    for prefix in &safe_data_prefixes {
+        if lower.starts_with(prefix) {
+            let rest = &lower[prefix.len()..];
+            if rest.starts_with(';') || rest.starts_with(',') {
+                return true;
+            }
+        }
     }
     // Block dangerous schemes
     if lower.starts_with("javascript:")
@@ -260,7 +269,15 @@ mod tests {
     #[test]
     fn safe_img_allows_data_image() {
         assert!(is_safe_img_src("data:image/png;base64,iVBOR..."));
+        assert!(is_safe_img_src("data:image/png,rawdata"));
         assert!(is_safe_img_src("data:image/jpeg;base64,/9j/4..."));
+    }
+
+    #[test]
+    fn safe_img_blocks_data_image_prefix_spoof() {
+        // "data:image/pnganything" should not match — MIME must be followed by ; or ,
+        assert!(!is_safe_img_src("data:image/pngevil"));
+        assert!(!is_safe_img_src("data:image/jpegscript:alert(1)"));
     }
 
     #[test]

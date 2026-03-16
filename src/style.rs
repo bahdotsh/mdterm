@@ -326,6 +326,42 @@ mod tests {
     }
 
     #[test]
+    fn cjk_characters_count_as_double_width() {
+        // Each CJK character is 2 columns wide; with width=6, at most 3 CJK chars fit per line
+        let lines = vec![plain_line("你好世界测试")]; // 6 chars, 12 columns
+        let wrapped = wrap_lines(&lines, 6);
+        assert!(
+            wrapped.len() >= 2,
+            "CJK text should wrap based on display width, not char count"
+        );
+        for line in &wrapped {
+            assert!(
+                line.display_width() <= 6,
+                "each line should be at most 6 columns, got {}",
+                line.display_width()
+            );
+        }
+        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        assert_eq!(all, "你好世界测试");
+    }
+
+    #[test]
+    fn emoji_display_width_respected() {
+        // Emoji are typically 2 columns wide
+        let lines = vec![plain_line("🎉🎊🎈")]; // 3 emoji, 6 columns
+        let wrapped = wrap_lines(&lines, 4);
+        assert!(
+            wrapped.len() >= 2,
+            "emoji text should wrap based on display width"
+        );
+        for line in &wrapped {
+            assert!(line.display_width() <= 4);
+        }
+        let all: String = wrapped.iter().map(|l| line_text(l)).collect();
+        assert_eq!(all, "🎉🎊🎈");
+    }
+
+    #[test]
     fn multi_span_line_wraps_preserving_styles() {
         let bold_style = Style {
             bold: true,
