@@ -129,9 +129,7 @@ fn html_escape(s: &str) -> String {
 /// Tabs, newlines, and carriage returns are also stripped because the URL
 /// standard removes them before scheme matching.
 fn strip_control_chars(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .collect()
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Returns true if the URL scheme is safe for use in `<a href>`.
