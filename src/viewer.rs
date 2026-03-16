@@ -975,18 +975,18 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
 }
 
 /// Convert heading text to a GitHub-style anchor slug.
+/// Note: when duplicate headings exist, callers match the first occurrence.
 fn heading_to_slug(text: &str) -> String {
     text.chars()
-        .map(|c| {
+        .filter_map(|c| {
             if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
+                Some(c.to_lowercase().next().unwrap_or(c))
             } else if c == ' ' || c == '-' {
-                '-'
+                Some('-')
             } else {
-                '\0'
+                None
             }
         })
-        .filter(|&c| c != '\0')
         .collect()
 }
 
@@ -2791,5 +2791,34 @@ mod tests {
             visible < total,
             "short viewport should truncate help: visible={visible}, total={total}"
         );
+    }
+
+    #[test]
+    fn slug_basic() {
+        assert_eq!(heading_to_slug("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slug_punctuation_stripped() {
+        assert_eq!(heading_to_slug("Rust 2024!"), "rust-2024");
+        assert_eq!(heading_to_slug("What's new?"), "whats-new");
+    }
+
+    #[test]
+    fn slug_consecutive_hyphens_preserved() {
+        assert_eq!(heading_to_slug("foo--bar"), "foo--bar");
+        assert_eq!(heading_to_slug("a  b"), "a--b");
+    }
+
+    #[test]
+    fn slug_unicode() {
+        assert_eq!(heading_to_slug("café"), "café");
+        assert_eq!(heading_to_slug("Über"), "über");
+    }
+
+    #[test]
+    fn slug_empty_and_special_only() {
+        assert_eq!(heading_to_slug(""), "");
+        assert_eq!(heading_to_slug("!@#$%"), "");
     }
 }
