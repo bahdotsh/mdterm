@@ -1282,7 +1282,16 @@ fn run_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
     let start = std::time::Instant::now();
     loop {
         match child.try_wait()? {
-            Some(_status) => return Ok(()),
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("{cmd} exited with {status}"),
+                    ));
+                }
+            }
             None => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();

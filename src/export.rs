@@ -124,11 +124,13 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Strip ASCII control characters (0x00–0x1F except tab/newline) that browsers
-/// silently ignore when parsing URL schemes, which could bypass scheme checks.
+/// Strip all ASCII control characters (0x00–0x1F, 0x7F) that browsers silently
+/// ignore when parsing URL schemes, which could bypass scheme checks.
+/// Tabs, newlines, and carriage returns are also stripped because the URL
+/// standard removes them before scheme matching.
 fn strip_control_chars(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() || *c == '\t' || *c == '\n' || *c == '\r')
+        .filter(|c| !c.is_control())
         .collect()
 }
 
@@ -242,6 +244,16 @@ mod tests {
         assert!(!is_safe_url("java\x01script:alert(1)"));
         assert!(!is_safe_url("java\x0Bscript:alert(1)"));
         assert!(!is_safe_url("\x00javascript:alert(1)"));
+    }
+
+    #[test]
+    fn safe_url_blocks_tab_newline_in_scheme() {
+        // Browsers strip tabs and newlines before scheme matching (URL standard),
+        // so these must be stripped before our checks too.
+        assert!(!is_safe_url("java\tscript:alert(1)"));
+        assert!(!is_safe_url("java\nscript:alert(1)"));
+        assert!(!is_safe_url("java\rscript:alert(1)"));
+        assert!(!is_safe_url("j\ta\nv\ra\tscript:alert(1)"));
     }
 
     #[test]
