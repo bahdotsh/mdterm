@@ -163,7 +163,11 @@ fn is_safe_img_src(url: &str) -> bool {
     let lower = trimmed.to_lowercase();
     if lower.starts_with("http://")
         || lower.starts_with("https://")
-        || lower.starts_with("data:image/")
+        || lower.starts_with("data:image/png")
+        || lower.starts_with("data:image/jpeg")
+        || lower.starts_with("data:image/gif")
+        || lower.starts_with("data:image/webp")
+        || lower.starts_with("data:image/bmp")
     {
         return true;
     }
@@ -263,6 +267,16 @@ mod tests {
     fn safe_img_blocks_data_non_image() {
         assert!(!is_safe_img_src("data:text/html,<script>alert(1)</script>"));
         assert!(!is_safe_img_src("data:application/pdf,stuff"));
+    }
+
+    #[test]
+    fn safe_img_blocks_svg_xss() {
+        assert!(!is_safe_img_src(
+            "data:image/svg+xml,<svg onload='alert(1)'>"
+        ));
+        assert!(!is_safe_img_src(
+            "data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9ImFsZXJ0KDEpIj4="
+        ));
     }
 
     #[test]

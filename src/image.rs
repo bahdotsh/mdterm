@@ -757,7 +757,6 @@ fn is_blocked_host(host: &str) -> bool {
         || is_rfc1918_172(&h)
         || h.ends_with(".local")
         || h.ends_with(".localhost")
-        || h == "localhost"
         || h.ends_with(".internal")
         || h.starts_with("[::ffff:")
         || h.starts_with("::ffff:")
