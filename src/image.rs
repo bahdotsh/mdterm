@@ -212,12 +212,12 @@ pub struct ImageCache {
     images: HashMap<String, Option<DynamicImage>>,
     protocol: ImageProtocol,
 
-    // Kitty: image uploaded once, placed per-frame
-    kitty_images: HashMap<String, KittyImage>,
+    // Kitty: image uploaded once, placed per-frame (None = encode failed)
+    kitty_images: HashMap<String, Option<KittyImage>>,
     next_kitty_id: u32,
 
-    // iTerm2: pre-cropped strips cached per image
-    iterm2_images: HashMap<String, Iterm2Image>,
+    // iTerm2: pre-cropped strips cached per image (None = encode failed)
+    iterm2_images: HashMap<String, Option<Iterm2Image>>,
 
     // Half-block: resized images for Unicode block rendering
     halfblock_images: HashMap<String, HalfBlockImage>,
@@ -408,25 +408,12 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = match encode_png(&resized) {
-                            Some(data) => data,
-                            None => {
-                                return KittyImage {
-                                    id: 0,
-                                    cols: 0,
-                                    rows: 0,
-                                    target_w: 0,
-                                    target_h: 0,
-                                    cell_h_px: 0,
-                                    pending_png: None,
-                                };
-                            }
-                        };
+                        let png = encode_png(&resized)?;
                         self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
                         if self.next_kitty_id == 0 {
                             self.next_kitty_id = 1;
                         }
-                        KittyImage {
+                        Some(KittyImage {
                             id: self.next_kitty_id,
                             cols,
                             rows,
@@ -434,7 +421,7 @@ impl ImageCache {
                             target_h,
                             cell_h_px,
                             pending_png: Some(png),
-                        }
+                        })
                     });
                 }
                 ImageProtocol::Iterm2 => {
@@ -450,29 +437,17 @@ impl ImageCache {
                         let target_w = (cols as u32 * cell_w_px).max(1);
                         let target_h = (rows as u32 * cell_h_px).max(1);
                         let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = match encode_png(&resized) {
-                            Some(data) => data,
-                            None => {
-                                return Iterm2Image {
-                                    cols: 0,
-                                    total_rows: 0,
-                                    cell_h_px: 0,
-                                    resized: DynamicImage::new_rgb8(1, 1),
-                                    full_base64: String::new(),
-                                    crop_cache: None,
-                                };
-                            }
-                        };
+                        let png = encode_png(&resized)?;
                         let full_base64 = BASE64.encode(png);
 
-                        Iterm2Image {
+                        Some(Iterm2Image {
                             cols,
                             total_rows: rows,
                             cell_h_px,
                             resized,
                             full_base64,
                             crop_cache: None,
-                        }
+                        })
                     });
                 }
                 ImageProtocol::HalfBlock => {
@@ -522,12 +497,7 @@ impl ImageCache {
     /// Transmit any Kitty images that haven't been uploaded to the terminal yet.
     /// Call this once per frame, before placing images.
     pub fn transmit_pending_kitty(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        for ki in self.kitty_images.values_mut() {
-            // Skip sentinel images produced by encode_png failure (id 0 has
-            // special meaning in the Kitty protocol — "the last image").
-            if ki.id == 0 {
-                continue;
-            }
+        for ki in self.kitty_images.values_mut().flatten() {
             if let Some(png_data) = ki.pending_png.take() {
                 transmit_kitty_image(stdout, &png_data, ki.id)?;
             }
@@ -542,9 +512,9 @@ impl ImageCache {
         image_row: usize,
         content_width: usize,
     ) -> io::Result<bool> {
-        let ki = match self.kitty_images.get(url) {
-            Some(ki) if ki.id != 0 && ki.cols > 0 => ki,
-            _ => return Ok(false),
+        let ki = match self.kitty_images.get(url).and_then(|o| o.as_ref()) {
+            Some(ki) => ki,
+            None => return Ok(false),
         };
         if image_row >= ki.rows {
             return Ok(false);
@@ -632,9 +602,9 @@ impl ImageCache {
         content_width: usize,
         screen_y: u16,
     ) -> io::Result<()> {
-        let ii = match self.iterm2_images.get_mut(url) {
-            Some(ii) if ii.cols > 0 => ii,
-            _ => return Ok(()),
+        let ii = match self.iterm2_images.get_mut(url).and_then(|o| o.as_mut()) {
+            Some(ii) => ii,
+            None => return Ok(()),
         };
 
         let x_col = 2 + content_width.saturating_sub(ii.cols) / 2;

@@ -173,11 +173,10 @@ fn is_safe_img_src(url: &str) -> bool {
         "data:image/bmp",
     ];
     for prefix in &safe_data_prefixes {
-        if lower.starts_with(prefix) {
-            let rest = &lower[prefix.len()..];
-            if rest.starts_with(';') || rest.starts_with(',') {
-                return true;
-            }
+        if let Some(rest) = lower.strip_prefix(prefix)
+            && (rest.starts_with(';') || rest.starts_with(','))
+        {
+            return true;
         }
     }
     // Block dangerous schemes
