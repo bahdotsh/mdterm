@@ -974,6 +974,22 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
     }
 }
 
+/// Convert heading text to a GitHub-style anchor slug.
+fn heading_to_slug(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else if c == ' ' || c == '-' {
+                '-'
+            } else {
+                '\0'
+            }
+        })
+        .filter(|&c| c != '\0')
+        .collect()
+}
+
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
     match code {
         KeyCode::Esc => {
@@ -991,7 +1007,20 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
                 && num <= state.link_entries.len()
             {
                 let url = state.link_entries[num - 1].url.clone();
-                if url.starts_with("http://")
+                if let Some(anchor) = url.strip_prefix('#') {
+                    if let Some(entry) = state
+                        .toc_entries
+                        .iter()
+                        .find(|e| heading_to_slug(&e.text) == anchor)
+                    {
+                        let target = entry.line_idx;
+                        let max = state.max_offset();
+                        state.offset = target.min(max);
+                        state.status_msg = Some(format!("Jumped to: {}", url));
+                    } else {
+                        state.status_msg = Some(format!("Heading not found: {}", url));
+                    }
+                } else if url.starts_with("http://")
                     || url.starts_with("https://")
                     || url.starts_with("mailto:")
                 {
