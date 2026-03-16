@@ -1286,10 +1286,7 @@ fn run_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
                 if status.success() {
                     return Ok(());
                 } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("{cmd} exited with {status}"),
-                    ));
+                    return Err(io::Error::other(format!("{cmd} exited with {status}")));
                 }
             }
             None => {
