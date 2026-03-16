@@ -964,7 +964,9 @@ mod tests {
         let mut cache = ImageCache::new();
         // Fill up to the cap by inserting directly into in_flight
         for i in 0..ImageCache::MAX_CONCURRENT_FETCHES {
-            cache.in_flight.insert(format!("http://example.com/{i}.png"));
+            cache
+                .in_flight
+                .insert(format!("http://example.com/{i}.png"));
         }
         assert_eq!(cache.in_flight_count(), ImageCache::MAX_CONCURRENT_FETCHES);
         // Attempting another fetch should return false
