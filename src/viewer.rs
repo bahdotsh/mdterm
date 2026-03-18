@@ -507,9 +507,9 @@ impl ViewerState {
         }
     }
 
-    fn switch_file(&mut self, idx: usize) {
+    fn switch_file(&mut self, idx: usize) -> bool {
         if idx >= self.files.len() || idx == self.current_file_idx {
-            return;
+            return idx < self.files.len() && idx == self.current_file_idx;
         }
         let path = self.files[idx].clone();
         if let Ok(c) = std::fs::read_to_string(&path) {
@@ -523,6 +523,9 @@ impl ViewerState {
             if self.follow_mode {
                 self.last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -1117,16 +1120,28 @@ fn dispatch_link(state: &mut ViewerState, url: &str) {
         navigate_to_anchor(state, anchor);
     } else if let Some(resolved) = resolve_local_link(state, url) {
         let (path, anchor) = resolved;
-        // Save current position so we can go back
-        state.nav_history.push((state.current_file_idx, state.offset));
-        if let Some(idx) = state.files.iter().position(|f| f == &path) {
-            state.switch_file(idx);
-        } else {
+        let prev_file_idx = state.current_file_idx;
+        let prev_offset = state.offset;
+        // Find existing entry by canonicalizing both sides to handle relative vs absolute paths
+        let existing_idx = state.files.iter().position(|f| {
+            std::path::Path::new(f)
+                .canonicalize()
+                .ok()
+                .is_some_and(|c| c == std::path::Path::new(&path))
+        });
+        let target_idx = existing_idx.unwrap_or_else(|| {
             state.files.push(path.clone());
-            state.switch_file(state.files.len() - 1);
-        }
-        if let Some(anchor) = anchor {
-            navigate_to_anchor(state, &anchor);
+            state.files.len() - 1
+        });
+        let switched = state.switch_file(target_idx);
+        if switched {
+            // Save previous position only after confirming the switch succeeded
+            state.nav_history.push((prev_file_idx, prev_offset));
+            if let Some(anchor) = anchor {
+                navigate_to_anchor(state, &anchor);
+            }
+        } else {
+            state.status_msg = Some(format!("Failed to open: {}", url));
         }
     } else {
         state.status_msg = Some(format!("Blocked: unsupported URL scheme in '{}'", url));
@@ -1171,9 +1186,7 @@ fn resolve_local_link(state: &ViewerState, url: &str) -> Option<(String, Option<
 
     // Only open files that actually exist on disk
     if resolved.is_file() {
-        let canonical = resolved
-            .canonicalize()
-            .unwrap_or(resolved.clone());
+        let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
         Some((canonical.to_string_lossy().into_owned(), anchor))
     } else {
         None
