@@ -979,7 +979,8 @@ impl ImageCache {
                 .as_ref()
                 .is_some_and(|(fr, nr, _)| *fr == first_row && *nr == num_rows)
             {
-                let y = (first_row as u32 * si.cell_h_px).min(si.resized.height().saturating_sub(1));
+                let y =
+                    (first_row as u32 * si.cell_h_px).min(si.resized.height().saturating_sub(1));
                 let h = (num_rows as u32 * si.cell_h_px)
                     .min(si.resized.height().saturating_sub(y))
                     .max(1);
@@ -1801,7 +1802,9 @@ mod tests {
     fn sixel_encode_alpha_blending() {
         // A 1×1 image with 50% alpha red, blended against white bg
         let mut img = DynamicImage::new_rgba8(1, 1);
-        img.as_mut_rgba8().unwrap().put_pixel(0, 0, image::Rgba([255, 0, 0, 128]));
+        img.as_mut_rgba8()
+            .unwrap()
+            .put_pixel(0, 0, image::Rgba([255, 0, 0, 128]));
         let data = encode_sixel(&img, (255, 255, 255));
         // Should produce valid Sixel output (not empty)
         assert!(data.starts_with("\x1bP"));
@@ -1815,12 +1818,26 @@ mod tests {
         let parts: Vec<u32> = color_def
             .split(';')
             .skip(2)
-            .filter_map(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+            .filter_map(|s| {
+                s.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
             .collect();
         assert_eq!(parts.len(), 3);
         assert!(parts[0] >= 99, "R should be ~100, got {}", parts[0]);
-        assert!((49..=51).contains(&parts[1]), "G should be ~50, got {}", parts[1]);
-        assert!((49..=51).contains(&parts[2]), "B should be ~50, got {}", parts[2]);
+        assert!(
+            (49..=51).contains(&parts[1]),
+            "G should be ~50, got {}",
+            parts[1]
+        );
+        assert!(
+            (49..=51).contains(&parts[2]),
+            "B should be ~50, got {}",
+            parts[2]
+        );
     }
 
     #[test]
