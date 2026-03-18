@@ -730,6 +730,9 @@ impl ImageCache {
         if self.is_ready_to_render(url) || self.render_in_flight.contains(url) {
             return;
         }
+        if self.render_in_flight.len() >= Self::MAX_CONCURRENT_FETCHES {
+            return;
+        }
         let img = match self.images.get(url).and_then(|o| o.as_ref()) {
             Some(img) => Arc::clone(img),
             None => return,
@@ -876,8 +879,8 @@ impl ImageCache {
                         );
                     }
                 }
+                any = true;
             }
-            any = true;
         }
         any
     }
