@@ -806,8 +806,10 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                                 LineMeta::Heading { .. } => {
                                     if let Some(entry) = state.toc_entry_for_line(line_idx) {
                                         let text = entry.content.clone();
-                                        let label = if entry.text.len() > 30 {
-                                            format!("{}...", &entry.text[..27])
+                                        let label = if entry.text.chars().count() > 30 {
+                                            let truncated: String =
+                                                entry.text.chars().take(27).collect();
+                                            format!("{}...", truncated)
                                         } else {
                                             entry.text.clone()
                                         };
@@ -2159,7 +2161,7 @@ fn render_toast_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
     let label_len = label.chars().count();
     let box_w = label_len + 2; // │ + content + │
     let x_off = width.saturating_sub(box_w) / 2;
-    let y_off = viewport / 2; // +1 for title bar row, centered in viewport
+    let y_off = ((viewport / 2) + 1).min(viewport.saturating_sub(3) + 1);
 
     let inner = box_w.saturating_sub(2);
 
