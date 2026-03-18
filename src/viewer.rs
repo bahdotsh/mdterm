@@ -15,6 +15,8 @@ use crossterm::{
     },
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::markdown::SyntectRes;
 use crate::style::{DocumentInfo, Line, LineMeta, StyledSpan, wrap_lines};
 use crate::theme::Theme;
@@ -553,7 +555,7 @@ impl ViewerState {
         let line = self.wrapped.get(line_idx)?;
         let mut col = 0;
         for span in &line.spans {
-            let span_len = span.text.chars().count();
+            let span_len = UnicodeWidthStr::width(span.text.as_str());
             if content_col >= col && content_col < col + span_len {
                 return span.style.link_url.as_deref();
             }
@@ -708,8 +710,34 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 }
             },
             MouseEventKind::Down(MouseButton::Left) if state.mode == ViewMode::Normal => {
-                if let Some(url) = state.link_at_position(me.row as usize, me.column as usize) {
-                    let _ = open::that(url);
+                if let Some(url) = state
+                    .link_at_position(me.row as usize, me.column as usize)
+                    .map(String::from)
+                {
+                    if url.starts_with("http://")
+                        || url.starts_with("https://")
+                        || url.starts_with("mailto:")
+                    {
+                        let _ = open::that(&url);
+                        state.status_msg = Some(format!("Opened: {}", url));
+                    } else if let Some(anchor) = url.strip_prefix('#') {
+                        if let Some(entry) = state
+                            .toc_entries
+                            .iter()
+                            .find(|e| heading_to_slug(&e.text) == anchor)
+                        {
+                            let target = entry.line_idx;
+                            let max = state.max_offset();
+                            state.offset = target.min(max);
+                            state.status_msg = Some(format!("Jumped to: {}", url));
+                        } else {
+                            state.status_msg =
+                                Some(format!("Heading not found: {}", url));
+                        }
+                    } else {
+                        state.status_msg =
+                            Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+                    }
                 }
             }
             MouseEventKind::Moved if state.mode == ViewMode::Normal => {
@@ -782,6 +810,11 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if state.mouse_captured {
                 let _ = execute!(stdout, DisableMouseCapture);
                 state.mouse_captured = false;
+                if state.cursor_on_link {
+                    let _ = queue!(stdout, Print("\x1b]22;default\x07"));
+                    let _ = stdout.flush();
+                    state.cursor_on_link = false;
+                }
                 state.status_msg = Some("Mouse capture OFF — select text freely".into());
             } else {
                 let _ = execute!(stdout, EnableMouseCapture);
