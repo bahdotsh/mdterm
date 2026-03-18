@@ -87,8 +87,18 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
             result.push(line.clone());
         } else {
             let mut wrapped = word_wrap(line, width);
-            // Propagate metadata to first wrapped line only
-            if let Some(first) = wrapped.first_mut() {
+            // Propagate metadata to all wrapped lines for clickable types
+            // (ListItem, Heading) so click-to-copy works on continuation lines.
+            // Other types only propagate to the first line.
+            let propagate_all = matches!(
+                line.meta,
+                LineMeta::ListItem { .. } | LineMeta::Heading { .. }
+            );
+            if propagate_all {
+                for w in &mut wrapped {
+                    w.meta = line.meta.clone();
+                }
+            } else if let Some(first) = wrapped.first_mut() {
                 first.meta = line.meta.clone();
             }
             result.extend(wrapped);
@@ -269,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_propagated_to_first_wrapped_line_only() {
+    fn heading_meta_propagated_to_all_wrapped_lines() {
         let mut line = plain_line("hello world foo bar");
         line.meta = LineMeta::Heading {
             level: 2,
@@ -277,9 +287,37 @@ mod tests {
         };
         let wrapped = wrap_lines(&[line], 10);
         assert!(wrapped.len() >= 2);
+        for l in &wrapped {
+            assert!(
+                matches!(l.meta, LineMeta::Heading { level: 2, .. }),
+                "all wrapped lines of a heading should carry the Heading meta"
+            );
+        }
+    }
+
+    #[test]
+    fn list_item_meta_propagated_to_all_wrapped_lines() {
+        let mut line = plain_line("this is a long list item that wraps");
+        line.meta = LineMeta::ListItem { list_id: 42 };
+        let wrapped = wrap_lines(&[line], 10);
+        assert!(wrapped.len() >= 2);
+        for l in &wrapped {
+            assert!(
+                matches!(l.meta, LineMeta::ListItem { list_id: 42 }),
+                "all wrapped lines of a list item should carry the ListItem meta"
+            );
+        }
+    }
+
+    #[test]
+    fn code_meta_propagated_to_first_wrapped_line_only() {
+        let mut line = plain_line("some very long code line content here");
+        line.meta = LineMeta::CodeContent { block_id: 5 };
+        let wrapped = wrap_lines(&[line], 10);
+        assert!(wrapped.len() >= 2);
         assert!(matches!(
             wrapped[0].meta,
-            LineMeta::Heading { level: 2, .. }
+            LineMeta::CodeContent { block_id: 5 }
         ));
         for l in &wrapped[1..] {
             assert!(matches!(l.meta, LineMeta::None));

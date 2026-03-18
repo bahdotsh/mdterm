@@ -78,9 +78,9 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             continue;
         }
 
-        let timeout = if state.toast.is_some() {
-            // Re-render promptly to clear expired toast
-            Duration::from_millis(50)
+        let timeout = if let Some((_, t)) = &state.toast {
+            // Sleep only until the toast expires
+            Duration::from_secs(1).saturating_sub(t.elapsed())
         } else if state.image_cache.has_in_flight() {
             // Check for completions frequently while fetches are in flight
             Duration::from_millis(50)
@@ -276,7 +276,7 @@ struct ViewerState {
     mouse_captured: bool,
 
     // Whether the cursor is currently over a clickable element (link or code block)
-    cursor_on_link: bool,
+    cursor_on_clickable: bool,
 
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
@@ -353,7 +353,7 @@ impl ViewerState {
             pending_image_urls: std::collections::VecDeque::new(),
             fast_scrolling: false,
             mouse_captured: true,
-            cursor_on_link: false,
+            cursor_on_clickable: false,
             nav_history: Vec::new(),
         }
     }
@@ -623,6 +623,29 @@ impl ViewerState {
             .join("\n")
     }
 
+    /// Returns the wrapped-line index for a given terminal row, if it maps to content.
+    fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
+        if term_row < 1 {
+            return None; // row 0 is the title bar
+        }
+        let idx = self.offset + (term_row - 1);
+        if idx < self.wrapped.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the line at `line_idx` has copyable metadata.
+    fn is_copyable_line(&self, line_idx: usize) -> bool {
+        self.wrapped.get(line_idx).is_some_and(|l| {
+            matches!(
+                l.meta,
+                LineMeta::CodeContent { .. } | LineMeta::Heading { .. } | LineMeta::ListItem { .. }
+            )
+        })
+    }
+
     /// Width of the left gutter ("│ ") in terminal columns.
     const GUTTER_COLS: usize = 2;
 
@@ -790,43 +813,38 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     .map(String::from)
                 {
                     dispatch_link(state, &url);
-                } else {
-                    let row = me.row as usize;
-                    if row >= 1 {
-                        let line_idx = state.offset + (row - 1); // row 0 is title bar
-                        if let Some(line) = state.wrapped.get(line_idx) {
-                            match line.meta {
-                                LineMeta::CodeContent { block_id } => {
-                                    if let Some(block) = state.doc_info.code_blocks.get(block_id)
-                                        && copy_to_clipboard(&block.content).is_ok()
-                                    {
-                                        state.set_toast("Code block copied");
-                                    }
-                                }
-                                LineMeta::Heading { .. } => {
-                                    if let Some(entry) = state.toc_entry_for_line(line_idx) {
-                                        let text = entry.content.clone();
-                                        let label = if entry.text.chars().count() > 30 {
-                                            let truncated: String =
-                                                entry.text.chars().take(27).collect();
-                                            format!("{}...", truncated)
-                                        } else {
-                                            entry.text.clone()
-                                        };
-                                        if copy_to_clipboard(&text).is_ok() {
-                                            state.set_toast(format!("Copied: {}", label));
-                                        }
-                                    }
-                                }
-                                LineMeta::ListItem { list_id } => {
-                                    let text = state.list_text(list_id);
-                                    if copy_to_clipboard(&text).is_ok() {
-                                        state.set_toast("List copied");
-                                    }
-                                }
-                                _ => {}
+                } else if let Some(line_idx) = state.line_idx_at_row(me.row as usize)
+                    && let Some(line) = state.wrapped.get(line_idx)
+                {
+                    match line.meta {
+                        LineMeta::CodeContent { block_id } => {
+                            if let Some(block) = state.doc_info.code_blocks.get(block_id)
+                                && copy_to_clipboard(&block.content).is_ok()
+                            {
+                                state.set_toast("Code block copied");
                             }
                         }
+                        LineMeta::Heading { .. } => {
+                            if let Some(entry) = state.toc_entry_for_line(line_idx) {
+                                let text = entry.content.clone();
+                                let label = if entry.text.chars().count() > 30 {
+                                    let truncated: String = entry.text.chars().take(27).collect();
+                                    format!("{}...", truncated)
+                                } else {
+                                    entry.text.clone()
+                                };
+                                if copy_to_clipboard(&text).is_ok() {
+                                    state.set_toast(format!("Copied: {}", label));
+                                }
+                            }
+                        }
+                        LineMeta::ListItem { list_id } => {
+                            let text = state.list_text(list_id);
+                            if copy_to_clipboard(&text).is_ok() {
+                                state.set_toast("List copied");
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -834,25 +852,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let on_link = state
                     .link_at_position(me.row as usize, me.column as usize)
                     .is_some();
-                let on_copyable = !on_link && {
-                    let row = me.row as usize;
-                    if row >= 1 {
-                        let line_idx = state.offset + (row - 1);
-                        state.wrapped.get(line_idx).is_some_and(|l| {
-                            matches!(
-                                l.meta,
-                                LineMeta::CodeContent { .. }
-                                    | LineMeta::Heading { .. }
-                                    | LineMeta::ListItem { .. }
-                            )
-                        })
-                    } else {
-                        false
-                    }
-                };
+                let on_copyable = !on_link
+                    && state
+                        .line_idx_at_row(me.row as usize)
+                        .is_some_and(|idx| state.is_copyable_line(idx));
                 let on_clickable = on_link || on_copyable;
-                if on_clickable != state.cursor_on_link {
-                    state.cursor_on_link = on_clickable;
+                if on_clickable != state.cursor_on_clickable {
+                    state.cursor_on_clickable = on_clickable;
                     let mut stdout = io::stdout();
                     if on_clickable {
                         // OSC 22: set mouse pointer to "pointer" (hand cursor)
@@ -917,10 +923,10 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if state.mouse_captured {
                 let _ = execute!(stdout, DisableMouseCapture);
                 state.mouse_captured = false;
-                if state.cursor_on_link {
+                if state.cursor_on_clickable {
                     let _ = queue!(stdout, Print("\x1b]22;default\x07"));
                     let _ = stdout.flush();
-                    state.cursor_on_link = false;
+                    state.cursor_on_clickable = false;
                 }
                 state.set_toast("Mouse capture OFF — select text freely");
             } else {
@@ -1301,8 +1307,8 @@ fn resolve_local_link(state: &ViewerState, url: &str) -> Option<(String, Option<
 
 /// Reset the cursor shape to default if it was changed for a link hover.
 fn reset_cursor_shape(state: &mut ViewerState) {
-    if state.cursor_on_link {
-        state.cursor_on_link = false;
+    if state.cursor_on_clickable {
+        state.cursor_on_clickable = false;
         let mut stdout = io::stdout();
         let _ = queue!(stdout, Print("\x1b]22;default\x07"));
         let _ = stdout.flush();
@@ -2152,10 +2158,17 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
 // ── Overlay rendering ───────────────────────────────────────────────────────
 
 fn render_toast_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
+    let Some((msg, _)) = state.toast.as_ref() else {
+        return Ok(());
+    };
     let theme = &state.theme;
-    let (msg, _) = state.toast.as_ref().unwrap();
     let width = state.cols as usize;
     let viewport = state.viewport();
+
+    // Toast needs 3 rows; skip if viewport is too small
+    if viewport < 5 {
+        return Ok(());
+    }
 
     let label = format!(" \u{2713} {} ", msg); // ✓ prefix
     let label_len = label.chars().count();
