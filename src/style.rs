@@ -30,6 +30,9 @@ pub enum LineMeta {
     CodeContent {
         block_id: usize,
     },
+    ListItem {
+        list_id: usize,
+    },
     SlideBreak,
     #[allow(dead_code)]
     Image {

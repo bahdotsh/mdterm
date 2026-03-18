@@ -80,9 +80,6 @@ pub struct Theme {
     // Line numbers
     pub line_number: Color,
 
-    // Copy flash
-    pub copy_flash_bg: Color,
-
     is_dark: bool,
 }
 
@@ -329,11 +326,6 @@ impl Theme {
                 g: 71,
                 b: 90,
             },
-            copy_flash_bg: Color::Rgb {
-                r: 55,
-                g: 65,
-                b: 50,
-            },
         }
     }
 
@@ -578,11 +570,6 @@ impl Theme {
                 r: 172,
                 g: 176,
                 b: 190,
-            },
-            copy_flash_bg: Color::Rgb {
-                r: 200,
-                g: 235,
-                b: 200,
             },
         }
     }

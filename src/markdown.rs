@@ -34,6 +34,7 @@ struct Renderer<'a> {
     // List state
     list_stack: Vec<ListKind>,
     item_has_nested_list: bool,
+    list_id: usize,
 
     // Table state
     in_table: bool,
@@ -93,6 +94,7 @@ impl<'a> Renderer<'a> {
             code_block_id: 0,
             list_stack: Vec::new(),
             item_has_nested_list: false,
+            list_id: 0,
             in_table: false,
             table_alignments: Vec::new(),
             table_head: Vec::new(),
@@ -827,7 +829,10 @@ impl<'a> Renderer<'a> {
 
             Event::Start(Tag::List(ordered)) => {
                 self.flush_line();
-                if !self.list_stack.is_empty() {
+                if self.list_stack.is_empty() {
+                    // Top-level list: assign a new list_id
+                    self.list_id += 1;
+                } else {
                     self.item_has_nested_list = true;
                 }
                 match ordered {
@@ -864,7 +869,9 @@ impl<'a> Renderer<'a> {
                 );
             }
             Event::End(TagEnd::Item) => {
-                self.flush_line();
+                self.flush_line_with_meta(LineMeta::ListItem {
+                    list_id: self.list_id,
+                });
                 if self.list_stack.len() <= 1 && self.item_has_nested_list {
                     self.push_empty_line();
                 }
