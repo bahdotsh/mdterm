@@ -616,12 +616,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             }
             // F1 opens help from any mode; Esc/F1 closes it
             if ke.code == KeyCode::F(1) {
-                state.mode = if state.mode == ViewMode::Help {
-                    ViewMode::Normal
+                if state.mode == ViewMode::Help {
+                    state.mode = ViewMode::Normal;
                 } else {
+                    reset_cursor_shape(state);
                     state.help_scroll = 0;
-                    ViewMode::Help
-                };
+                    state.mode = ViewMode::Help;
+                }
                 return false;
             }
             if state.mode == ViewMode::Help {
@@ -723,30 +724,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     .link_at_position(me.row as usize, me.column as usize)
                     .map(String::from)
                 {
-                    if url.starts_with("http://")
-                        || url.starts_with("https://")
-                        || url.starts_with("mailto:")
-                    {
-                        let _ = open::that(&url);
-                        state.status_msg = Some(format!("Opened: {}", url));
-                    } else if let Some(anchor) = url.strip_prefix('#') {
-                        if let Some(entry) = state
-                            .toc_entries
-                            .iter()
-                            .find(|e| heading_to_slug(&e.text) == anchor)
-                        {
-                            let target = entry.line_idx;
-                            let max = state.max_offset();
-                            state.offset = target.min(max);
-                            state.status_msg = Some(format!("Jumped to: {}", url));
-                        } else {
-                            state.status_msg =
-                                Some(format!("Heading not found: {}", url));
-                        }
-                    } else {
-                        state.status_msg =
-                            Some(format!("Blocked: unsupported URL scheme in '{}'", url));
-                    }
+                    dispatch_link(state, &url);
                 }
             }
             MouseEventKind::Moved if state.mode == ViewMode::Normal => {
@@ -834,6 +812,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
 
         // Search
         KeyCode::Char('/') => {
+            reset_cursor_shape(state);
             state.mode = ViewMode::Search;
             state.search.input_active = true;
             state.search.input_buf.clear();
@@ -850,6 +829,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         // TOC
         KeyCode::Char('o') => {
             if !state.toc_entries.is_empty() {
+                reset_cursor_shape(state);
                 state.toc_selected = 0;
                 state.toc_scroll = 0;
                 // Try to select the heading closest to current offset
@@ -873,6 +853,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         // Link picker
         KeyCode::Char('f') => {
             if !state.link_entries.is_empty() {
+                reset_cursor_shape(state);
                 state.link_input.clear();
                 state.mode = ViewMode::LinkPicker;
             }
@@ -881,6 +862,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         // Fuzzy heading search
         KeyCode::Char(':') => {
             if !state.toc_entries.is_empty() {
+                reset_cursor_shape(state);
                 state.fuzzy_input.clear();
                 state.fuzzy_selected = 0;
                 state.fuzzy_scroll = 0;
@@ -1112,6 +1094,41 @@ fn heading_to_slug(text: &str) -> String {
     result
 }
 
+/// Open a URL externally, navigate to an anchor heading, or block unsupported schemes.
+fn dispatch_link(state: &mut ViewerState, url: &str) {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        match open::that(url) {
+            Ok(_) => state.status_msg = Some(format!("Opened: {}", url)),
+            Err(e) => state.status_msg = Some(format!("Failed to open: {}", e)),
+        }
+    } else if let Some(anchor) = url.strip_prefix('#') {
+        if let Some(entry) = state
+            .toc_entries
+            .iter()
+            .find(|e| heading_to_slug(&e.text) == anchor)
+        {
+            let target = entry.line_idx;
+            let max = state.max_offset();
+            state.offset = target.min(max);
+            state.status_msg = Some(format!("Jumped to: {}", url));
+        } else {
+            state.status_msg = Some(format!("Heading not found: {}", url));
+        }
+    } else {
+        state.status_msg = Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+    }
+}
+
+/// Reset the cursor shape to default if it was changed for a link hover.
+fn reset_cursor_shape(state: &mut ViewerState) {
+    if state.cursor_on_link {
+        state.cursor_on_link = false;
+        let mut stdout = io::stdout();
+        let _ = queue!(stdout, Print("\x1b]22;default\x07"));
+        let _ = stdout.flush();
+    }
+}
+
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
     match code {
         KeyCode::Esc => {
@@ -1129,29 +1146,7 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
                 && num <= state.link_entries.len()
             {
                 let url = state.link_entries[num - 1].url.clone();
-                if let Some(anchor) = url.strip_prefix('#') {
-                    if let Some(entry) = state
-                        .toc_entries
-                        .iter()
-                        .find(|e| heading_to_slug(&e.text) == anchor)
-                    {
-                        let target = entry.line_idx;
-                        let max = state.max_offset();
-                        state.offset = target.min(max);
-                        state.status_msg = Some(format!("Jumped to: {}", url));
-                    } else {
-                        state.status_msg = Some(format!("Heading not found: {}", url));
-                    }
-                } else if url.starts_with("http://")
-                    || url.starts_with("https://")
-                    || url.starts_with("mailto:")
-                {
-                    let _ = open::that(&url);
-                    state.status_msg = Some(format!("Opened: {}", url));
-                } else {
-                    state.status_msg =
-                        Some(format!("Blocked: unsupported URL scheme in '{}'", url));
-                }
+                dispatch_link(state, &url);
             }
             state.mode = ViewMode::Normal;
         }
@@ -3030,10 +3025,8 @@ mod tests {
 
     #[test]
     fn link_at_position_returns_none_for_gutter() {
-        let state = make_state_with_lines(vec![line(vec![span(
-            "link",
-            Some("https://example.com"),
-        )])]);
+        let state =
+            make_state_with_lines(vec![line(vec![span("link", Some("https://example.com"))])]);
         // Column 0 and 1 are the gutter ("│ ")
         assert_eq!(state.link_at_position(1, 0), None);
         assert_eq!(state.link_at_position(1, 1), None);
@@ -3041,10 +3034,8 @@ mod tests {
 
     #[test]
     fn link_at_position_returns_none_for_title_bar() {
-        let state = make_state_with_lines(vec![line(vec![span(
-            "link",
-            Some("https://example.com"),
-        )])]);
+        let state =
+            make_state_with_lines(vec![line(vec![span("link", Some("https://example.com"))])]);
         // Row 0 is the title bar
         assert_eq!(state.link_at_position(0, 2), None);
     }
