@@ -418,7 +418,8 @@ impl ViewerState {
                     self.pending_image_urls.push_back(url.clone());
                 }
             }
-            self.image_cache.pre_render(cw);
+            self.image_cache
+                .pre_render(cw, crate::image::color_to_rgb(self.theme.bg));
 
             // Adjust image placeholder rows to match actual image aspect ratio
             let mut new_wrapped = Vec::with_capacity(self.wrapped.len());
@@ -1773,25 +1774,14 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     }
                 }
                 // +1 for title bar row
-                if state.image_cache.protocol() == crate::image::ImageProtocol::Sixel {
-                    state.image_cache.render_sixel_block(
-                        stdout,
-                        &url,
-                        first_image_row,
-                        count,
-                        content_width,
-                        (first_screen_row + 1) as u16,
-                    )?;
-                } else {
-                    state.image_cache.render_iterm2_block(
-                        stdout,
-                        &url,
-                        first_image_row,
-                        count,
-                        content_width,
-                        (first_screen_row + 1) as u16,
-                    )?;
-                }
+                state.image_cache.render_block_image(
+                    stdout,
+                    &url,
+                    first_image_row,
+                    count,
+                    content_width,
+                    (first_screen_row + 1) as u16,
+                )?;
                 row += count;
                 continue;
             }
