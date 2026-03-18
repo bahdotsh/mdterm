@@ -882,15 +882,7 @@ impl<'a> Renderer<'a> {
                 self.link_url = dest_url.to_string();
             }
             Event::End(TagEnd::Link) => {
-                let url = std::mem::take(&mut self.link_url);
-                self.push_span(
-                    &format!(" {}", url),
-                    Style {
-                        fg: Some(self.theme.link_url),
-                        link_url: Some(url),
-                        ..Default::default()
-                    },
-                );
+                self.link_url.clear();
                 self.in_link = false;
             }
 

@@ -540,17 +540,29 @@ impl ViewerState {
 
         // Build link list
         self.link_entries.clear();
-        let mut seen_urls = std::collections::HashSet::new();
+        let mut prev_url: Option<String> = None;
         for line in &self.wrapped {
             for span in &line.spans {
-                if let Some(ref url) = span.style.link_url
-                    && seen_urls.insert(url.clone())
-                {
+                if let Some(ref url) = span.style.link_url {
                     let text = span.text.trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // Merge adjacent fragments of the same link (from line wrapping)
+                    if prev_url.as_deref() == Some(url.as_str())
+                        && let Some(last) = self.link_entries.last_mut()
+                    {
+                        last.text.push(' ');
+                        last.text.push_str(&text);
+                        continue;
+                    }
                     self.link_entries.push(LinkEntry {
                         url: url.clone(),
                         text,
                     });
+                    prev_url = Some(url.clone());
+                } else {
+                    prev_url = None;
                 }
             }
         }
@@ -2438,18 +2450,53 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
 
     for (i, entry) in entries.iter().enumerate().take(shown) {
         let num = format!(" {:>2}. ", i + 1);
-        let available = box_w.saturating_sub(2 + num.chars().count());
-        let url_display: String = if entry.url.chars().count() > available {
-            entry
-                .url
-                .chars()
-                .take(available.saturating_sub(1))
-                .collect::<String>()
-                + "…"
+        let num_len = num.chars().count();
+        let available = box_w.saturating_sub(2 + num_len);
+        let has_text = !entry.text.is_empty() && entry.text != entry.url;
+
+        let (text_part, url_part) = if has_text {
+            let sep = " → ";
+            let sep_len = sep.chars().count();
+            let text_len = entry.text.chars().count();
+            let url_len = entry.url.chars().count();
+
+            if text_len + sep_len + url_len <= available {
+                (format!("{}{}", entry.text, sep), entry.url.clone())
+            } else if text_len + sep_len + 3 <= available {
+                let url_budget = available - text_len - sep_len;
+                let truncated_url: String = entry
+                    .url
+                    .chars()
+                    .take(url_budget.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+                (format!("{}{}", entry.text, sep), truncated_url)
+            } else {
+                // Even text barely fits — just show truncated text
+                let truncated: String = entry
+                    .text
+                    .chars()
+                    .take(available.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+                (truncated, String::new())
+            }
         } else {
-            entry.url.clone()
+            let url_display: String = if entry.url.chars().count() > available {
+                entry
+                    .url
+                    .chars()
+                    .take(available.saturating_sub(1))
+                    .collect::<String>()
+                    + "…"
+            } else {
+                entry.url.clone()
+            };
+            (String::new(), url_display)
         };
-        let padding = box_w.saturating_sub(2 + num.chars().count() + url_display.chars().count());
+
+        let content_len = text_part.chars().count() + url_part.chars().count();
+        let padding = box_w.saturating_sub(2 + num_len + content_len);
 
         queue!(
             stdout,
@@ -2460,7 +2507,9 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
             SetForegroundColor(theme.overlay_selected_fg),
             Print(&num),
             SetForegroundColor(theme.overlay_text),
-            Print(&url_display),
+            Print(&text_part),
+            SetForegroundColor(theme.link_url),
+            Print(&url_part),
             Print(" ".repeat(padding)),
             SetForegroundColor(theme.overlay_border),
             Print("│"),

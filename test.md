@@ -24,6 +24,8 @@ Visit [Rust](https://www.rust-lang.org) or check out [mdterm on GitHub](https://
 
 Multiple links: [Google](https://google.com), [Wikipedia](https://en.wikipedia.org), [Hacker News](https://news.ycombinator.com).
 
+Same-target links: [readme 1](README.md) and [readme 2](README.md) — both point to README.md but have different text. Only the text should show inline. Press `f` to see both entries with text and URL.
+
 Press `f` to open the link picker and jump to any link.
 
 ## Images
