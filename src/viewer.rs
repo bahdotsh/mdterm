@@ -50,8 +50,13 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
 
         render_frame(&mut stdout, &mut state)?;
 
-        // Clear transient status after rendering so it shows for one frame
-        state.status_msg = None;
+        // Clear flash after one frame; expire status message after 1.5s
+        state.flash_lines = None;
+        if let Some((_, t)) = &state.status_msg
+            && t.elapsed() >= Duration::from_millis(1500)
+        {
+            state.status_msg = None;
+        }
 
         // Poll for completed background fetches
         let new_images = state.image_cache.poll_completed();
@@ -79,6 +84,9 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             Duration::from_millis(50)
         } else if state.fast_scrolling {
             Duration::from_millis(50)
+        } else if state.status_msg.is_some() {
+            // Re-render to clear expired status message
+            Duration::from_millis(200)
         } else if state.follow_mode {
             Duration::from_millis(500)
         } else {
@@ -253,8 +261,8 @@ struct ViewerState {
     // Follow mode
     last_mtime: Option<std::time::SystemTime>,
 
-    // Status message
-    status_msg: Option<String>,
+    // Status message with expiry time
+    status_msg: Option<(String, std::time::Instant)>,
 
     // Image cache
     image_cache: crate::image::ImageCache,
@@ -268,11 +276,14 @@ struct ViewerState {
     // Whether mouse capture is currently enabled
     mouse_captured: bool,
 
-    // Whether the cursor is currently over a link (for pointer shape)
+    // Whether the cursor is currently over a clickable element (link or code block)
     cursor_on_link: bool,
 
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
+
+    // Flash highlight for copy feedback (start_line, end_line exclusive)
+    flash_lines: Option<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -344,7 +355,12 @@ impl ViewerState {
             mouse_captured: true,
             cursor_on_link: false,
             nav_history: Vec::new(),
+            flash_lines: None,
         }
+    }
+
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some((msg.into(), std::time::Instant::now()));
     }
 
     fn content_width(&self) -> usize {
@@ -512,7 +528,7 @@ impl ViewerState {
             {
                 self.content = new_content;
                 self.rebuild();
-                self.status_msg = Some("File reloaded".into());
+                self.set_status("File reloaded");
             }
             self.last_mtime = Some(mtime);
         }
@@ -562,6 +578,23 @@ impl ViewerState {
         None
     }
 
+    /// Returns the (start, end_exclusive) wrapped line range for a given code block.
+    fn code_block_line_range(&self, target_id: usize) -> Option<(usize, usize)> {
+        let mut start = None;
+        let mut end = 0;
+        for (i, line) in self.wrapped.iter().enumerate() {
+            if let LineMeta::CodeContent { block_id } = line.meta
+                && block_id == target_id
+            {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = i + 1;
+            }
+        }
+        start.map(|s| (s, end))
+    }
+
     /// Width of the left gutter ("│ ") in terminal columns.
     const GUTTER_COLS: usize = 2;
 
@@ -595,8 +628,8 @@ impl ViewerState {
         None
     }
 
-    fn visible_section_text(&self) -> String {
-        // Find current heading section
+    /// Returns (text, start_line, end_line_exclusive) for the current heading section.
+    fn visible_section_text_range(&self) -> (String, usize, usize) {
         let headings = self.heading_lines();
         let current_pos = self.offset;
 
@@ -612,11 +645,12 @@ impl ViewerState {
             .copied()
             .unwrap_or(self.wrapped.len());
 
-        self.wrapped[start..end]
+        let text = self.wrapped[start..end]
             .iter()
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        (text, start, end)
     }
 
     fn full_text(&self) -> String {
@@ -747,16 +781,43 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     .map(String::from)
                 {
                     dispatch_link(state, &url);
+                } else {
+                    // Click on a code block → copy it
+                    let row = me.row as usize;
+                    if row >= 1 {
+                        let line_idx = state.offset + (row - 1); // row 0 is title bar
+                        if let Some(line) = state.wrapped.get(line_idx)
+                            && let LineMeta::CodeContent { block_id } = line.meta
+                            && let Some(block) = state.doc_info.code_blocks.get(block_id)
+                            && copy_to_clipboard(&block.content).is_ok()
+                        {
+                            state.set_status("Code block copied");
+                            state.flash_lines = state.code_block_line_range(block_id);
+                        }
+                    }
                 }
             }
             MouseEventKind::Moved if state.mode == ViewMode::Normal => {
                 let on_link = state
                     .link_at_position(me.row as usize, me.column as usize)
                     .is_some();
-                if on_link != state.cursor_on_link {
-                    state.cursor_on_link = on_link;
+                let on_code = !on_link && {
+                    let row = me.row as usize;
+                    if row >= 1 {
+                        let line_idx = state.offset + (row - 1);
+                        state
+                            .wrapped
+                            .get(line_idx)
+                            .is_some_and(|l| matches!(l.meta, LineMeta::CodeContent { .. }))
+                    } else {
+                        false
+                    }
+                };
+                let on_clickable = on_link || on_code;
+                if on_clickable != state.cursor_on_link {
+                    state.cursor_on_link = on_clickable;
                     let mut stdout = io::stdout();
-                    if on_link {
+                    if on_clickable {
                         // OSC 22: set mouse pointer to "pointer" (hand cursor)
                         let _ = queue!(stdout, Print("\x1b]22;pointer\x07"));
                     } else {
@@ -806,10 +867,10 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         KeyCode::Char('l') => {
             state.line_numbers = !state.line_numbers;
             state.rebuild();
-            state.status_msg = Some(if state.line_numbers {
-                "Line numbers ON".into()
+            state.set_status(if state.line_numbers {
+                "Line numbers ON"
             } else {
-                "Line numbers OFF".into()
+                "Line numbers OFF"
             });
         }
 
@@ -824,11 +885,11 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                     let _ = stdout.flush();
                     state.cursor_on_link = false;
                 }
-                state.status_msg = Some("Mouse capture OFF — select text freely".into());
+                state.set_status("Mouse capture OFF — select text freely");
             } else {
                 let _ = execute!(stdout, EnableMouseCapture);
                 state.mouse_captured = true;
-                state.status_msg = Some("Mouse capture ON — scroll with mouse".into());
+                state.set_status("Mouse capture ON — scroll with mouse");
             }
         }
 
@@ -894,15 +955,18 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
 
         // Copy section (y) or full document (Y)
         KeyCode::Char('y') => {
-            let text = state.visible_section_text();
+            let (text, start, end) = state.visible_section_text_range();
             if copy_to_clipboard(&text).is_ok() {
-                state.status_msg = Some("Section copied".into());
+                state.set_status("Section copied");
+                state.flash_lines = Some((start, end));
             }
         }
         KeyCode::Char('Y') => {
             let text = state.full_text();
             if copy_to_clipboard(&text).is_ok() {
-                state.status_msg = Some("Document copied".into());
+                state.set_status("Document copied");
+                let vp = state.viewport();
+                state.flash_lines = Some((state.offset, state.offset + vp));
             }
         }
 
@@ -912,7 +976,8 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                 && let Some(block) = state.doc_info.code_blocks.get(block_id)
                 && copy_to_clipboard(&block.content).is_ok()
             {
-                state.status_msg = Some("Code block copied".into());
+                state.set_status("Code block copied");
+                state.flash_lines = state.code_block_line_range(block_id);
             }
         }
 
@@ -951,7 +1016,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if let Some((file_idx, offset)) = state.nav_history.pop() {
                 state.switch_file(file_idx);
                 state.offset = offset.min(state.max_offset());
-                state.status_msg = Some("Back".into());
+                state.set_status("Back");
             }
         }
 
@@ -1127,8 +1192,8 @@ fn heading_to_slug(text: &str) -> String {
 fn dispatch_link(state: &mut ViewerState, url: &str) {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         match open::that(url) {
-            Ok(_) => state.status_msg = Some(format!("Opened: {}", url)),
-            Err(e) => state.status_msg = Some(format!("Failed to open: {}", e)),
+            Ok(_) => state.set_status(format!("Opened: {}", url)),
+            Err(e) => state.set_status(format!("Failed to open: {}", e)),
         }
     } else if let Some(anchor) = url.strip_prefix('#') {
         navigate_to_anchor(state, anchor);
@@ -1155,10 +1220,10 @@ fn dispatch_link(state: &mut ViewerState, url: &str) {
                 navigate_to_anchor(state, &anchor);
             }
         } else {
-            state.status_msg = Some(format!("Failed to open: {}", url));
+            state.set_status(format!("Failed to open: {}", url));
         }
     } else {
-        state.status_msg = Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+        state.set_status(format!("Blocked: unsupported URL scheme in '{}'", url));
     }
 }
 
@@ -1172,9 +1237,9 @@ fn navigate_to_anchor(state: &mut ViewerState, anchor: &str) {
         let target = entry.line_idx;
         let max = state.max_offset();
         state.offset = target.min(max);
-        state.status_msg = Some(format!("Jumped to: #{}", anchor));
+        state.set_status(format!("Jumped to: #{}", anchor));
     } else {
-        state.status_msg = Some(format!("Heading not found: #{}", anchor));
+        state.set_status(format!("Heading not found: #{}", anchor));
     }
 }
 
@@ -1732,6 +1797,15 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             }
 
             if !drew_inline_image {
+                let is_flashed = state
+                    .flash_lines
+                    .is_some_and(|(s, e)| line_idx >= s && line_idx < e);
+                let flash_bg = if is_flashed {
+                    Some(theme.copy_flash_bg)
+                } else {
+                    None
+                };
+
                 let highlights = if !state.slide_mode {
                     state.search.highlights_for_line(line_idx)
                 } else {
@@ -1745,20 +1819,41 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     &highlighted
                 };
 
+                // Apply flash background override
+                let flashed_spans;
+                let spans = if let Some(fbg) = flash_bg {
+                    flashed_spans = spans
+                        .iter()
+                        .map(|span| {
+                            let mut s = span.clone();
+                            s.style.bg = Some(fbg);
+                            s
+                        })
+                        .collect::<Vec<_>>();
+                    &flashed_spans[..]
+                } else {
+                    spans
+                };
+
+                let restore_bg = flash_bg.unwrap_or(theme.bg);
                 let mut col = 0;
                 for span in spans {
-                    write_span(stdout, span, Some(theme.bg))?;
+                    write_span(stdout, span, Some(restore_bg))?;
                     col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
-                    let common_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                        if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                            Some(bg)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(bg) = common_bg {
+                    let fill_bg = if is_flashed {
+                        Some(theme.copy_flash_bg)
+                    } else {
+                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                                Some(bg)
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    if let Some(bg) = fill_bg {
                         queue!(
                             stdout,
                             SetBackgroundColor(bg),
@@ -1953,7 +2048,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
         return Ok(());
     }
 
-    if let Some(ref msg) = state.status_msg {
+    if let Some((ref msg, _)) = state.status_msg {
         let msg_label = format!(" {} ", msg);
         let msg_len = msg_label.chars().count();
         let fill = width.saturating_sub(3 + msg_len);
@@ -2585,7 +2680,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
             entries: &[
                 ("y", "Copy current section to clipboard"),
                 ("Y", "Copy full document to clipboard"),
-                ("c", "Copy nearest code block"),
+                ("c", "Copy nearest code block (or click)"),
                 ("t", "Toggle dark / light theme"),
                 ("l", "Toggle line numbers"),
                 ("m", "Toggle mouse capture (for text select)"),
