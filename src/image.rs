@@ -385,6 +385,7 @@ fn sixel_median_cut(counts: &HashMap<(u8, u8, u8), u32>, max_colors: usize) -> V
     // Weighted average of each box → palette colour
     boxes
         .iter()
+        .filter(|b| !b.is_empty())
         .map(|b| {
             let (rs, gs, bs, total) = b.iter().fold(
                 (0u64, 0u64, 0u64, 0u64),
@@ -978,7 +979,7 @@ impl ImageCache {
                 .as_ref()
                 .is_some_and(|(fr, nr, _)| *fr == first_row && *nr == num_rows)
             {
-                let y = first_row as u32 * si.cell_h_px;
+                let y = (first_row as u32 * si.cell_h_px).min(si.resized.height().saturating_sub(1));
                 let h = (num_rows as u32 * si.cell_h_px)
                     .min(si.resized.height().saturating_sub(y))
                     .max(1);
@@ -1794,6 +1795,32 @@ mod tests {
         let mut out = String::new();
         sixel_rle(&[0x3F, 0x3F], &mut out);
         assert_eq!(out, "??", "2 repeated chars should not use RLE");
+    }
+
+    #[test]
+    fn sixel_encode_alpha_blending() {
+        // A 1×1 image with 50% alpha red, blended against white bg
+        let mut img = DynamicImage::new_rgba8(1, 1);
+        img.as_mut_rgba8().unwrap().put_pixel(0, 0, image::Rgba([255, 0, 0, 128]));
+        let data = encode_sixel(&img, (255, 255, 255));
+        // Should produce valid Sixel output (not empty)
+        assert!(data.starts_with("\x1bP"));
+        assert!(data.ends_with("\x1b\\"));
+        // The blended colour should be roughly (255, 127, 127) → ~(100%, 50%, 50%)
+        // Verify the color register is close: expect #0;2;100;50;50 (±1 from rounding)
+        let color_def = data
+            .split('#')
+            .find(|s| s.starts_with("0;2;"))
+            .expect("should have a color definition");
+        let parts: Vec<u32> = color_def
+            .split(';')
+            .skip(2)
+            .filter_map(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+            .collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0] >= 99, "R should be ~100, got {}", parts[0]);
+        assert!((49..=51).contains(&parts[1]), "G should be ~50, got {}", parts[1]);
+        assert!((49..=51).contains(&parts[2]), "B should be ~50, got {}", parts[2]);
     }
 
     #[test]
