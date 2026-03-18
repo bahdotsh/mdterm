@@ -232,6 +232,16 @@ Duis ac tellus et risus vulputate vehicula. Donec lobortis risus a elit. Etiam t
 
 Praesent dapibus, neque id cursus faucibus, tortor neque egestas auguae, eu vulputate magna eros eu erat. Aliquam erat volutpat. Nam dui mi, tincidunt quis, accumsan porttitor, facilisis luctus, metus.
 
+## Local File Links
+
+Test relative file links — press `f` and select one, or click directly:
+
+- [Linked Page](test_linked.md) — opens a local markdown file in the viewer
+- [Linked Page (with ./)](./test_linked.md) — same file with explicit relative path
+- [Jump to anchor in linked file](test_linked.md#heading-for-anchor-test) — opens file and scrolls to heading
+- [README](README.md) — opens the project README
+- [nonexistent.md](nonexistent.md) — this should show "unsupported URL scheme" (file doesn't exist)
+
 ## Final Section
 
 You've reached the bottom! Try these:

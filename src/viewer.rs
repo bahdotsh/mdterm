@@ -270,6 +270,9 @@ struct ViewerState {
 
     // Whether the cursor is currently over a link (for pointer shape)
     cursor_on_link: bool,
+
+    // Navigation history for back navigation (file index + scroll offset)
+    nav_history: Vec<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -340,6 +343,7 @@ impl ViewerState {
             fast_scrolling: false,
             mouse_captured: true,
             cursor_on_link: false,
+            nav_history: Vec::new(),
         }
     }
 
@@ -926,6 +930,13 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                 state.switch_file(prev);
             }
         }
+        KeyCode::Backspace => {
+            if let Some((file_idx, offset)) = state.nav_history.pop() {
+                state.switch_file(file_idx);
+                state.offset = offset.min(state.max_offset());
+                state.status_msg = Some("Back".into());
+            }
+        }
 
         // Navigation
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1095,7 +1106,7 @@ fn heading_to_slug(text: &str) -> String {
     result
 }
 
-/// Open a URL externally, navigate to an anchor heading, or block unsupported schemes.
+/// Open a URL externally, navigate to an anchor heading, open a local file, or block unsupported schemes.
 fn dispatch_link(state: &mut ViewerState, url: &str) {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         match open::that(url) {
@@ -1103,20 +1114,69 @@ fn dispatch_link(state: &mut ViewerState, url: &str) {
             Err(e) => state.status_msg = Some(format!("Failed to open: {}", e)),
         }
     } else if let Some(anchor) = url.strip_prefix('#') {
-        if let Some(entry) = state
-            .toc_entries
-            .iter()
-            .find(|e| heading_to_slug(&e.text) == anchor)
-        {
-            let target = entry.line_idx;
-            let max = state.max_offset();
-            state.offset = target.min(max);
-            state.status_msg = Some(format!("Jumped to: {}", url));
+        navigate_to_anchor(state, anchor);
+    } else if let Some(resolved) = resolve_local_link(state, url) {
+        let (path, anchor) = resolved;
+        // Save current position so we can go back
+        state.nav_history.push((state.current_file_idx, state.offset));
+        if let Some(idx) = state.files.iter().position(|f| f == &path) {
+            state.switch_file(idx);
         } else {
-            state.status_msg = Some(format!("Heading not found: {}", url));
+            state.files.push(path.clone());
+            state.switch_file(state.files.len() - 1);
+        }
+        if let Some(anchor) = anchor {
+            navigate_to_anchor(state, &anchor);
         }
     } else {
         state.status_msg = Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+    }
+}
+
+/// Navigate to a heading anchor within the current document.
+fn navigate_to_anchor(state: &mut ViewerState, anchor: &str) {
+    if let Some(entry) = state
+        .toc_entries
+        .iter()
+        .find(|e| heading_to_slug(&e.text) == anchor)
+    {
+        let target = entry.line_idx;
+        let max = state.max_offset();
+        state.offset = target.min(max);
+        state.status_msg = Some(format!("Jumped to: #{}", anchor));
+    } else {
+        state.status_msg = Some(format!("Heading not found: #{}", anchor));
+    }
+}
+
+/// Resolve a relative link to a local file path and optional anchor fragment.
+/// Returns `None` if the link doesn't point to an existing local file.
+fn resolve_local_link(state: &ViewerState, url: &str) -> Option<(String, Option<String>)> {
+    // Split off an optional #anchor fragment
+    let (file_part, anchor) = match url.split_once('#') {
+        Some((f, a)) => (f, Some(a.to_string())),
+        None => (url, None),
+    };
+
+    // Must have a file part (not just "#anchor", which is handled earlier)
+    if file_part.is_empty() {
+        return None;
+    }
+
+    // Resolve relative to the directory of the current file
+    let base_dir = std::path::Path::new(&state.filename)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let resolved = base_dir.join(file_part);
+
+    // Only open files that actually exist on disk
+    if resolved.is_file() {
+        let canonical = resolved
+            .canonicalize()
+            .unwrap_or(resolved.clone());
+        Some((canonical.to_string_lossy().into_owned(), anchor))
+    } else {
+        None
     }
 }
 
@@ -2478,6 +2538,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
                 ("] ", "Jump to next heading"),
                 ("Tab", "Next file"),
                 ("Shift+Tab", "Previous file"),
+                ("Backspace", "Go back (after following a link)"),
             ],
         },
         HelpSection {
