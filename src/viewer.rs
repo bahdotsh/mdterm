@@ -1716,9 +1716,14 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         }
     }
 
-    // iTerm2: overlay images in a second pass (1 escape sequence per image,
+    // iTerm2/Sixel: overlay images in a second pass (1 escape sequence per image,
     // not per-row, so scrolling stays smooth).
-    if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Iterm2 {
+    if !suppress_images
+        && matches!(
+            state.image_cache.protocol(),
+            crate::image::ImageProtocol::Iterm2 | crate::image::ImageProtocol::Sixel
+        )
+    {
         let mut row = 0;
         while row < viewport {
             let line_idx = if state.slide_mode {
@@ -1768,14 +1773,25 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     }
                 }
                 // +1 for title bar row
-                state.image_cache.render_iterm2_block(
-                    stdout,
-                    &url,
-                    first_image_row,
-                    count,
-                    content_width,
-                    (first_screen_row + 1) as u16,
-                )?;
+                if state.image_cache.protocol() == crate::image::ImageProtocol::Sixel {
+                    state.image_cache.render_sixel_block(
+                        stdout,
+                        &url,
+                        first_image_row,
+                        count,
+                        content_width,
+                        (first_screen_row + 1) as u16,
+                    )?;
+                } else {
+                    state.image_cache.render_iterm2_block(
+                        stdout,
+                        &url,
+                        first_image_row,
+                        count,
+                        content_width,
+                        (first_screen_row + 1) as u16,
+                    )?;
+                }
                 row += count;
                 continue;
             }

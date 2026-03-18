@@ -11,12 +11,24 @@ use image::{DynamicImage, GenericImageView, imageops::FilterType};
 pub enum ImageProtocol {
     Kitty,
     Iterm2,
+    Sixel,
     /// Universal fallback: render images using Unicode half-block characters (▀)
     /// with foreground/background colors. Works in any terminal with color support.
     HalfBlock,
 }
 
 pub fn detect_protocol() -> ImageProtocol {
+    // Allow users to force a specific protocol via environment variable
+    if let Ok(proto) = std::env::var("MDTERM_IMAGE_PROTOCOL") {
+        match proto.to_lowercase().as_str() {
+            "kitty" => return ImageProtocol::Kitty,
+            "iterm2" => return ImageProtocol::Iterm2,
+            "sixel" => return ImageProtocol::Sixel,
+            "halfblock" => return ImageProtocol::HalfBlock,
+            _ => {}
+        }
+    }
+
     // Kitty checks first (more efficient: upload once, place per-frame)
     if std::env::var("KITTY_WINDOW_ID").is_ok() {
         return ImageProtocol::Kitty;
@@ -28,6 +40,7 @@ pub fn detect_protocol() -> ImageProtocol {
         match term.as_str() {
             "WezTerm" | "ghostty" => return ImageProtocol::Kitty,
             "iTerm.app" => return ImageProtocol::Iterm2,
+            "foot" | "mlterm" | "mintty" | "contour" => return ImageProtocol::Sixel,
             _ => {}
         }
     }
@@ -40,6 +53,15 @@ pub fn detect_protocol() -> ImageProtocol {
     }
     if std::env::var("LC_TERMINAL").ok().as_deref() == Some("iTerm2") {
         return ImageProtocol::Iterm2;
+    }
+    // Additional Sixel-capable terminal detection
+    if let Ok(term) = std::env::var("TERM")
+        && (term == "foot" || term == "foot-extra" || term.starts_with("mlterm"))
+    {
+        return ImageProtocol::Sixel;
+    }
+    if std::env::var("MLTERM").is_ok() {
+        return ImageProtocol::Sixel;
     }
     ImageProtocol::HalfBlock
 }
@@ -161,6 +183,245 @@ pub fn kitty_delete_all(stdout: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+// ── Sixel graphics protocol ─────────────────────────────────────────────────
+
+/// Encode a `DynamicImage` as a Sixel escape sequence.
+/// Alpha is blended against black.
+fn encode_sixel(img: &DynamicImage) -> String {
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return String::new();
+    }
+
+    // Convert to RGB pixels, blending alpha against black
+    let rgba = img.to_rgba8();
+    let mut rgb_pixels: Vec<(u8, u8, u8)> = Vec::with_capacity((width * height) as usize);
+    for pixel in rgba.pixels() {
+        let a = pixel[3] as f32 / 255.0;
+        rgb_pixels.push((
+            (pixel[0] as f32 * a) as u8,
+            (pixel[1] as f32 * a) as u8,
+            (pixel[2] as f32 * a) as u8,
+        ));
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    let (palette, indexed) = sixel_quantize(&rgb_pixels, w);
+    let padded_h = h.div_ceil(6) * 6;
+
+    let mut out = String::with_capacity(w * padded_h);
+
+    // DCS header (P2=0: color 0 maps to terminal background)
+    out.push_str("\x1bP0;0;0q");
+
+    // Raster attributes: aspect 1:1, width, height
+    out.push_str(&format!("\"1;1;{};{}", width, height));
+
+    // Define color registers (RGB percentages 0-100)
+    for (i, &(r, g, b)) in palette.iter().enumerate() {
+        out.push_str(&format!(
+            "#{};2;{};{};{}",
+            i,
+            (r as u32 * 100 + 127) / 255,
+            (g as u32 * 100 + 127) / 255,
+            (b as u32 * 100 + 127) / 255,
+        ));
+    }
+
+    // Encode pixel data in 6-row-tall bands
+    let num_bands = padded_h / 6;
+    for band in 0..num_bands {
+        let band_y = band * 6;
+
+        // Determine which palette colors appear in this band
+        let mut color_present = [false; 256];
+        for dy in 0..6 {
+            let y = band_y + dy;
+            if y < h {
+                for x in 0..w {
+                    color_present[indexed[y * w + x]] = true;
+                }
+            }
+        }
+        let colors_in_band: Vec<usize> = (0..palette.len()).filter(|&i| color_present[i]).collect();
+
+        for (ci_idx, &color_idx) in colors_in_band.iter().enumerate() {
+            out.push_str(&format!("#{}", color_idx));
+
+            // Build sixel characters for this color across the band
+            let mut sixels: Vec<u8> = Vec::with_capacity(w);
+            for x in 0..w {
+                let mut val: u8 = 0;
+                for dy in 0..6u8 {
+                    let y = band_y + dy as usize;
+                    if y < h && indexed[y * w + x] == color_idx {
+                        val |= 1 << dy;
+                    }
+                }
+                sixels.push(val + 0x3F);
+            }
+
+            sixel_rle(&sixels, &mut out);
+
+            // Graphics carriage return between colors in the same band
+            if ci_idx < colors_in_band.len() - 1 {
+                out.push('$');
+            }
+        }
+
+        // Graphics new line between bands
+        if band + 1 < num_bands {
+            out.push('-');
+        }
+    }
+
+    // String Terminator
+    out.push_str("\x1b\\");
+    out
+}
+
+/// Run-length encode a slice of sixel characters into `out`.
+fn sixel_rle(data: &[u8], out: &mut String) {
+    let mut i = 0;
+    while i < data.len() {
+        let ch = data[i] as char;
+        let mut count = 1;
+        while i + count < data.len() && data[i + count] == data[i] {
+            count += 1;
+        }
+        if count >= 3 {
+            out.push_str(&format!("!{}{}", count, ch));
+        } else {
+            for _ in 0..count {
+                out.push(ch);
+            }
+        }
+        i += count;
+    }
+}
+
+/// Quantize RGB pixels to at most 256 colours using median-cut.
+/// Returns (palette, per-pixel palette indices).
+fn sixel_quantize(pixels: &[(u8, u8, u8)], width: usize) -> (Vec<(u8, u8, u8)>, Vec<usize>) {
+    let max_colors: usize = 256;
+
+    // Count unique colours
+    let mut counts: HashMap<(u8, u8, u8), u32> = HashMap::new();
+    for &c in pixels {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+
+    let palette = if counts.len() <= max_colors {
+        counts.keys().copied().collect()
+    } else {
+        sixel_median_cut(&counts, max_colors)
+    };
+
+    // Map each pixel to the nearest palette entry (cached)
+    let mut cache: HashMap<(u8, u8, u8), usize> = HashMap::new();
+    let indexed: Vec<usize> = pixels
+        .iter()
+        .map(|&c| {
+            *cache.entry(c).or_insert_with(|| {
+                palette
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &(pr, pg, pb))| {
+                        let dr = c.0 as i32 - pr as i32;
+                        let dg = c.1 as i32 - pg as i32;
+                        let db = c.2 as i32 - pb as i32;
+                        dr * dr + dg * dg + db * db
+                    })
+                    .unwrap()
+                    .0
+            })
+        })
+        .collect();
+
+    let _ = width; // used by caller for row stride
+    (palette, indexed)
+}
+
+/// Median-cut colour quantization on deduplicated colour counts.
+#[allow(clippy::type_complexity)]
+fn sixel_median_cut(counts: &HashMap<(u8, u8, u8), u32>, max_colors: usize) -> Vec<(u8, u8, u8)> {
+    let initial: Vec<((u8, u8, u8), u32)> = counts.iter().map(|(&c, &n)| (c, n)).collect();
+    let mut boxes: Vec<Vec<((u8, u8, u8), u32)>> = vec![initial];
+
+    while boxes.len() < max_colors {
+        // Find the box with the greatest range in any channel
+        let split_idx = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .max_by_key(|(_, b)| {
+                let (r, g, bl) = sixel_color_ranges(b);
+                r.max(g).max(bl) as u32
+            })
+            .map(|(i, _)| i);
+
+        let Some(split_idx) = split_idx else { break };
+
+        let mut box_to_split = boxes.swap_remove(split_idx);
+        let (r_range, g_range, b_range) = sixel_color_ranges(&box_to_split);
+        let max_range = r_range.max(g_range).max(b_range);
+
+        if max_range == r_range {
+            box_to_split.sort_by_key(|&(c, _)| c.0);
+        } else if max_range == g_range {
+            box_to_split.sort_by_key(|&(c, _)| c.1);
+        } else {
+            box_to_split.sort_by_key(|&(c, _)| c.2);
+        }
+
+        let mid = box_to_split.len() / 2;
+        let right = box_to_split.split_off(mid);
+        boxes.push(box_to_split);
+        boxes.push(right);
+    }
+
+    // Weighted average of each box → palette colour
+    boxes
+        .iter()
+        .map(|b| {
+            let (rs, gs, bs, total) = b.iter().fold(
+                (0u64, 0u64, 0u64, 0u64),
+                |(rs, gs, bs, t), &((r, g, b), n)| {
+                    let c = n as u64;
+                    (
+                        rs + r as u64 * c,
+                        gs + g as u64 * c,
+                        bs + b as u64 * c,
+                        t + c,
+                    )
+                },
+            );
+            ((rs / total) as u8, (gs / total) as u8, (bs / total) as u8)
+        })
+        .collect()
+}
+
+/// Return the (R, G, B) channel ranges for a set of weighted colours.
+fn sixel_color_ranges(colors: &[((u8, u8, u8), u32)]) -> (u8, u8, u8) {
+    let mut r_min = 255u8;
+    let mut r_max = 0u8;
+    let mut g_min = 255u8;
+    let mut g_max = 0u8;
+    let mut b_min = 255u8;
+    let mut b_max = 0u8;
+    for &((r, g, b), _) in colors {
+        r_min = r_min.min(r);
+        r_max = r_max.max(r);
+        g_min = g_min.min(g);
+        g_max = g_max.max(g);
+        b_min = b_min.min(b);
+        b_max = b_max.max(b);
+    }
+    (r_max - r_min, g_max - g_min, b_max - b_min)
+}
+
 // ── Image cache ─────────────────────────────────────────────────────────────
 
 /// Default placeholder rows when image dimensions are unknown
@@ -199,6 +460,19 @@ struct Iterm2Image {
     crop_cache: Option<(usize, usize, String)>,
 }
 
+/// Pre-encoded Sixel image: full image + cached crop for scrolling.
+struct SixelImage {
+    cols: usize,
+    total_rows: usize,
+    cell_h_px: u32,
+    /// The resized image pixels (for cropping visible portions).
+    resized: DynamicImage,
+    /// Pre-encoded Sixel data for the full image.
+    full_sixel: String,
+    /// Cached crop: (first_row, num_rows, sixel_data).
+    crop_cache: Option<(usize, usize, String)>,
+}
+
 /// Pre-rendered half-block image: uses Unicode ▀ with fg/bg colors to render
 /// two vertical pixels per terminal cell. Works in any terminal.
 struct HalfBlockImage {
@@ -218,6 +492,9 @@ pub struct ImageCache {
 
     // iTerm2: pre-cropped strips cached per image (None = encode failed)
     iterm2_images: HashMap<String, Option<Iterm2Image>>,
+
+    // Sixel: pre-encoded sixel data cached per image (None = encode failed)
+    sixel_images: HashMap<String, Option<SixelImage>>,
 
     // Half-block: resized images for Unicode block rendering
     halfblock_images: HashMap<String, HalfBlockImage>,
@@ -243,6 +520,7 @@ impl ImageCache {
             // ID 0 is reserved in the Kitty protocol ("the last image").
             next_kitty_id: 0,
             iterm2_images: HashMap::new(),
+            sixel_images: HashMap::new(),
             halfblock_images: HashMap::new(),
             last_render_width: 0,
             cell_metrics: get_cell_metrics(),
@@ -265,6 +543,7 @@ impl ImageCache {
             self.cell_metrics = new;
             self.kitty_images.clear();
             self.iterm2_images.clear();
+            self.sixel_images.clear();
             self.halfblock_images.clear();
         } else {
             self.cell_metrics = new;
@@ -377,6 +656,7 @@ impl ImageCache {
         if content_width != self.last_render_width {
             self.kitty_images.clear();
             self.iterm2_images.clear();
+            self.sixel_images.clear();
             self.halfblock_images.clear();
             self.last_render_width = content_width;
         }
@@ -450,6 +730,30 @@ impl ImageCache {
                         })
                     });
                 }
+                ImageProtocol::Sixel => {
+                    self.sixel_images.entry(url).or_insert_with(|| {
+                        let (img_w, img_h) = img.dimensions();
+                        let (cols, rows) = calc_display_cells(
+                            img_w,
+                            img_h,
+                            content_width,
+                            MAX_IMAGE_ROWS,
+                            cell_aspect,
+                        );
+                        let target_w = (cols as u32 * cell_w_px).max(1);
+                        let target_h = (rows as u32 * cell_h_px).max(1);
+                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+                        let full_sixel = encode_sixel(&resized);
+                        Some(SixelImage {
+                            cols,
+                            total_rows: rows,
+                            cell_h_px,
+                            resized,
+                            full_sixel,
+                            crop_cache: None,
+                        })
+                    });
+                }
                 ImageProtocol::HalfBlock => {
                     self.halfblock_images.entry(url).or_insert_with(|| {
                         let (img_w, img_h) = img.dimensions();
@@ -490,7 +794,7 @@ impl ImageCache {
             ImageProtocol::HalfBlock => {
                 self.render_halfblock_row(stdout, url, image_row, content_width, bg)
             }
-            ImageProtocol::Iterm2 => Ok(false),
+            ImageProtocol::Iterm2 | ImageProtocol::Sixel => Ok(false),
         }
     }
 
@@ -639,6 +943,50 @@ impl ImageCache {
             "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=0:{}\x07",
             ii.cols, num_rows, data
         )?;
+
+        Ok(())
+    }
+
+    /// Render a visible portion of a Sixel image as a single inline block.
+    /// Works like `render_iterm2_block`: positions cursor, emits Sixel data.
+    pub fn render_sixel_block(
+        &mut self,
+        stdout: &mut impl Write,
+        url: &str,
+        first_row: usize,
+        num_rows: usize,
+        content_width: usize,
+        screen_y: u16,
+    ) -> io::Result<()> {
+        let si = match self.sixel_images.get_mut(url).and_then(|o| o.as_mut()) {
+            Some(si) => si,
+            None => return Ok(()),
+        };
+
+        let x_col = 2 + content_width.saturating_sub(si.cols) / 2;
+
+        // Pick the right Sixel payload: full image or a cached crop
+        let data: &str = if first_row == 0 && num_rows == si.total_rows {
+            &si.full_sixel
+        } else {
+            if !si
+                .crop_cache
+                .as_ref()
+                .is_some_and(|(fr, nr, _)| *fr == first_row && *nr == num_rows)
+            {
+                let y = first_row as u32 * si.cell_h_px;
+                let h = (num_rows as u32 * si.cell_h_px)
+                    .min(si.resized.height().saturating_sub(y))
+                    .max(1);
+                let cropped = si.resized.crop_imm(0, y, si.resized.width(), h);
+                si.crop_cache = Some((first_row, num_rows, encode_sixel(&cropped)));
+            }
+            &si.crop_cache.as_ref().unwrap().2
+        };
+
+        // Position cursor and emit the Sixel sequence
+        write!(stdout, "\x1b[{};{}H", screen_y + 1, x_col + 1)?;
+        stdout.write_all(data.as_bytes())?;
 
         Ok(())
     }
@@ -1372,5 +1720,84 @@ mod tests {
         // Since initial URL is also localhost (blocked), we test the function directly.
         let blocked = "http://169.254.169.254/latest/meta-data/";
         assert!(fetch_image_http(blocked).is_none());
+    }
+
+    // ── Sixel encoding ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sixel_encode_empty_image_returns_empty() {
+        let img = DynamicImage::new_rgb8(0, 0);
+        assert!(encode_sixel(&img).is_empty());
+    }
+
+    #[test]
+    fn sixel_encode_has_dcs_and_st() {
+        let img = DynamicImage::new_rgb8(2, 2);
+        let data = encode_sixel(&img);
+        assert!(data.starts_with("\x1bP"), "should start with DCS");
+        assert!(data.ends_with("\x1b\\"), "should end with ST");
+    }
+
+    #[test]
+    fn sixel_encode_contains_raster_attributes() {
+        let img = DynamicImage::new_rgb8(4, 3);
+        let data = encode_sixel(&img);
+        assert!(
+            data.contains("\"1;1;4;3"),
+            "should contain raster attributes"
+        );
+    }
+
+    #[test]
+    fn sixel_encode_contains_color_definitions() {
+        let img = DynamicImage::new_rgb8(1, 1);
+        let data = encode_sixel(&img);
+        // At least one color register should be defined
+        assert!(data.contains("#0;2;"), "should define at least one color");
+    }
+
+    #[test]
+    fn sixel_rle_compresses_repeated_chars() {
+        let mut out = String::new();
+        sixel_rle(&[0x7E, 0x7E, 0x7E, 0x7E, 0x7E], &mut out);
+        assert_eq!(out, "!5~", "5 repeated '~' should be RLE-compressed");
+    }
+
+    #[test]
+    fn sixel_rle_short_runs_not_compressed() {
+        let mut out = String::new();
+        sixel_rle(&[0x3F, 0x3F], &mut out);
+        assert_eq!(out, "??", "2 repeated chars should not use RLE");
+    }
+
+    #[test]
+    fn sixel_quantize_few_colors_preserves_all() {
+        // Image with only 3 unique colors — should not quantize
+        let pixels = vec![(255, 0, 0), (0, 255, 0), (0, 0, 255)];
+        let (palette, indexed) = sixel_quantize(&pixels, 3);
+        assert_eq!(palette.len(), 3);
+        assert_eq!(indexed.len(), 3);
+        // Each pixel should map to a unique index
+        let mut indices: Vec<usize> = indexed.clone();
+        indices.sort();
+        indices.dedup();
+        assert_eq!(indices.len(), 3);
+    }
+
+    #[test]
+    fn sixel_quantize_many_colors_limited_to_256() {
+        // Create >256 unique colors
+        let mut pixels = Vec::new();
+        for r in 0..8 {
+            for g in 0..8 {
+                for b in 0..8 {
+                    pixels.push((r * 32, g * 32, b * 32));
+                }
+            }
+        }
+        assert!(pixels.len() > 256);
+        let (palette, indexed) = sixel_quantize(&pixels, pixels.len());
+        assert!(palette.len() <= 256);
+        assert_eq!(indexed.len(), pixels.len());
     }
 }
