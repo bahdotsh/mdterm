@@ -48,14 +48,14 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         let max_offset = state.max_offset();
         state.offset = state.offset.min(max_offset);
 
-        render_frame(&mut stdout, &mut state)?;
-
-        // Expire toast after 1 second
+        // Expire toast before rendering so it doesn't show for an extra frame
         if let Some((_, t)) = &state.toast
             && t.elapsed() >= Duration::from_secs(1)
         {
             state.toast = None;
         }
+
+        render_frame(&mut stdout, &mut state)?;
 
         // Poll for completed background fetches
         let new_images = state.image_cache.poll_completed();
@@ -278,6 +278,10 @@ struct ViewerState {
     // Whether the cursor is currently over a clickable element (link or code block)
     cursor_on_clickable: bool,
 
+    // Pre-computed list content keyed by list_id (built from pre-wrap lines
+    // so that word-wrapping doesn't introduce artificial line breaks).
+    list_contents: std::collections::HashMap<usize, String>,
+
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
 }
@@ -354,6 +358,7 @@ impl ViewerState {
             fast_scrolling: false,
             mouse_captured: true,
             cursor_on_clickable: false,
+            list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
         }
     }
@@ -390,6 +395,20 @@ impl ViewerState {
             self.line_numbers,
             &self.syntect_res,
         );
+        // Pre-compute list content from pre-wrap lines so that word-wrapping
+        // doesn't introduce artificial newlines within a single list item.
+        self.list_contents.clear();
+        for line in &lines {
+            if let LineMeta::ListItem { list_id } = line.meta {
+                let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+                let entry = self.list_contents.entry(list_id).or_default();
+                if !entry.is_empty() {
+                    entry.push('\n');
+                }
+                entry.push_str(&text);
+            }
+        }
+
         self.wrapped = wrap_lines(&lines, cw);
         self.doc_info = doc_info;
 
@@ -613,14 +632,12 @@ impl ViewerState {
             .find(|e| e.line_idx <= line_idx && line_idx < e.section_end)
     }
 
-    /// Extracts the plain text of all lines belonging to a given list_id.
+    /// Returns the pre-computed plain text of the list with the given id.
     fn list_text(&self, target_id: usize) -> String {
-        self.wrapped
-            .iter()
-            .filter(|l| matches!(l.meta, LineMeta::ListItem { list_id } if list_id == target_id))
-            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.list_contents
+            .get(&target_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
