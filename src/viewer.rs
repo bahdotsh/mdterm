@@ -5,7 +5,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        MouseButton, MouseEventKind,
     },
     execute, queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
@@ -256,6 +256,12 @@ struct ViewerState {
 
     // Scroll performance: skip expensive image rendering during rapid scroll
     fast_scrolling: bool,
+
+    // Whether mouse capture is currently enabled
+    mouse_captured: bool,
+
+    // Whether the cursor is currently over a link (for pointer shape)
+    cursor_on_link: bool,
 }
 
 #[derive(Clone)]
@@ -324,6 +330,8 @@ impl ViewerState {
             image_cache: crate::image::ImageCache::new(),
             pending_image_urls: std::collections::VecDeque::new(),
             fast_scrolling: false,
+            mouse_captured: true,
+            cursor_on_link: false,
         }
     }
 
@@ -524,6 +532,36 @@ impl ViewerState {
         None
     }
 
+    /// Returns the link URL at the given terminal (row, col), if any.
+    fn link_at_position(&self, term_row: usize, term_col: usize) -> Option<&str> {
+        // Row 0 is the title bar; content starts at row 1. Cols 0-1 are "│ ".
+        if term_row < 1 || term_col < 2 {
+            return None;
+        }
+        let content_col = term_col - 2;
+        let line_idx = if self.slide_mode {
+            let start = self
+                .slide_boundaries
+                .get(self.current_slide)
+                .copied()
+                .unwrap_or(0);
+            start + (term_row - 1)
+        } else {
+            self.offset + (term_row - 1)
+        };
+
+        let line = self.wrapped.get(line_idx)?;
+        let mut col = 0;
+        for span in &line.spans {
+            let span_len = span.text.chars().count();
+            if content_col >= col && content_col < col + span_len {
+                return span.style.link_url.as_deref();
+            }
+            col += span_len;
+        }
+        None
+    }
+
     fn visible_section_text(&self) -> String {
         // Find current heading section
         let headings = self.heading_lines();
@@ -669,6 +707,27 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     state.offset = state.offset.saturating_sub(3);
                 }
             },
+            MouseEventKind::Down(MouseButton::Left) if state.mode == ViewMode::Normal => {
+                if let Some(url) = state.link_at_position(me.row as usize, me.column as usize) {
+                    let _ = open::that(url);
+                }
+            }
+            MouseEventKind::Moved if state.mode == ViewMode::Normal => {
+                let on_link = state
+                    .link_at_position(me.row as usize, me.column as usize)
+                    .is_some();
+                if on_link != state.cursor_on_link {
+                    state.cursor_on_link = on_link;
+                    let mut stdout = io::stdout();
+                    if on_link {
+                        // OSC 22: set mouse pointer to "pointer" (hand cursor)
+                        let _ = queue!(stdout, Print("\x1b]22;pointer\x07"));
+                    } else {
+                        let _ = queue!(stdout, Print("\x1b]22;default\x07"));
+                    }
+                    let _ = stdout.flush();
+                }
+            }
             _ => {}
         },
         Event::Resize(c, r) => {
@@ -715,6 +774,20 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             } else {
                 "Line numbers OFF".into()
             });
+        }
+
+        // Mouse capture toggle
+        KeyCode::Char('m') => {
+            let mut stdout = io::stdout();
+            if state.mouse_captured {
+                let _ = execute!(stdout, DisableMouseCapture);
+                state.mouse_captured = false;
+                state.status_msg = Some("Mouse capture OFF — select text freely".into());
+            } else {
+                let _ = execute!(stdout, EnableMouseCapture);
+                state.mouse_captured = true;
+                state.status_msg = Some("Mouse capture ON — scroll with mouse".into());
+            }
         }
 
         // Search
@@ -2384,6 +2457,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
                 ("c", "Copy nearest code block"),
                 ("t", "Toggle dark / light theme"),
                 ("l", "Toggle line numbers"),
+                ("m", "Toggle mouse capture (for text select)"),
             ],
         },
         HelpSection {
