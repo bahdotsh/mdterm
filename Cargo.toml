@@ -6,6 +6,7 @@ description = "A terminal-based Markdown viewer with syntax highlighting and int
 license = "MIT"
 repository = "https://github.com/bahdotsh/mdterm"
 keywords = ["markdown", "terminal", "viewer", "tui", "cli"]
+exclude = ["demo.gif", "demo.cast", "screenshots/", "test.md", "test_linked.md"]
 categories = ["command-line-utilities"]
 
 [dependencies]
