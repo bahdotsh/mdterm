@@ -174,7 +174,13 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            Print("\x1b]22;default\x07"),
+            DisableMouseCapture,
+            Show,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -534,13 +540,16 @@ impl ViewerState {
         None
     }
 
+    /// Width of the left gutter ("│ ") in terminal columns.
+    const GUTTER_COLS: usize = 2;
+
     /// Returns the link URL at the given terminal (row, col), if any.
     fn link_at_position(&self, term_row: usize, term_col: usize) -> Option<&str> {
-        // Row 0 is the title bar; content starts at row 1. Cols 0-1 are "│ ".
-        if term_row < 1 || term_col < 2 {
+        // Row 0 is the title bar; content starts at row 1.
+        if term_row < 1 || term_col < Self::GUTTER_COLS {
             return None;
         }
-        let content_col = term_col - 2;
+        let content_col = term_col - Self::GUTTER_COLS;
         let line_idx = if self.slide_mode {
             let start = self
                 .slide_boundaries
@@ -1656,7 +1665,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                 let mut col = 0;
                 for span in spans {
                     write_span(stdout, span, Some(theme.bg))?;
-                    col += span.text.chars().count();
+                    col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
                     let common_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
@@ -2951,5 +2960,121 @@ mod tests {
     fn slug_empty_and_special_only() {
         assert_eq!(heading_to_slug(""), "");
         assert_eq!(heading_to_slug("!@#$%"), "");
+    }
+
+    // ── link_at_position tests ─────────────────────────────────────────────
+
+    /// Build a minimal `ViewerState` with pre-set `wrapped` lines for hit-testing.
+    fn make_state_with_lines(lines: Vec<Line>) -> ViewerState {
+        let opts = ViewerOptions {
+            files: vec![],
+            initial_content: String::new(),
+            filename: String::new(),
+            theme: crate::theme::Theme::dark(),
+            slide_mode: false,
+            follow_mode: false,
+            line_numbers: false,
+            width_override: None,
+        };
+        let mut state = ViewerState::new(opts, 80, 24);
+        state.wrapped = lines;
+        state
+    }
+
+    fn span(text: &str, link: Option<&str>) -> StyledSpan {
+        StyledSpan {
+            text: text.to_string(),
+            style: crate::style::Style {
+                link_url: link.map(String::from),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn line(spans: Vec<StyledSpan>) -> Line {
+        Line {
+            spans,
+            meta: LineMeta::None,
+        }
+    }
+
+    #[test]
+    fn link_at_position_hits_link_span() {
+        // Line 0: "Hello " (6 cols) + "click me" (8 cols, linked)
+        let state = make_state_with_lines(vec![line(vec![
+            span("Hello ", None),
+            span("click me", Some("https://example.com")),
+        ])]);
+        // term_row=1 (first content row), gutter is 2 cols
+        // "Hello " starts at content_col 0..6, "click me" at 6..14
+        assert_eq!(
+            state.link_at_position(1, 2 + 6),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            state.link_at_position(1, 2 + 13),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn link_at_position_misses_plain_span() {
+        let state = make_state_with_lines(vec![line(vec![
+            span("Hello ", None),
+            span("click me", Some("https://example.com")),
+        ])]);
+        // Click on "Hello " (no link)
+        assert_eq!(state.link_at_position(1, 2 + 0), None);
+        assert_eq!(state.link_at_position(1, 2 + 5), None);
+    }
+
+    #[test]
+    fn link_at_position_returns_none_for_gutter() {
+        let state = make_state_with_lines(vec![line(vec![span(
+            "link",
+            Some("https://example.com"),
+        )])]);
+        // Column 0 and 1 are the gutter ("│ ")
+        assert_eq!(state.link_at_position(1, 0), None);
+        assert_eq!(state.link_at_position(1, 1), None);
+    }
+
+    #[test]
+    fn link_at_position_returns_none_for_title_bar() {
+        let state = make_state_with_lines(vec![line(vec![span(
+            "link",
+            Some("https://example.com"),
+        )])]);
+        // Row 0 is the title bar
+        assert_eq!(state.link_at_position(0, 2), None);
+    }
+
+    #[test]
+    fn link_at_position_returns_none_past_end_of_line() {
+        let state = make_state_with_lines(vec![line(vec![span("short", None)])]);
+        // "short" is 5 cols wide; clicking at col 5+ past the content
+        assert_eq!(state.link_at_position(1, 2 + 10), None);
+    }
+
+    #[test]
+    fn link_at_position_returns_none_past_last_line() {
+        let state = make_state_with_lines(vec![line(vec![span("only line", None)])]);
+        // Row 2 maps to line index 1 which doesn't exist
+        assert_eq!(state.link_at_position(2, 2), None);
+    }
+
+    #[test]
+    fn link_at_position_multiple_links_on_one_line() {
+        let state = make_state_with_lines(vec![line(vec![
+            span("aa", Some("https://a.com")),
+            span(" ", None),
+            span("bb", Some("https://b.com")),
+        ])]);
+        // "aa" at cols 0..2, " " at 2..3, "bb" at 3..5
+        assert_eq!(state.link_at_position(1, 2 + 0), Some("https://a.com"));
+        assert_eq!(state.link_at_position(1, 2 + 1), Some("https://a.com"));
+        assert_eq!(state.link_at_position(1, 2 + 2), None); // space
+        assert_eq!(state.link_at_position(1, 2 + 3), Some("https://b.com"));
+        assert_eq!(state.link_at_position(1, 2 + 4), Some("https://b.com"));
     }
 }
