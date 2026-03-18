@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Write};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
@@ -485,8 +485,41 @@ struct HalfBlockImage {
     resized: DynamicImage,
 }
 
+/// Result from a background pre-render thread.
+enum PreRenderedResult {
+    Kitty {
+        id: u32,
+        cols: usize,
+        rows: usize,
+        target_w: u32,
+        target_h: u32,
+        cell_h_px: u32,
+        png: Vec<u8>,
+    },
+    Iterm2 {
+        cols: usize,
+        total_rows: usize,
+        cell_h_px: u32,
+        resized: DynamicImage,
+        full_base64: String,
+    },
+    Sixel {
+        cols: usize,
+        total_rows: usize,
+        cell_h_px: u32,
+        bg: (u8, u8, u8),
+        resized: DynamicImage,
+        full_sixel: String,
+    },
+    HalfBlock {
+        cols: usize,
+        rows: usize,
+        resized: DynamicImage,
+    },
+}
+
 pub struct ImageCache {
-    images: HashMap<String, Option<DynamicImage>>,
+    images: HashMap<String, Option<Arc<DynamicImage>>>,
     protocol: ImageProtocol,
 
     // Kitty: image uploaded once, placed per-frame (None = encode failed)
@@ -509,12 +542,18 @@ pub struct ImageCache {
     sender: mpsc::Sender<(String, Option<DynamicImage>)>,
     receiver: mpsc::Receiver<(String, Option<DynamicImage>)>,
     in_flight: HashSet<String>,
+
+    // Background pre-render infrastructure
+    render_sender: mpsc::Sender<(String, usize, Option<PreRenderedResult>)>,
+    render_receiver: mpsc::Receiver<(String, usize, Option<PreRenderedResult>)>,
+    render_in_flight: HashSet<String>,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
         let protocol = detect_protocol();
         let (sender, receiver) = mpsc::channel();
+        let (render_sender, render_receiver) = mpsc::channel();
         ImageCache {
             images: HashMap::new(),
             protocol,
@@ -530,6 +569,9 @@ impl ImageCache {
             sender,
             receiver,
             in_flight: HashSet::new(),
+            render_sender,
+            render_receiver,
+            render_in_flight: HashSet::new(),
         }
     }
 
@@ -547,6 +589,11 @@ impl ImageCache {
             self.kitty_images.clear();
             self.iterm2_images.clear();
             self.sixel_images.clear();
+            // Cancel stale in-flight pre-renders
+            let (render_sender, render_receiver) = mpsc::channel();
+            self.render_sender = render_sender;
+            self.render_receiver = render_receiver;
+            self.render_in_flight.clear();
             self.halfblock_images.clear();
         } else {
             self.cell_metrics = new;
@@ -598,15 +645,15 @@ impl ImageCache {
         let mut any = false;
         while let Ok((url, img)) = self.receiver.try_recv() {
             self.in_flight.remove(&url);
-            self.images.insert(url, img);
+            self.images.insert(url, img.map(Arc::new));
             any = true;
         }
         any
     }
 
-    /// Returns true if any fetches are currently in flight.
+    /// Returns true if any fetches or pre-renders are currently in flight.
     pub fn has_in_flight(&self) -> bool {
-        !self.in_flight.is_empty()
+        !self.in_flight.is_empty() || !self.render_in_flight.is_empty()
     }
 
     /// Number of fetches currently in flight.
@@ -614,20 +661,24 @@ impl ImageCache {
         self.in_flight.len()
     }
 
-    /// Cancel all in-flight fetches by replacing the channel.
-    /// Background threads will finish but their results go to the dead channel.
+    /// Cancel all in-flight fetches and pre-renders by replacing the channels.
+    /// Background threads will finish but their results go to the dead channels.
     /// Already-cached images are preserved.
     pub fn cancel_in_flight(&mut self) {
         let (sender, receiver) = mpsc::channel();
         self.sender = sender;
         self.receiver = receiver;
         self.in_flight.clear();
+        let (render_sender, render_receiver) = mpsc::channel();
+        self.render_sender = render_sender;
+        self.render_receiver = render_receiver;
+        self.render_in_flight.clear();
     }
 
     /// Insert a pre-loaded image directly (used in tests).
     #[cfg(test)]
     fn insert(&mut self, url: &str, img: Option<image::DynamicImage>) {
-        self.images.insert(url.to_string(), img);
+        self.images.insert(url.to_string(), img.map(Arc::new));
     }
 
     pub fn image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
@@ -660,18 +711,68 @@ impl ImageCache {
         if self.images.contains_key(url) {
             return;
         }
-        let img = fetch_image(url).map(|img| downscale(img, MAX_SOURCE_DIM));
+        let img = fetch_image(url).map(|img| Arc::new(downscale(img, MAX_SOURCE_DIM)));
         self.images.insert(url.to_string(), img);
     }
 
-    /// Pre-render images for the current protocol and content width.
-    /// `bg` is the theme background colour used for Sixel alpha blending.
-    pub fn pre_render(&mut self, content_width: usize, bg: (u8, u8, u8)) {
+    /// Returns true if the image has been pre-rendered and is ready for display.
+    pub fn is_ready_to_render(&self, url: &str) -> bool {
+        match self.protocol {
+            ImageProtocol::Kitty => self.kitty_images.get(url).is_some_and(|o| o.is_some()),
+            ImageProtocol::Iterm2 => self.iterm2_images.get(url).is_some_and(|o| o.is_some()),
+            ImageProtocol::Sixel => self.sixel_images.get(url).is_some_and(|o| o.is_some()),
+            ImageProtocol::HalfBlock => self.halfblock_images.contains_key(url),
+        }
+    }
+
+    /// Queue a background thread to pre-render a single image for display.
+    fn queue_pre_render(&mut self, url: &str, content_width: usize, bg: (u8, u8, u8)) {
+        if self.is_ready_to_render(url) || self.render_in_flight.contains(url) {
+            return;
+        }
+        let img = match self.images.get(url).and_then(|o| o.as_ref()) {
+            Some(img) => Arc::clone(img),
+            None => return,
+        };
+
+        self.render_in_flight.insert(url.to_string());
+        let sender = self.render_sender.clone();
+        let url_owned = url.to_string();
+        let protocol = self.protocol;
+        let cell_metrics = self.cell_metrics;
+
+        let kitty_id = if protocol == ImageProtocol::Kitty {
+            self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
+            if self.next_kitty_id == 0 {
+                self.next_kitty_id = 1;
+            }
+            self.next_kitty_id
+        } else {
+            0
+        };
+
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pre_render_image(&img, protocol, content_width, cell_metrics, bg, kitty_id)
+            }))
+            .unwrap_or(None);
+            let _ = sender.send((url_owned, content_width, result));
+        });
+    }
+
+    /// Queue background pre-rendering for all loaded images that haven't been
+    /// pre-rendered yet. Clears caches when `content_width` changes.
+    pub fn queue_all_pre_renders(&mut self, content_width: usize, bg: (u8, u8, u8)) {
         if content_width != self.last_render_width {
             self.kitty_images.clear();
             self.iterm2_images.clear();
             self.sixel_images.clear();
             self.halfblock_images.clear();
+            // Cancel stale in-flight pre-renders for the old width
+            let (render_sender, render_receiver) = mpsc::channel();
+            self.render_sender = render_sender;
+            self.render_receiver = render_receiver;
+            self.render_in_flight.clear();
             self.last_render_width = content_width;
         }
 
@@ -681,117 +782,104 @@ impl ImageCache {
             .filter_map(|(url, opt)| opt.as_ref().map(|_| url.clone()))
             .collect();
 
-        let cell_aspect = self.cell_metrics.aspect;
-        let cell_w_px = self.cell_metrics.cell_w_px;
-        let cell_h_px = self.cell_metrics.cell_h_px;
-
         for url in urls {
-            let img = self.images.get(&url).unwrap().as_ref().unwrap();
+            self.queue_pre_render(&url, content_width, bg);
+        }
+    }
 
-            match self.protocol {
-                ImageProtocol::Kitty => {
-                    self.kitty_images.entry(url).or_insert_with(|| {
-                        let (img_w, img_h) = img.dimensions();
-                        let (cols, rows) = calc_display_cells(
-                            img_w,
-                            img_h,
-                            content_width,
-                            MAX_IMAGE_ROWS,
-                            cell_aspect,
+    /// Poll for completed background pre-renders. Returns true if any new
+    /// pre-rendered images are now ready for display.
+    pub fn poll_pre_rendered(&mut self) -> bool {
+        let mut any = false;
+        while let Ok((url, content_width, data)) = self.render_receiver.try_recv() {
+            self.render_in_flight.remove(&url);
+            // Discard results for stale content widths
+            if content_width != self.last_render_width {
+                continue;
+            }
+            if let Some(data) = data {
+                match data {
+                    PreRenderedResult::Kitty {
+                        id,
+                        cols,
+                        rows,
+                        target_w,
+                        target_h,
+                        cell_h_px,
+                        png,
+                    } => {
+                        self.kitty_images.insert(
+                            url,
+                            Some(KittyImage {
+                                id,
+                                cols,
+                                rows,
+                                target_w,
+                                target_h,
+                                cell_h_px,
+                                pending_png: Some(png),
+                            }),
                         );
-                        let target_w = (cols as u32 * cell_w_px).max(1);
-                        let target_h = (rows as u32 * cell_h_px).max(1);
-                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = encode_png(&resized)?;
-                        self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
-                        if self.next_kitty_id == 0 {
-                            self.next_kitty_id = 1;
-                        }
-                        Some(KittyImage {
-                            id: self.next_kitty_id,
-                            cols,
-                            rows,
-                            target_w,
-                            target_h,
-                            cell_h_px,
-                            pending_png: Some(png),
-                        })
-                    });
-                }
-                ImageProtocol::Iterm2 => {
-                    self.iterm2_images.entry(url).or_insert_with(|| {
-                        let (img_w, img_h) = img.dimensions();
-                        let (cols, rows) = calc_display_cells(
-                            img_w,
-                            img_h,
-                            content_width,
-                            MAX_IMAGE_ROWS,
-                            cell_aspect,
+                    }
+                    PreRenderedResult::Iterm2 {
+                        cols,
+                        total_rows,
+                        cell_h_px,
+                        resized,
+                        full_base64,
+                    } => {
+                        self.iterm2_images.insert(
+                            url,
+                            Some(Iterm2Image {
+                                cols,
+                                total_rows,
+                                cell_h_px,
+                                resized,
+                                full_base64,
+                                crop_cache: None,
+                            }),
                         );
-                        let target_w = (cols as u32 * cell_w_px).max(1);
-                        let target_h = (rows as u32 * cell_h_px).max(1);
-                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let png = encode_png(&resized)?;
-                        let full_base64 = BASE64.encode(png);
-
-                        Some(Iterm2Image {
-                            cols,
-                            total_rows: rows,
-                            cell_h_px,
-                            resized,
-                            full_base64,
-                            crop_cache: None,
-                        })
-                    });
-                }
-                ImageProtocol::Sixel => {
-                    self.sixel_images.entry(url).or_insert_with(|| {
-                        let (img_w, img_h) = img.dimensions();
-                        let (cols, rows) = calc_display_cells(
-                            img_w,
-                            img_h,
-                            content_width,
-                            MAX_IMAGE_ROWS,
-                            cell_aspect,
+                    }
+                    PreRenderedResult::Sixel {
+                        cols,
+                        total_rows,
+                        cell_h_px,
+                        bg,
+                        resized,
+                        full_sixel,
+                    } => {
+                        self.sixel_images.insert(
+                            url,
+                            Some(SixelImage {
+                                cols,
+                                total_rows,
+                                cell_h_px,
+                                bg,
+                                resized,
+                                full_sixel,
+                                crop_cache: None,
+                            }),
                         );
-                        let target_w = (cols as u32 * cell_w_px).max(1);
-                        let target_h = (rows as u32 * cell_h_px).max(1);
-                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        let full_sixel = encode_sixel(&resized, bg);
-                        Some(SixelImage {
-                            cols,
-                            total_rows: rows,
-                            cell_h_px,
-                            bg,
-                            resized,
-                            full_sixel,
-                            crop_cache: None,
-                        })
-                    });
-                }
-                ImageProtocol::HalfBlock => {
-                    self.halfblock_images.entry(url).or_insert_with(|| {
-                        let (img_w, img_h) = img.dimensions();
-                        let (cols, rows) = calc_display_cells(
-                            img_w,
-                            img_h,
-                            content_width,
-                            MAX_IMAGE_ROWS,
-                            cell_aspect,
+                    }
+                    PreRenderedResult::HalfBlock {
+                        cols,
+                        rows,
+                        resized,
+                    } => {
+                        self.halfblock_images.insert(
+                            url,
+                            HalfBlockImage {
+                                cols,
+                                rows,
+                                resized,
+                            },
                         );
-                        // Half-block: each cell = 1 column wide, 2 vertical pixels
-                        let target_w = (cols as u32).max(1);
-                        let target_h = (rows as u32 * 2).max(1);
-                        let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
-                        HalfBlockImage {
-                            cols,
-                            rows,
-                            resized,
-                        }
-                    });
+                    }
                 }
             }
+            any = true;
         }
+        any
     }
 
     /// Render a single image row. Returns true if the row was rendered inline.
@@ -1051,6 +1139,81 @@ fn blend_alpha(pixel: image::Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
 }
 
 // ── Fetching ────────────────────────────────────────────────────────────────
+
+/// Pre-render an image for a specific protocol on a background thread.
+fn pre_render_image(
+    img: &DynamicImage,
+    protocol: ImageProtocol,
+    content_width: usize,
+    cell_metrics: CellMetrics,
+    bg: (u8, u8, u8),
+    kitty_id: u32,
+) -> Option<PreRenderedResult> {
+    let (img_w, img_h) = img.dimensions();
+    let (cols, rows) = calc_display_cells(
+        img_w,
+        img_h,
+        content_width,
+        MAX_IMAGE_ROWS,
+        cell_metrics.aspect,
+    );
+
+    match protocol {
+        ImageProtocol::Kitty => {
+            let target_w = (cols as u32 * cell_metrics.cell_w_px).max(1);
+            let target_h = (rows as u32 * cell_metrics.cell_h_px).max(1);
+            let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+            let png = encode_png(&resized)?;
+            Some(PreRenderedResult::Kitty {
+                id: kitty_id,
+                cols,
+                rows,
+                target_w,
+                target_h,
+                cell_h_px: cell_metrics.cell_h_px,
+                png,
+            })
+        }
+        ImageProtocol::Iterm2 => {
+            let target_w = (cols as u32 * cell_metrics.cell_w_px).max(1);
+            let target_h = (rows as u32 * cell_metrics.cell_h_px).max(1);
+            let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+            let png = encode_png(&resized)?;
+            let full_base64 = BASE64.encode(png);
+            Some(PreRenderedResult::Iterm2 {
+                cols,
+                total_rows: rows,
+                cell_h_px: cell_metrics.cell_h_px,
+                resized,
+                full_base64,
+            })
+        }
+        ImageProtocol::Sixel => {
+            let target_w = (cols as u32 * cell_metrics.cell_w_px).max(1);
+            let target_h = (rows as u32 * cell_metrics.cell_h_px).max(1);
+            let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+            let full_sixel = encode_sixel(&resized, bg);
+            Some(PreRenderedResult::Sixel {
+                cols,
+                total_rows: rows,
+                cell_h_px: cell_metrics.cell_h_px,
+                bg,
+                resized,
+                full_sixel,
+            })
+        }
+        ImageProtocol::HalfBlock => {
+            let target_w = (cols as u32).max(1);
+            let target_h = (rows as u32 * 2).max(1);
+            let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+            Some(PreRenderedResult::HalfBlock {
+                cols,
+                rows,
+                resized,
+            })
+        }
+    }
+}
 
 fn downscale(img: DynamicImage, max_dim: u32) -> DynamicImage {
     let (w, h) = img.dimensions();

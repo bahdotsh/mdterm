@@ -57,10 +57,18 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
 
         render_frame(&mut stdout, &mut state)?;
 
-        // Poll for completed background fetches
-        let new_images = state.image_cache.poll_completed();
-        if new_images {
-            state.rebuild();
+        // Poll for completed background fetches (raw images)
+        let new_fetches = state.image_cache.poll_completed();
+
+        // Poll for completed pre-renders (resize/encode done in background)
+        let new_renders = state.image_cache.poll_pre_rendered();
+
+        // When new raw images arrive, adjust layout and queue pre-rendering
+        if new_fetches {
+            let cw = state.content_width();
+            let bg = crate::image::color_to_rgb(state.theme.bg);
+            state.image_cache.queue_all_pre_renders(cw, bg);
+            state.finalize_layout();
         }
 
         // Dispatch pending URLs as background fetches (concurrency cap is in ImageCache)
@@ -72,9 +80,8 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             }
         }
 
-        // If new images arrived, loop back to render them immediately.
-        // This comes after dispatch so pending URLs still get queued.
-        if new_images {
+        // If new images or pre-renders arrived, loop back to render immediately.
+        if new_fetches || new_renders {
             continue;
         }
 
@@ -414,73 +421,82 @@ impl ViewerState {
 
         // Queue any not-yet-fetched images; actual fetching happens in the
         // event loop so the first frame renders immediately.
-        {
-            self.pending_image_urls.clear();
-            let mut seen = std::collections::HashSet::new();
-            for line in &self.wrapped {
-                if let LineMeta::Image {
-                    ref url, row: 0, ..
-                } = line.meta
-                    && seen.insert(url.clone())
-                    && !self.image_cache.has_attempted(url)
-                {
-                    self.pending_image_urls.push_back(url.clone());
-                }
+        self.pending_image_urls.clear();
+        let mut seen = std::collections::HashSet::new();
+        for line in &self.wrapped {
+            if let LineMeta::Image {
+                ref url, row: 0, ..
+            } = line.meta
+                && seen.insert(url.clone())
+                && !self.image_cache.has_attempted(url)
+            {
+                self.pending_image_urls.push_back(url.clone());
             }
-            self.image_cache
-                .pre_render(cw, crate::image::color_to_rgb(self.theme.bg));
-
-            // Adjust image placeholder rows to match actual image aspect ratio.
-            // Track how many rows shift above the current scroll offset so we
-            // can compensate and keep the viewport visually stable.
-            let old_offset = self.offset;
-            let mut offset_delta: isize = 0;
-            let mut new_wrapped = Vec::with_capacity(self.wrapped.len());
-            let mut i = 0;
-            while i < self.wrapped.len() {
-                if let LineMeta::Image {
-                    ref url,
-                    row: 0,
-                    total_rows,
-                    ref alt,
-                } = self.wrapped[i].meta
-                {
-                    let url = url.clone();
-                    let alt = alt.clone();
-                    // Use ideal rows if image loaded, otherwise 3 placeholder rows
-                    let actual_rows = if self.image_cache.has_image(&url) {
-                        self.image_cache.ideal_rows(&url, cw).unwrap_or(total_rows)
-                    } else {
-                        3
-                    };
-
-                    // If this image block is entirely above the viewport,
-                    // adjust offset to compensate for the row count change.
-                    if i + total_rows <= old_offset {
-                        offset_delta += actual_rows as isize - total_rows as isize;
-                    }
-
-                    for r in 0..actual_rows {
-                        new_wrapped.push(Line {
-                            spans: vec![],
-                            meta: LineMeta::Image {
-                                url: url.clone(),
-                                alt: alt.clone(),
-                                row: r,
-                                total_rows: actual_rows,
-                            },
-                        });
-                    }
-                    // Skip the original placeholder rows
-                    i += total_rows;
-                } else {
-                    new_wrapped.push(self.wrapped[i].clone());
-                    i += 1;
-                }
-            }
-            self.wrapped = new_wrapped;
-            self.offset = (old_offset as isize + offset_delta).max(0) as usize;
         }
+
+        // Queue pre-rendering for loaded images (non-blocking background threads)
+        let bg = crate::image::color_to_rgb(self.theme.bg);
+        self.image_cache.queue_all_pre_renders(cw, bg);
+
+        self.finalize_layout();
+    }
+
+    /// Adjust image placeholder rows to match actual dimensions, then rebuild
+    /// TOC, links, slide boundaries, and search indices. Called after rebuild()
+    /// and whenever new image fetches complete (without re-parsing markdown).
+    fn finalize_layout(&mut self) {
+        let cw = self.content_width();
+
+        // Adjust image placeholder rows to match actual image aspect ratio.
+        // Track how many rows shift above the current scroll offset so we
+        // can compensate and keep the viewport visually stable.
+        let old_offset = self.offset;
+        let mut offset_delta: isize = 0;
+        let mut new_wrapped = Vec::with_capacity(self.wrapped.len());
+        let mut i = 0;
+        while i < self.wrapped.len() {
+            if let LineMeta::Image {
+                ref url,
+                row: 0,
+                total_rows,
+                ref alt,
+            } = self.wrapped[i].meta
+            {
+                let url = url.clone();
+                let alt = alt.clone();
+                // Use ideal rows if image loaded, otherwise 3 placeholder rows
+                let actual_rows = if self.image_cache.has_image(&url) {
+                    self.image_cache.ideal_rows(&url, cw).unwrap_or(total_rows)
+                } else {
+                    3
+                };
+
+                // If this image block is entirely above the viewport,
+                // adjust offset to compensate for the row count change.
+                if i + total_rows <= old_offset {
+                    offset_delta += actual_rows as isize - total_rows as isize;
+                }
+
+                for r in 0..actual_rows {
+                    new_wrapped.push(Line {
+                        spans: vec![],
+                        meta: LineMeta::Image {
+                            url: url.clone(),
+                            alt: alt.clone(),
+                            row: r,
+                            total_rows: actual_rows,
+                        },
+                    });
+                }
+                // Skip the original placeholder rows
+                i += total_rows;
+            } else {
+                new_wrapped.push(self.wrapped[i].clone());
+                i += 1;
+            }
+        }
+        self.wrapped = new_wrapped;
+        self.offset = (old_offset as isize + offset_delta).max(0) as usize;
 
         // Build TOC with pre-computed section ranges and content
         // (must be after image placeholder adjustment so line indices are final)
@@ -1791,7 +1807,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     row: image_row,
                     ..
                 } = line.meta
-                && state.image_cache.has_image(url)
+                && state.image_cache.is_ready_to_render(url)
             {
                 drew_inline_image = state.image_cache.render_image_row(
                     stdout,
@@ -1802,7 +1818,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                 )?;
             }
 
-            // Render placeholder for unloaded images
+            // Render placeholder for images not yet ready (loading or pre-rendering)
             if !drew_inline_image
                 && let LineMeta::Image {
                     ref url,
@@ -1810,7 +1826,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     row: image_row,
                     ..
                 } = line.meta
-                && !state.image_cache.has_image(url)
+                && !state.image_cache.is_ready_to_render(url)
             {
                 if image_row == 0 {
                     let label_text = if alt.is_empty() {
@@ -1946,7 +1962,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     row: image_row,
                     ..
                 } = line.meta
-                && state.image_cache.has_image(url)
+                && state.image_cache.is_ready_to_render(url)
             {
                 let first_image_row = image_row;
                 let first_screen_row = row;
