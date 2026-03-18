@@ -23,7 +23,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Heading jumps** — `[` / `]` to jump between sections
 - **Local file links** — Click or select relative markdown links to navigate between files, with `Backspace` to go back
 - **Link picker** — Press `f` to list all links, type a number to open in browser
-- **Clipboard** — `y` copies current section, `Y` copies full document, `c` copies a code block
+- **Click-to-copy** — Click any heading section, list, or code block to copy it; `Y` copies full document, `c` copies nearest code block
 - **Mermaid diagrams** — Visual rendering of flowcharts/graphs in the terminal with box-drawing characters
 - **Math rendering** — LaTeX to Unicode: `$\alpha + \beta$` renders as `α + β`
 - **Slide mode** — `--slides` treats `---` as slide separators for terminal presentations
@@ -99,7 +99,9 @@ mdterm README.md | less -R
 | `f` | Link picker (open URLs / follow local links) |
 | `t` | Toggle dark/light theme |
 | `l` | Toggle line numbers in code blocks |
-| `y` | Copy current section to clipboard |
+| Click heading | Copy heading section to clipboard |
+| Click list | Copy entire list to clipboard |
+| Click code block | Copy code block to clipboard |
 | `Y` | Copy entire document to clipboard |
 | `c` | Copy nearest code block to clipboard |
 | `Tab` / `Shift+Tab` | Switch between files |

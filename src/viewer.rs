@@ -48,10 +48,14 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         let max_offset = state.max_offset();
         state.offset = state.offset.min(max_offset);
 
-        render_frame(&mut stdout, &mut state)?;
+        // Expire toast before rendering so it doesn't show for an extra frame
+        if let Some((_, t)) = &state.toast
+            && t.elapsed() >= Duration::from_secs(1)
+        {
+            state.toast = None;
+        }
 
-        // Clear transient status after rendering so it shows for one frame
-        state.status_msg = None;
+        render_frame(&mut stdout, &mut state)?;
 
         // Poll for completed background fetches
         let new_images = state.image_cache.poll_completed();
@@ -74,7 +78,10 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             continue;
         }
 
-        let timeout = if state.image_cache.has_in_flight() {
+        let timeout = if let Some((_, t)) = &state.toast {
+            // Sleep only until the toast expires
+            Duration::from_secs(1).saturating_sub(t.elapsed())
+        } else if state.image_cache.has_in_flight() {
             // Check for completions frequently while fetches are in flight
             Duration::from_millis(50)
         } else if state.fast_scrolling {
@@ -253,8 +260,8 @@ struct ViewerState {
     // Follow mode
     last_mtime: Option<std::time::SystemTime>,
 
-    // Status message
-    status_msg: Option<String>,
+    // Toast overlay with expiry time
+    toast: Option<(String, std::time::Instant)>,
 
     // Image cache
     image_cache: crate::image::ImageCache,
@@ -268,8 +275,12 @@ struct ViewerState {
     // Whether mouse capture is currently enabled
     mouse_captured: bool,
 
-    // Whether the cursor is currently over a link (for pointer shape)
-    cursor_on_link: bool,
+    // Whether the cursor is currently over a clickable element (link or code block)
+    cursor_on_clickable: bool,
+
+    // Pre-computed list content keyed by list_id (built from pre-wrap lines
+    // so that word-wrapping doesn't introduce artificial line breaks).
+    list_contents: std::collections::HashMap<usize, String>,
 
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
@@ -278,8 +289,12 @@ struct ViewerState {
 #[derive(Clone)]
 struct TocEntry {
     line_idx: usize,
+    /// Wrapped-line index where this section ends (next same-or-higher-level heading, or EOF).
+    section_end: usize,
     level: u8,
     text: String,
+    /// Pre-extracted plain text content of this section (heading + body).
+    content: String,
 }
 
 #[derive(Clone)]
@@ -337,14 +352,19 @@ impl ViewerState {
             current_slide: 0,
             slide_boundaries: Vec::new(),
             last_mtime,
-            status_msg: None,
+            toast: None,
             image_cache: crate::image::ImageCache::new(),
             pending_image_urls: std::collections::VecDeque::new(),
             fast_scrolling: false,
             mouse_captured: true,
-            cursor_on_link: false,
+            cursor_on_clickable: false,
+            list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
         }
+    }
+
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), std::time::Instant::now()));
     }
 
     fn content_width(&self) -> usize {
@@ -375,37 +395,22 @@ impl ViewerState {
             self.line_numbers,
             &self.syntect_res,
         );
+        // Pre-compute list content from pre-wrap lines so that word-wrapping
+        // doesn't introduce artificial newlines within a single list item.
+        self.list_contents.clear();
+        for line in &lines {
+            if let LineMeta::ListItem { list_id } = line.meta {
+                let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+                let entry = self.list_contents.entry(list_id).or_default();
+                if !entry.is_empty() {
+                    entry.push('\n');
+                }
+                entry.push_str(&text);
+            }
+        }
+
         self.wrapped = wrap_lines(&lines, cw);
         self.doc_info = doc_info;
-
-        // Build TOC
-        self.toc_entries.clear();
-        for (i, line) in self.wrapped.iter().enumerate() {
-            if let LineMeta::Heading { level, ref text } = line.meta {
-                self.toc_entries.push(TocEntry {
-                    line_idx: i,
-                    level,
-                    text: text.clone(),
-                });
-            }
-        }
-
-        // Build link list
-        self.link_entries.clear();
-        let mut seen_urls = std::collections::HashSet::new();
-        for line in &self.wrapped {
-            for span in &line.spans {
-                if let Some(ref url) = span.style.link_url
-                    && seen_urls.insert(url.clone())
-                {
-                    let text = span.text.trim().to_string();
-                    self.link_entries.push(LinkEntry {
-                        url: url.clone(),
-                        text,
-                    });
-                }
-            }
-        }
 
         // Queue any not-yet-fetched images; actual fetching happens in the
         // event loop so the first frame renders immediately.
@@ -477,6 +482,63 @@ impl ViewerState {
             self.offset = (old_offset as isize + offset_delta).max(0) as usize;
         }
 
+        // Build TOC with pre-computed section ranges and content
+        // (must be after image placeholder adjustment so line indices are final)
+        self.toc_entries.clear();
+        for (i, line) in self.wrapped.iter().enumerate() {
+            if let LineMeta::Heading { level, ref text } = line.meta {
+                self.toc_entries.push(TocEntry {
+                    line_idx: i,
+                    section_end: 0,
+                    level,
+                    text: text.clone(),
+                    content: String::new(),
+                });
+            }
+        }
+        let total = self.wrapped.len();
+        for i in (0..self.toc_entries.len()).rev() {
+            let lvl = self.toc_entries[i].level;
+            let end = self.toc_entries[i + 1..]
+                .iter()
+                .find(|e| e.level <= lvl)
+                .map(|e| e.line_idx)
+                .unwrap_or(total);
+            self.toc_entries[i].section_end = end;
+        }
+        for i in 0..self.toc_entries.len() {
+            let s = self.toc_entries[i].line_idx;
+            let e = self.toc_entries[i].section_end;
+            let content = self.wrapped[s..e]
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|sp| sp.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.toc_entries[i].content = content;
+        }
+
+        // Build link list
+        self.link_entries.clear();
+        let mut seen_urls = std::collections::HashSet::new();
+        for line in &self.wrapped {
+            for span in &line.spans {
+                if let Some(ref url) = span.style.link_url
+                    && seen_urls.insert(url.clone())
+                {
+                    let text = span.text.trim().to_string();
+                    self.link_entries.push(LinkEntry {
+                        url: url.clone(),
+                        text,
+                    });
+                }
+            }
+        }
+
         // Build slide boundaries
         if self.slide_mode {
             self.slide_boundaries.clear();
@@ -512,7 +574,7 @@ impl ViewerState {
             {
                 self.content = new_content;
                 self.rebuild();
-                self.status_msg = Some("File reloaded".into());
+                self.set_toast("File reloaded");
             }
             self.last_mtime = Some(mtime);
         }
@@ -562,6 +624,45 @@ impl ViewerState {
         None
     }
 
+    /// Returns the TOC entry that owns the given wrapped-line index.
+    fn toc_entry_for_line(&self, line_idx: usize) -> Option<&TocEntry> {
+        self.toc_entries
+            .iter()
+            .rev()
+            .find(|e| e.line_idx <= line_idx && line_idx < e.section_end)
+    }
+
+    /// Returns the pre-computed plain text of the list with the given id.
+    fn list_text(&self, target_id: usize) -> String {
+        self.list_contents
+            .get(&target_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns the wrapped-line index for a given terminal row, if it maps to content.
+    fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
+        if term_row < 1 {
+            return None; // row 0 is the title bar
+        }
+        let idx = self.offset + (term_row - 1);
+        if idx < self.wrapped.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the line at `line_idx` has copyable metadata.
+    fn is_copyable_line(&self, line_idx: usize) -> bool {
+        self.wrapped.get(line_idx).is_some_and(|l| {
+            matches!(
+                l.meta,
+                LineMeta::CodeContent { .. } | LineMeta::Heading { .. } | LineMeta::ListItem { .. }
+            )
+        })
+    }
+
     /// Width of the left gutter ("│ ") in terminal columns.
     const GUTTER_COLS: usize = 2;
 
@@ -595,24 +696,10 @@ impl ViewerState {
         None
     }
 
-    fn visible_section_text(&self) -> String {
-        // Find current heading section
-        let headings = self.heading_lines();
-        let current_pos = self.offset;
-
-        let start = headings
-            .iter()
-            .rev()
-            .find(|&&h| h <= current_pos)
-            .copied()
-            .unwrap_or(0);
-        let end = headings
-            .iter()
-            .find(|&&h| h > current_pos)
-            .copied()
-            .unwrap_or(self.wrapped.len());
-
-        self.wrapped[start..end]
+    fn lines_to_text(&self, start: usize, end: usize) -> String {
+        let s = start.min(self.wrapped.len());
+        let e = end.min(self.wrapped.len());
+        self.wrapped[s..e]
             .iter()
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
@@ -620,11 +707,7 @@ impl ViewerState {
     }
 
     fn full_text(&self) -> String {
-        self.wrapped
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.lines_to_text(0, self.wrapped.len())
     }
 }
 
@@ -747,16 +830,54 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     .map(String::from)
                 {
                     dispatch_link(state, &url);
+                } else if let Some(line_idx) = state.line_idx_at_row(me.row as usize)
+                    && let Some(line) = state.wrapped.get(line_idx)
+                {
+                    match line.meta {
+                        LineMeta::CodeContent { block_id } => {
+                            if let Some(block) = state.doc_info.code_blocks.get(block_id)
+                                && copy_to_clipboard(&block.content).is_ok()
+                            {
+                                state.set_toast("Code block copied");
+                            }
+                        }
+                        LineMeta::Heading { .. } => {
+                            if let Some(entry) = state.toc_entry_for_line(line_idx) {
+                                let text = entry.content.clone();
+                                let label = if entry.text.chars().count() > 30 {
+                                    let truncated: String = entry.text.chars().take(27).collect();
+                                    format!("{}...", truncated)
+                                } else {
+                                    entry.text.clone()
+                                };
+                                if copy_to_clipboard(&text).is_ok() {
+                                    state.set_toast(format!("Copied: {}", label));
+                                }
+                            }
+                        }
+                        LineMeta::ListItem { list_id } => {
+                            let text = state.list_text(list_id);
+                            if copy_to_clipboard(&text).is_ok() {
+                                state.set_toast("List copied");
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             MouseEventKind::Moved if state.mode == ViewMode::Normal => {
                 let on_link = state
                     .link_at_position(me.row as usize, me.column as usize)
                     .is_some();
-                if on_link != state.cursor_on_link {
-                    state.cursor_on_link = on_link;
+                let on_copyable = !on_link
+                    && state
+                        .line_idx_at_row(me.row as usize)
+                        .is_some_and(|idx| state.is_copyable_line(idx));
+                let on_clickable = on_link || on_copyable;
+                if on_clickable != state.cursor_on_clickable {
+                    state.cursor_on_clickable = on_clickable;
                     let mut stdout = io::stdout();
-                    if on_link {
+                    if on_clickable {
                         // OSC 22: set mouse pointer to "pointer" (hand cursor)
                         let _ = queue!(stdout, Print("\x1b]22;pointer\x07"));
                     } else {
@@ -806,10 +927,10 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         KeyCode::Char('l') => {
             state.line_numbers = !state.line_numbers;
             state.rebuild();
-            state.status_msg = Some(if state.line_numbers {
-                "Line numbers ON".into()
+            state.set_toast(if state.line_numbers {
+                "Line numbers ON"
             } else {
-                "Line numbers OFF".into()
+                "Line numbers OFF"
             });
         }
 
@@ -819,16 +940,16 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if state.mouse_captured {
                 let _ = execute!(stdout, DisableMouseCapture);
                 state.mouse_captured = false;
-                if state.cursor_on_link {
+                if state.cursor_on_clickable {
                     let _ = queue!(stdout, Print("\x1b]22;default\x07"));
                     let _ = stdout.flush();
-                    state.cursor_on_link = false;
+                    state.cursor_on_clickable = false;
                 }
-                state.status_msg = Some("Mouse capture OFF — select text freely".into());
+                state.set_toast("Mouse capture OFF — select text freely");
             } else {
                 let _ = execute!(stdout, EnableMouseCapture);
                 state.mouse_captured = true;
-                state.status_msg = Some("Mouse capture ON — scroll with mouse".into());
+                state.set_toast("Mouse capture ON — scroll with mouse");
             }
         }
 
@@ -892,17 +1013,11 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             }
         }
 
-        // Copy section (y) or full document (Y)
-        KeyCode::Char('y') => {
-            let text = state.visible_section_text();
-            if copy_to_clipboard(&text).is_ok() {
-                state.status_msg = Some("Section copied".into());
-            }
-        }
+        // Copy full document
         KeyCode::Char('Y') => {
             let text = state.full_text();
             if copy_to_clipboard(&text).is_ok() {
-                state.status_msg = Some("Document copied".into());
+                state.set_toast("Document copied");
             }
         }
 
@@ -912,7 +1027,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                 && let Some(block) = state.doc_info.code_blocks.get(block_id)
                 && copy_to_clipboard(&block.content).is_ok()
             {
-                state.status_msg = Some("Code block copied".into());
+                state.set_toast("Code block copied");
             }
         }
 
@@ -951,7 +1066,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if let Some((file_idx, offset)) = state.nav_history.pop() {
                 state.switch_file(file_idx);
                 state.offset = offset.min(state.max_offset());
-                state.status_msg = Some("Back".into());
+                state.set_toast("Back");
             }
         }
 
@@ -1127,8 +1242,8 @@ fn heading_to_slug(text: &str) -> String {
 fn dispatch_link(state: &mut ViewerState, url: &str) {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         match open::that(url) {
-            Ok(_) => state.status_msg = Some(format!("Opened: {}", url)),
-            Err(e) => state.status_msg = Some(format!("Failed to open: {}", e)),
+            Ok(_) => state.set_toast(format!("Opened: {}", url)),
+            Err(e) => state.set_toast(format!("Failed to open: {}", e)),
         }
     } else if let Some(anchor) = url.strip_prefix('#') {
         navigate_to_anchor(state, anchor);
@@ -1155,10 +1270,10 @@ fn dispatch_link(state: &mut ViewerState, url: &str) {
                 navigate_to_anchor(state, &anchor);
             }
         } else {
-            state.status_msg = Some(format!("Failed to open: {}", url));
+            state.set_toast(format!("Failed to open: {}", url));
         }
     } else {
-        state.status_msg = Some(format!("Blocked: unsupported URL scheme in '{}'", url));
+        state.set_toast(format!("Blocked: unsupported URL scheme in '{}'", url));
     }
 }
 
@@ -1172,9 +1287,9 @@ fn navigate_to_anchor(state: &mut ViewerState, anchor: &str) {
         let target = entry.line_idx;
         let max = state.max_offset();
         state.offset = target.min(max);
-        state.status_msg = Some(format!("Jumped to: #{}", anchor));
+        state.set_toast(format!("Jumped to: #{}", anchor));
     } else {
-        state.status_msg = Some(format!("Heading not found: #{}", anchor));
+        state.set_toast(format!("Heading not found: #{}", anchor));
     }
 }
 
@@ -1209,8 +1324,8 @@ fn resolve_local_link(state: &ViewerState, url: &str) -> Option<(String, Option<
 
 /// Reset the cursor shape to default if it was changed for a link hover.
 fn reset_cursor_shape(state: &mut ViewerState) {
-    if state.cursor_on_link {
-        state.cursor_on_link = false;
+    if state.cursor_on_clickable {
+        state.cursor_on_clickable = false;
         let mut stdout = io::stdout();
         let _ = queue!(stdout, Print("\x1b]22;default\x07"));
         let _ = stdout.flush();
@@ -1751,14 +1866,14 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
-                    let common_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                    let fill_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
                         if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
                             Some(bg)
                         } else {
                             None
                         }
                     });
-                    if let Some(bg) = common_bg {
+                    if let Some(bg) = fill_bg {
                         queue!(
                             stdout,
                             SetBackgroundColor(bg),
@@ -1888,6 +2003,11 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         _ => {}
     }
 
+    // Toast overlay (renders on top of everything, including other overlays)
+    if state.toast.is_some() {
+        render_toast_overlay(stdout, state)?;
+    }
+
     queue!(stdout, EndSynchronizedUpdate)?;
     stdout.flush()
 }
@@ -1945,26 +2065,6 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             Print("╰─"),
             SetForegroundColor(theme.search_prompt),
             Print(&search_label),
-            SetForegroundColor(theme.border),
-            Print("─".repeat(fill)),
-            Print("╯"),
-            SetAttribute(Attribute::Reset),
-        )?;
-        return Ok(());
-    }
-
-    if let Some(ref msg) = state.status_msg {
-        let msg_label = format!(" {} ", msg);
-        let msg_len = msg_label.chars().count();
-        let fill = width.saturating_sub(3 + msg_len);
-        queue!(
-            stdout,
-            MoveTo(0, (viewport + 1) as u16),
-            SetBackgroundColor(theme.bg),
-            SetForegroundColor(theme.border),
-            Print("╰─"),
-            SetForegroundColor(theme.search_prompt),
-            Print(&msg_label),
             SetForegroundColor(theme.border),
             Print("─".repeat(fill)),
             Print("╯"),
@@ -2073,6 +2173,66 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
 }
 
 // ── Overlay rendering ───────────────────────────────────────────────────────
+
+fn render_toast_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
+    let Some((msg, _)) = state.toast.as_ref() else {
+        return Ok(());
+    };
+    let theme = &state.theme;
+    let width = state.cols as usize;
+    let viewport = state.viewport();
+
+    // Toast needs 3 rows; skip if viewport is too small
+    if viewport < 5 {
+        return Ok(());
+    }
+
+    let label = format!(" \u{2713} {} ", msg); // ✓ prefix
+    let label_len = label.chars().count();
+    let box_w = label_len + 2; // │ + content + │
+    let x_off = width.saturating_sub(box_w) / 2;
+    let y_off = ((viewport / 2) + 1).min(viewport.saturating_sub(3) + 1);
+
+    let inner = box_w.saturating_sub(2);
+
+    // Top border
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, y_off as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("╭"),
+        Print("─".repeat(inner)),
+        Print("╮"),
+    )?;
+
+    // Content row
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, (y_off + 1) as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("│"),
+        SetForegroundColor(theme.overlay_text),
+        Print(&label),
+        SetForegroundColor(theme.overlay_border),
+        Print("│"),
+    )?;
+
+    // Bottom border
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, (y_off + 2) as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("╰"),
+        Print("─".repeat(inner)),
+        Print("╯"),
+        SetAttribute(Attribute::Reset),
+    )?;
+
+    Ok(())
+}
 
 fn render_toc_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
     let theme = &state.theme;
@@ -2583,7 +2743,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
         HelpSection {
             title: "Actions",
             entries: &[
-                ("y", "Copy current section to clipboard"),
+                ("click", "Copy heading section, list, or code block"),
                 ("Y", "Copy full document to clipboard"),
                 ("c", "Copy nearest code block"),
                 ("t", "Toggle dark / light theme"),
