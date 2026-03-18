@@ -21,6 +21,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Table of contents** — Press `o` to browse and jump to any heading
 - **Fuzzy heading search** — Press `:` to filter headings by name
 - **Heading jumps** — `[` / `]` to jump between sections
+- **Local file links** — Click or select relative markdown links to navigate between files, with `Backspace` to go back
 - **Link picker** — Press `f` to list all links, type a number to open in browser
 - **Clipboard** — `y` copies current section, `Y` copies full document, `c` copies a code block
 - **Mermaid diagrams** — Visual rendering of flowcharts/graphs in the terminal with box-drawing characters
@@ -77,6 +78,7 @@ mdterm README.md | less -R
 | `g` / `Home` | Jump to top |
 | `G` / `End` | Jump to bottom |
 | `[` / `]` | Previous / next heading |
+| `Backspace` | Go back (after following a local file link) |
 | Mouse scroll | Scroll up/down |
 
 ### Search
@@ -94,7 +96,7 @@ mdterm README.md | less -R
 |-----|--------|
 | `o` | Table of contents overlay |
 | `:` | Fuzzy heading search |
-| `f` | Link picker (open in browser) |
+| `f` | Link picker (open URLs / follow local links) |
 | `t` | Toggle dark/light theme |
 | `l` | Toggle line numbers in code blocks |
 | `y` | Copy current section to clipboard |
