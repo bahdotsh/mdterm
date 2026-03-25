@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 pulldown-cmark = "0.11"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
