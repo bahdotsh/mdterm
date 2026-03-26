@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::{
@@ -29,7 +30,6 @@ pub struct ViewerOptions {
     pub filename: String,
     pub theme: Theme,
     pub slide_mode: bool,
-    pub follow_mode: bool,
     pub line_numbers: bool,
     pub width_override: Option<usize>,
 }
@@ -85,6 +85,11 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             continue;
         }
 
+        // Check for file change notifications (inotify/FSEvents/kqueue)
+        if state.poll_file_changes() {
+            continue;
+        }
+
         let timeout = if let Some((_, t)) = &state.toast {
             // Sleep only until the toast expires
             Duration::from_secs(1).saturating_sub(t.elapsed())
@@ -93,7 +98,8 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             Duration::from_millis(50)
         } else if state.fast_scrolling {
             Duration::from_millis(50)
-        } else if state.follow_mode {
+        } else if state.file_watcher.is_some() {
+            // Wake periodically to check the notify channel
             Duration::from_millis(500)
         } else {
             Duration::from_secs(3600)
@@ -120,8 +126,9 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         } else {
             // No events pending — clear fast_scrolling so images render
             state.fast_scrolling = false;
-            if state.follow_mode {
-                state.check_file_changed();
+            // Check for file changes on timeout
+            if state.poll_file_changes() {
+                continue;
             }
         }
     }
@@ -233,7 +240,6 @@ struct ViewerState {
 
     // Options
     slide_mode: bool,
-    follow_mode: bool,
     line_numbers: bool,
     width_override: Option<usize>,
 
@@ -264,8 +270,10 @@ struct ViewerState {
     current_slide: usize,
     slide_boundaries: Vec<usize>, // wrapped line indices
 
-    // Follow mode
-    last_mtime: Option<std::time::SystemTime>,
+    // File change notifications (inotify/FSEvents/kqueue)
+    file_watcher: Option<notify::RecommendedWatcher>,
+    file_change_rx: mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    file_change_tx: mpsc::Sender<Result<notify::Event, notify::Error>>,
 
     // Toast overlay with expiry time
     toast: Option<(String, std::time::Instant)>,
@@ -313,16 +321,14 @@ struct LinkEntry {
 
 impl ViewerState {
     fn new(opts: ViewerOptions, cols: u16, rows: u16) -> Self {
-        let last_mtime = if opts.follow_mode && !opts.files.is_empty() {
-            std::fs::metadata(
-                &opts.files[opts
-                    .files
-                    .iter()
-                    .position(|f| *f == opts.filename)
-                    .unwrap_or(0)],
-            )
-            .and_then(|m| m.modified())
-            .ok()
+        let (file_change_tx, file_change_rx) = mpsc::channel();
+        let file_watcher = if !opts.files.is_empty() {
+            let idx = opts
+                .files
+                .iter()
+                .position(|f| *f == opts.filename)
+                .unwrap_or(0);
+            setup_file_watcher(&opts.files[idx], &file_change_tx)
         } else {
             None
         };
@@ -342,7 +348,6 @@ impl ViewerState {
             rows,
             syntect_res: SyntectRes::load(),
             slide_mode: opts.slide_mode,
-            follow_mode: opts.follow_mode,
             line_numbers: opts.line_numbers,
             width_override: opts.width_override,
             mode: ViewMode::Normal,
@@ -358,7 +363,9 @@ impl ViewerState {
             fuzzy_scroll: 0,
             current_slide: 0,
             slide_boundaries: Vec::new(),
-            last_mtime,
+            file_watcher,
+            file_change_rx,
+            file_change_tx,
             toast: None,
             image_cache: crate::image::ImageCache::new(),
             pending_image_urls: std::collections::VecDeque::new(),
@@ -588,24 +595,42 @@ impl ViewerState {
         self.offset = self.offset.min(max);
     }
 
-    fn check_file_changed(&mut self) {
+    /// Drain the notify channel and reload the file if it changed on disk.
+    /// Returns true if a reload happened.
+    fn poll_file_changes(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.file_change_rx.try_recv() {
+            if let Ok(event) = event
+                && (event.kind.is_modify() || event.kind.is_create())
+            {
+                changed = true;
+            }
+        }
+        if !changed || self.files.is_empty() {
+            return false;
+        }
+        let path = &self.files[self.current_file_idx];
+        if let Ok(new_content) = std::fs::read_to_string(path)
+            && new_content != self.content
+        {
+            self.content = new_content;
+            self.rebuild();
+            self.set_toast("File reloaded");
+            return true;
+        }
+        false
+    }
+
+    /// Set up the file watcher for the current file.
+    fn watch_current_file(&mut self) {
         if self.files.is_empty() {
+            self.file_watcher = None;
             return;
         }
         let path = &self.files[self.current_file_idx];
-        if let Ok(meta) = std::fs::metadata(path)
-            && let Ok(mtime) = meta.modified()
-        {
-            if self.last_mtime.is_some()
-                && Some(mtime) != self.last_mtime
-                && let Ok(new_content) = std::fs::read_to_string(path)
-            {
-                self.content = new_content;
-                self.rebuild();
-                self.set_toast("File reloaded");
-            }
-            self.last_mtime = Some(mtime);
-        }
+        self.file_watcher = setup_file_watcher(path, &self.file_change_tx);
+        // Drain any stale events from the previous watch
+        while self.file_change_rx.try_recv().is_ok() {}
     }
 
     fn switch_file(&mut self, idx: usize) -> bool {
@@ -624,9 +649,7 @@ impl ViewerState {
             self.search.clear();
             self.current_slide = 0;
             self.rebuild();
-            if self.follow_mode {
-                self.last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            }
+            self.watch_current_file();
             true
         } else {
             false
@@ -1640,6 +1663,27 @@ fn scroll_to_match(search: &SearchState, offset: &mut usize, viewport: usize, ma
     {
         *offset = target.saturating_sub(viewport / 3).min(max_offset);
     }
+}
+
+// ── File watcher ────────────────────────────────────────────────────────────
+
+fn setup_file_watcher(
+    path: &str,
+    tx: &mpsc::Sender<Result<notify::Event, notify::Error>>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+    let tx = tx.clone();
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        notify::Config::default(),
+    )
+    .ok()?;
+    watcher
+        .watch(std::path::Path::new(path), RecursiveMode::NonRecursive)
+        .ok()?;
+    Some(watcher)
 }
 
 // ── Clipboard ───────────────────────────────────────────────────────────────
@@ -3286,7 +3330,6 @@ mod tests {
             filename: String::new(),
             theme: crate::theme::Theme::dark(),
             slide_mode: false,
-            follow_mode: false,
             line_numbers: false,
             width_override: None,
         };

@@ -34,10 +34,6 @@ struct Cli {
     #[arg(long, short = 's')]
     slides: bool,
 
-    /// Watch file for changes and auto-reload
-    #[arg(long, short = 'f')]
-    follow: bool,
-
     /// Show line numbers in code blocks
     #[arg(long, short = 'l')]
     line_numbers: bool,
@@ -126,7 +122,6 @@ fn main() {
             filename,
             theme: initial_theme,
             slide_mode: cli.slides,
-            follow_mode: cli.follow,
             line_numbers,
             width_override: if width > 0 { Some(width) } else { None },
         };
