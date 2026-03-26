@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, short = 's')]
     slides: bool,
 
+    /// Deprecated: file watching is now always active
+    #[arg(long, short = 'f', hide = true)]
+    follow: bool,
+
     /// Show line numbers in code blocks
     #[arg(long, short = 'l')]
     line_numbers: bool,

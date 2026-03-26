@@ -604,16 +604,15 @@ impl ViewerState {
             if let Ok(event) = event {
                 if event.kind.is_modify() || event.kind.is_create() {
                     changed = true;
-                } else if event.kind.is_remove() || matches!(event.kind, notify::EventKind::Any) {
+                } else if event.kind.is_remove() {
                     // Atomic saves (write tmp + rename) produce remove/rename
                     // events that kill the inotify watch on the old inode.
                     need_rewatch = true;
                     changed = true;
+                } else if matches!(event.kind, notify::EventKind::Any) {
+                    changed = true;
                 }
             }
-        }
-        if need_rewatch {
-            self.watch_current_file();
         }
         if !changed || self.files.is_empty() {
             return false;
@@ -625,12 +624,13 @@ impl ViewerState {
             self.content = new_content;
             self.rebuild();
             self.set_toast("File reloaded");
-            // Re-establish the watch: editors that do atomic saves
-            // (write tmp + rename) replace the inode, killing the old watch.
-            self.watch_current_file();
-            return true;
         }
-        false
+        // Re-establish the watch after atomic saves (inode was replaced).
+        // Done regardless of reload success so future changes are still detected.
+        if need_rewatch {
+            self.watch_current_file();
+        }
+        changed
     }
 
     /// Set up the file watcher for the current file.
