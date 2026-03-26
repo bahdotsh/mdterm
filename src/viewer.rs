@@ -599,12 +599,21 @@ impl ViewerState {
     /// Returns true if a reload happened.
     fn poll_file_changes(&mut self) -> bool {
         let mut changed = false;
+        let mut need_rewatch = false;
         while let Ok(event) = self.file_change_rx.try_recv() {
-            if let Ok(event) = event
-                && (event.kind.is_modify() || event.kind.is_create())
-            {
-                changed = true;
+            if let Ok(event) = event {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    changed = true;
+                } else if event.kind.is_remove() || matches!(event.kind, notify::EventKind::Any) {
+                    // Atomic saves (write tmp + rename) produce remove/rename
+                    // events that kill the inotify watch on the old inode.
+                    need_rewatch = true;
+                    changed = true;
+                }
             }
+        }
+        if need_rewatch {
+            self.watch_current_file();
         }
         if !changed || self.files.is_empty() {
             return false;
@@ -616,6 +625,9 @@ impl ViewerState {
             self.content = new_content;
             self.rebuild();
             self.set_toast("File reloaded");
+            // Re-establish the watch: editors that do atomic saves
+            // (write tmp + rename) replace the inode, killing the old watch.
+            self.watch_current_file();
             return true;
         }
         false
