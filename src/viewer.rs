@@ -99,8 +99,9 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
         } else if state.fast_scrolling {
             Duration::from_millis(50)
         } else if state.file_watcher.is_some() {
-            // Wake periodically to check the notify channel
-            Duration::from_millis(500)
+            // crossterm::event::poll only watches the terminal fd, not our
+            // notify mpsc channel, so we need periodic wakeups to drain it.
+            Duration::from_millis(200)
         } else {
             Duration::from_secs(3600)
         };
@@ -596,7 +597,7 @@ impl ViewerState {
     }
 
     /// Drain the notify channel and reload the file if it changed on disk.
-    /// Returns true if a reload happened.
+    /// Returns true if the content was reloaded or the watcher was re-established.
     fn poll_file_changes(&mut self) -> bool {
         let mut changed = false;
         let mut need_rewatch = false;
@@ -617,6 +618,7 @@ impl ViewerState {
         if !changed || self.files.is_empty() {
             return false;
         }
+        let mut reloaded = false;
         let path = &self.files[self.current_file_idx];
         if let Ok(new_content) = std::fs::read_to_string(path)
             && new_content != self.content
@@ -624,13 +626,14 @@ impl ViewerState {
             self.content = new_content;
             self.rebuild();
             self.set_toast("File reloaded");
+            reloaded = true;
         }
         // Re-establish the watch after atomic saves (inode was replaced).
         // Done regardless of reload success so future changes are still detected.
         if need_rewatch {
             self.watch_current_file();
         }
-        changed
+        reloaded || need_rewatch
     }
 
     /// Set up the file watcher for the current file.

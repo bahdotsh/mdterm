@@ -24,4 +24,4 @@ libc = "0.2"
 base64 = "0.22"
 ureq = "3"
 unicode-width = "0.2"
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+notify = "7"
