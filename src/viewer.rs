@@ -433,6 +433,13 @@ impl ViewerState {
     }
 
     fn rebuild(&mut self) {
+        // Save the scroll position before re-rendering.  finalize_layout()
+        // adjusts the offset for image-row expansion, but when called from
+        // rebuild() the offset was already correct for the previous layout's
+        // expanded images — the delta would be double-counted.  Restoring
+        // and clamping preserves the user's scroll position.
+        let saved_offset = self.offset;
+
         let cw = self.content_width();
         let (lines, doc_info) = crate::markdown::render_with(
             &self.content,
@@ -483,6 +490,7 @@ impl ViewerState {
         self.image_cache.queue_all_pre_renders(cw, bg);
 
         self.finalize_layout();
+        self.offset = saved_offset.min(self.max_offset());
         self.dirty = true;
     }
 
