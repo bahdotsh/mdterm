@@ -159,13 +159,13 @@ graph TD
 - [x] Link picker (`f` key)
 - [x] Copy to clipboard (`y` / `Y` / `c`)
 - [x] Multiple files (`Tab` / `Shift+Tab`)
-- [ ] CLI flags (`--help`, `--version`, etc.)
+- [x] CLI flags (`--help`, `--version`, etc.)
 - [x] Config file (`~/.config/mdterm/config.toml`)
 - [x] Line numbers (`l` key or `--line-numbers`)
 - [x] Code block copy (`c` key)
 - [x] Regex search (`/` with patterns)
 - [x] Scrollbar
-- [x] Mermaid/diagram detection
+- [ ] Mermaid/diagram detection
 - [x] Slide mode (`--slides`)
 - [x] HTML export (`--export html`)
 - [x] Fuzzy heading search (`:` key)
@@ -177,9 +177,9 @@ graph TD
 - [x] Buy groceries
 - [x] Write documentation
 - [x] Fix login bug
-- [x] Review pull request
+- [ ] Review pull request
 - [x] Set up CI/CD pipeline
-- [ ] Update dependencies
+- [x] Update dependencies
 - [ ] Schedule team meeting
 - [x] Deploy to staging
 
