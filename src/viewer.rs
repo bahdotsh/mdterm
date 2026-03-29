@@ -45,17 +45,25 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
     state.rebuild();
 
     loop {
+        let old_offset = state.offset;
         let max_offset = state.max_offset();
         state.offset = state.offset.min(max_offset);
+        if state.offset != old_offset {
+            state.dirty = true;
+        }
 
         // Expire toast before rendering so it doesn't show for an extra frame
         if let Some((_, t)) = &state.toast
             && t.elapsed() >= Duration::from_secs(1)
         {
             state.toast = None;
+            state.dirty = true;
         }
 
-        render_frame(&mut stdout, &mut state)?;
+        if state.dirty {
+            render_frame(&mut stdout, &mut state)?;
+            state.dirty = false;
+        }
 
         // Poll for completed background fetches (raw images)
         let new_fetches = state.image_cache.poll_completed();
@@ -69,6 +77,7 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             let bg = crate::image::color_to_rgb(state.theme.bg);
             state.image_cache.queue_all_pre_renders(cw, bg);
             state.finalize_layout();
+            state.dirty = true;
         }
 
         // Dispatch pending URLs as background fetches (concurrency cap is in ImageCache)
@@ -82,11 +91,15 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
 
         // If new images or pre-renders arrived, loop back to render immediately.
         if new_fetches || new_renders {
+            if new_renders {
+                state.dirty = true;
+            }
             continue;
         }
 
         // Check for file change notifications (inotify/FSEvents/kqueue)
         if state.poll_file_changes() {
+            state.dirty = true;
             continue;
         }
 
@@ -126,9 +139,13 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             }
         } else {
             // No events pending — clear fast_scrolling so images render
-            state.fast_scrolling = false;
+            if state.fast_scrolling {
+                state.fast_scrolling = false;
+                state.dirty = true;
+            }
             // Check for file changes on timeout
             if state.poll_file_changes() {
+                state.dirty = true;
                 continue;
             }
         }
@@ -209,7 +226,7 @@ impl Drop for TerminalGuard {
 
 // ── View modes ──────────────────────────────────────────────────────────────
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone)]
 enum ViewMode {
     Normal,
     Search,
@@ -288,6 +305,9 @@ struct ViewerState {
 
     // Scroll performance: skip expensive image rendering during rapid scroll
     fast_scrolling: bool,
+
+    // Whether the display needs to be redrawn
+    dirty: bool,
 
     // Whether mouse capture is currently enabled
     mouse_captured: bool,
@@ -373,6 +393,7 @@ impl ViewerState {
             image_cache: crate::image::ImageCache::new(),
             pending_image_urls: std::collections::VecDeque::new(),
             fast_scrolling: false,
+            dirty: true,
             mouse_captured: true,
             cursor_on_clickable: false,
             list_contents: std::collections::HashMap::new(),
@@ -382,6 +403,7 @@ impl ViewerState {
 
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), std::time::Instant::now()));
+        self.dirty = true;
     }
 
     fn content_width(&self) -> usize {
@@ -456,6 +478,7 @@ impl ViewerState {
         self.image_cache.queue_all_pre_renders(cw, bg);
 
         self.finalize_layout();
+        self.dirty = true;
     }
 
     /// Adjust image placeholder rows to match actual dimensions, then rebuild
@@ -812,9 +835,12 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     state.help_scroll = 0;
                     state.mode = ViewMode::Help;
                 }
+                state.dirty = true;
                 return false;
             }
             if state.mode == ViewMode::Help {
+                let prev_scroll = state.help_scroll;
+                let prev_mode = state.mode;
                 match ke.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
                         state.mode = ViewMode::Normal;
@@ -853,62 +879,131 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     }
                     _ => {}
                 }
+                if state.help_scroll != prev_scroll || state.mode != prev_mode {
+                    state.dirty = true;
+                }
                 return false;
             }
             match state.mode {
-                ViewMode::Normal => return handle_normal(state, ke.code, ke.modifiers),
-                ViewMode::Search => handle_search(state, ke.code),
-                ViewMode::Toc => handle_toc(state, ke.code),
-                ViewMode::LinkPicker => handle_link_picker(state, ke.code),
-                ViewMode::FuzzyHeading => handle_fuzzy(state, ke.code, ke.modifiers),
+                ViewMode::Normal => {
+                    state.dirty = true;
+                    return handle_normal(state, ke.code, ke.modifiers);
+                }
+                ViewMode::Search => {
+                    state.dirty = true;
+                    handle_search(state, ke.code);
+                }
+                ViewMode::Toc => {
+                    let prev = (state.toc_selected, state.toc_scroll, state.mode);
+                    handle_toc(state, ke.code);
+                    if (state.toc_selected, state.toc_scroll, state.mode) != prev {
+                        state.dirty = true;
+                    }
+                }
+                ViewMode::LinkPicker => {
+                    let prev = (state.link_selected, state.link_scroll, state.mode);
+                    handle_link_picker(state, ke.code);
+                    if (state.link_selected, state.link_scroll, state.mode) != prev {
+                        state.dirty = true;
+                    }
+                }
+                ViewMode::FuzzyHeading => {
+                    let prev = (
+                        state.fuzzy_selected,
+                        state.fuzzy_scroll,
+                        state.fuzzy_input.clone(),
+                        state.mode,
+                    );
+                    handle_fuzzy(state, ke.code, ke.modifiers);
+                    if (
+                        state.fuzzy_selected,
+                        state.fuzzy_scroll,
+                        state.fuzzy_input.clone(),
+                        state.mode,
+                    ) != prev
+                    {
+                        state.dirty = true;
+                    }
+                }
                 ViewMode::Help => {}
             }
         }
         Event::Mouse(me) => match me.kind {
-            MouseEventKind::ScrollDown => match state.mode {
-                ViewMode::Help => {
-                    let total = help_total_rows();
-                    let (_, _, _, _, visible) =
-                        help_box_dimensions(state.cols as usize, state.viewport());
-                    if state.help_scroll + visible < total {
-                        state.help_scroll =
-                            (state.help_scroll + 3).min(total.saturating_sub(visible));
+            MouseEventKind::ScrollDown => {
+                let prev_offset = state.offset;
+                let prev_slide = state.current_slide;
+                let prev_help = state.help_scroll;
+                let prev_toc = (state.toc_selected, state.toc_scroll);
+                let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
+                match state.mode {
+                    ViewMode::Help => {
+                        let total = help_total_rows();
+                        let (_, _, _, _, visible) =
+                            help_box_dimensions(state.cols as usize, state.viewport());
+                        if state.help_scroll + visible < total {
+                            state.help_scroll =
+                                (state.help_scroll + 3).min(total.saturating_sub(visible));
+                        }
+                    }
+                    ViewMode::Toc => {
+                        handle_toc(state, KeyCode::Down);
+                    }
+                    ViewMode::FuzzyHeading => {
+                        handle_fuzzy(state, KeyCode::Down, KeyModifiers::empty());
+                    }
+                    _ if state.slide_mode => {
+                        if state.current_slide + 1 < state.slide_boundaries.len() {
+                            state.current_slide += 1;
+                        }
+                    }
+                    _ => {
+                        let max = state.max_offset();
+                        state.offset = (state.offset + 3).min(max);
                     }
                 }
-                ViewMode::Toc => {
-                    handle_toc(state, KeyCode::Down);
+                if state.offset != prev_offset
+                    || state.current_slide != prev_slide
+                    || state.help_scroll != prev_help
+                    || (state.toc_selected, state.toc_scroll) != prev_toc
+                    || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                {
+                    state.dirty = true;
                 }
-                ViewMode::FuzzyHeading => {
-                    handle_fuzzy(state, KeyCode::Down, KeyModifiers::empty());
-                }
-                _ if state.slide_mode => {
-                    if state.current_slide + 1 < state.slide_boundaries.len() {
-                        state.current_slide += 1;
+            }
+            MouseEventKind::ScrollUp => {
+                let prev_offset = state.offset;
+                let prev_slide = state.current_slide;
+                let prev_help = state.help_scroll;
+                let prev_toc = (state.toc_selected, state.toc_scroll);
+                let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
+                match state.mode {
+                    ViewMode::Help => {
+                        state.help_scroll = state.help_scroll.saturating_sub(3);
+                    }
+                    ViewMode::Toc => {
+                        handle_toc(state, KeyCode::Up);
+                    }
+                    ViewMode::FuzzyHeading => {
+                        handle_fuzzy(state, KeyCode::Up, KeyModifiers::empty());
+                    }
+                    _ if state.slide_mode => {
+                        state.current_slide = state.current_slide.saturating_sub(1);
+                    }
+                    _ => {
+                        state.offset = state.offset.saturating_sub(3);
                     }
                 }
-                _ => {
-                    let max = state.max_offset();
-                    state.offset = (state.offset + 3).min(max);
+                if state.offset != prev_offset
+                    || state.current_slide != prev_slide
+                    || state.help_scroll != prev_help
+                    || (state.toc_selected, state.toc_scroll) != prev_toc
+                    || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                {
+                    state.dirty = true;
                 }
-            },
-            MouseEventKind::ScrollUp => match state.mode {
-                ViewMode::Help => {
-                    state.help_scroll = state.help_scroll.saturating_sub(3);
-                }
-                ViewMode::Toc => {
-                    handle_toc(state, KeyCode::Up);
-                }
-                ViewMode::FuzzyHeading => {
-                    handle_fuzzy(state, KeyCode::Up, KeyModifiers::empty());
-                }
-                _ if state.slide_mode => {
-                    state.current_slide = state.current_slide.saturating_sub(1);
-                }
-                _ => {
-                    state.offset = state.offset.saturating_sub(3);
-                }
-            },
+            }
             MouseEventKind::Down(MouseButton::Left) if state.mode == ViewMode::Normal => {
+                state.dirty = true;
                 if let Some(url) = state
                     .link_at_position(me.row as usize, me.column as usize)
                     .map(String::from)
@@ -1822,9 +1917,9 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
     // Clear stale Kitty image placements before redrawing, then upload any
     // pending images (transmitted once, placed cheaply per-frame).
-    // Skip image rendering entirely when an overlay (Help) is visible so
+    // Skip image rendering entirely when an overlay is visible so
     // images don't bleed through the overlay.
-    let suppress_images = state.mode == ViewMode::Help;
+    let suppress_images = !matches!(state.mode, ViewMode::Normal | ViewMode::Search);
     if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
         crate::image::kitty_delete_all(stdout)?;
         state.image_cache.transmit_pending_kitty(stdout)?;
