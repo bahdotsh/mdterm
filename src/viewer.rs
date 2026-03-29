@@ -1783,21 +1783,14 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     }
 
     // Determine which lines to show
-    let (_display_lines, _display_offset) = if state.slide_mode {
-        let start = state
-            .slide_boundaries
-            .get(state.current_slide)
-            .copied()
-            .unwrap_or(0);
-        let end = state
+    let slide_end = if state.slide_mode {
+        state
             .slide_boundaries
             .get(state.current_slide + 1)
             .copied()
-            .unwrap_or(state.wrapped.len());
-        let slice = &state.wrapped[start..end.min(state.wrapped.len())];
-        (slice, start)
+            .unwrap_or(state.wrapped.len())
     } else {
-        (state.wrapped.as_slice(), state.offset)
+        usize::MAX
     };
 
     // Scrollbar
@@ -1869,7 +1862,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         )?;
 
         let mut drew_inline_image = false;
-        if let Some(line) = state.wrapped.get(line_idx) {
+        if let Some(line) = state.wrapped.get(line_idx).filter(|_| line_idx < slide_end) {
             // Render image pixels inline (Kitty / iTerm2).
             // Suppressed when an overlay is active to prevent images bleeding through.
             if !suppress_images
@@ -2027,7 +2020,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                 state.offset + row
             };
 
-            if let Some(line) = state.wrapped.get(line_idx)
+            if let Some(line) = state.wrapped.get(line_idx).filter(|_| line_idx < slide_end)
                 && let LineMeta::Image {
                     ref url,
                     row: image_row,
@@ -2050,7 +2043,8 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     } else {
                         state.offset + first_screen_row + count
                     };
-                    if let Some(next) = state.wrapped.get(next_idx) {
+                    if let Some(next) = state.wrapped.get(next_idx).filter(|_| next_idx < slide_end)
+                    {
                         if let LineMeta::Image { url: ref u2, .. } = next.meta
                             && *u2 == url
                         {
