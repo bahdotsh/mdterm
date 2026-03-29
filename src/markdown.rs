@@ -39,6 +39,10 @@ struct Renderer<'a> {
     item_has_nested_list: bool,
     list_id: usize,
 
+    // Task list state
+    current_task_checked: Option<bool>,
+    task_index: usize,
+
     // Table state
     in_table: bool,
     table_alignments: Vec<Alignment>,
@@ -98,6 +102,8 @@ impl<'a> Renderer<'a> {
             list_stack: Vec::new(),
             item_has_nested_list: false,
             list_id: 0,
+            current_task_checked: None,
+            task_index: 0,
             in_table: false,
             table_alignments: Vec::new(),
             table_head: Vec::new(),
@@ -881,9 +887,20 @@ impl<'a> Renderer<'a> {
                 );
             }
             Event::End(TagEnd::Item) => {
-                self.flush_line_with_meta(LineMeta::ListItem {
-                    list_id: self.list_id,
-                });
+                let meta = if let Some(checked) = self.current_task_checked.take() {
+                    let idx = self.task_index;
+                    self.task_index += 1;
+                    LineMeta::TaskItem {
+                        list_id: self.list_id,
+                        checked,
+                        task_index: idx,
+                    }
+                } else {
+                    LineMeta::ListItem {
+                        list_id: self.list_id,
+                    }
+                };
+                self.flush_line_with_meta(meta);
                 if self.list_stack.len() <= 1 && self.item_has_nested_list {
                     self.push_empty_line();
                 }
@@ -1079,6 +1096,16 @@ impl<'a> Renderer<'a> {
             }
 
             Event::TaskListMarker(checked) => {
+                // Strip the bullet ("• ") from the span that was just pushed
+                // by Event::Start(Tag::Item), keeping only the indentation.
+                if let Some(last) = self.current_spans.last_mut()
+                    && let Some(pos) = last.text.rfind("• ")
+                {
+                    last.text.truncate(pos);
+                }
+
+                self.current_task_checked = Some(checked);
+
                 let (marker, color) = if checked {
                     ("✓ ", self.theme.task_done)
                 } else {

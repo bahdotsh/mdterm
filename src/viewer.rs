@@ -445,7 +445,12 @@ impl ViewerState {
         // doesn't introduce artificial newlines within a single list item.
         self.list_contents.clear();
         for line in &lines {
-            if let LineMeta::ListItem { list_id } = line.meta {
+            let list_id_opt = match line.meta {
+                LineMeta::ListItem { list_id } => Some(list_id),
+                LineMeta::TaskItem { list_id, .. } => Some(list_id),
+                _ => None,
+            };
+            if let Some(list_id) = list_id_opt {
                 let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
                 let entry = self.list_contents.entry(list_id).or_default();
                 if !entry.is_empty() {
@@ -738,6 +743,64 @@ impl ViewerState {
             .unwrap_or_default()
     }
 
+    /// Toggle a task list checkbox by its document-wide index.
+    fn toggle_task(&mut self, task_index: usize, currently_checked: bool) {
+        // Walk through all task markers (- [ ], - [x], * [ ], * [x], + [ ], + [x])
+        // in document order and find the one at task_index.
+        let markers: &[&str] = &["- [ ]", "- [x]", "* [ ]", "* [x]", "+ [ ]", "+ [x]"];
+        let mut count = 0usize;
+        let mut found_pos = None;
+        let mut search_start = 0;
+        let bytes = self.content.as_bytes();
+
+        loop {
+            // Find the earliest task marker from search_start
+            let mut earliest: Option<usize> = None;
+            for marker in markers {
+                if let Some(p) = self.content[search_start..].find(marker) {
+                    let abs = p + search_start;
+                    earliest = Some(earliest.map_or(abs, |e: usize| e.min(abs)));
+                }
+            }
+            let Some(pos) = earliest else { break };
+
+            // Must be at start of line or preceded by whitespace (for indented items)
+            if pos == 0
+                || bytes[pos - 1] == b'\n'
+                || bytes[pos - 1] == b' '
+                || bytes[pos - 1] == b'\t'
+            {
+                if count == task_index {
+                    found_pos = Some(pos);
+                    break;
+                }
+                count += 1;
+            }
+            search_start = pos + 5;
+        }
+
+        if let Some(pos) = found_pos {
+            // Toggle [x] <-> [ ] — the marker char is at pos+2, bracket content at pos+3
+            let check_byte = self.content.as_bytes()[pos + 3];
+            let replacement = if check_byte == b'x' { "[ ]" } else { "[x]" };
+            self.content.replace_range(pos + 2..pos + 5, replacement);
+
+            // Write back to file if sourced from a file
+            let path = &self.files[self.current_file_idx];
+            if !path.is_empty() && std::path::Path::new(path).exists() {
+                let _ = std::fs::write(path, &self.content);
+            }
+
+            self.rebuild();
+            let label = if currently_checked {
+                "Unchecked"
+            } else {
+                "Checked"
+            };
+            self.set_toast(label);
+        }
+    }
+
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
     fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
         if term_row < 1 {
@@ -756,7 +819,10 @@ impl ViewerState {
         self.wrapped.get(line_idx).is_some_and(|l| {
             matches!(
                 l.meta,
-                LineMeta::CodeContent { .. } | LineMeta::Heading { .. } | LineMeta::ListItem { .. }
+                LineMeta::CodeContent { .. }
+                    | LineMeta::Heading { .. }
+                    | LineMeta::ListItem { .. }
+                    | LineMeta::TaskItem { .. }
             )
         })
     }
@@ -1039,6 +1105,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                             if copy_to_clipboard(&text).is_ok() {
                                 state.set_toast("List copied");
                             }
+                        }
+                        LineMeta::TaskItem {
+                            checked,
+                            task_index,
+                            ..
+                        } => {
+                            state.toggle_task(task_index, checked);
                         }
                         _ => {}
                     }
