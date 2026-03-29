@@ -321,6 +321,9 @@ struct ViewerState {
 
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
+
+    // Interactive JSON explorer state
+    json_view: Option<crate::json::JsonViewState>,
 }
 
 #[derive(Clone)]
@@ -398,6 +401,7 @@ impl ViewerState {
             cursor_on_clickable: false,
             list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
+            json_view: None,
         }
     }
 
@@ -442,17 +446,32 @@ impl ViewerState {
 
         let cw = self.content_width();
         let (lines, doc_info) = if self.filename.ends_with(".json") {
-            match crate::json::render(&self.content, cw, &self.theme) {
-                Ok(result) => result,
-                Err(_) => crate::markdown::render_with(
-                    &self.content,
-                    cw,
-                    &self.theme,
-                    self.line_numbers,
-                    &self.syntect_res,
-                ),
+            // Initialize JSON view state on first render
+            if self.json_view.is_none() {
+                self.json_view = Some(crate::json::JsonViewState::new());
+            }
+            let jv = self.json_view.as_ref().unwrap();
+            match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded)
+            {
+                Ok((lines, doc_info, navigable)) => {
+                    let jv = self.json_view.as_mut().unwrap();
+                    jv.navigable = navigable;
+                    jv.restore_cursor();
+                    (lines, doc_info)
+                }
+                Err(_) => {
+                    self.json_view = None;
+                    crate::markdown::render_with(
+                        &self.content,
+                        cw,
+                        &self.theme,
+                        self.line_numbers,
+                        &self.syntect_res,
+                    )
+                }
             }
         } else {
+            self.json_view = None;
             crate::markdown::render_with(
                 &self.content,
                 cw,
@@ -720,6 +739,7 @@ impl ViewerState {
             self.content = c;
             self.offset = 0;
             self.search.clear();
+            self.json_view = None;
             self.current_slide = 0;
             self.rebuild();
             self.watch_current_file();
@@ -1160,12 +1180,123 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
     false
 }
 
+/// Returns true if the key was consumed by JSON interactive navigation.
+fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
+    // Pre-check: is this a JSON navigation key?
+    let is_json_key = matches!(
+        code,
+        KeyCode::Char('j')
+            | KeyCode::Down
+            | KeyCode::Char('k')
+            | KeyCode::Up
+            | KeyCode::Enter
+            | KeyCode::Char(' ')
+            | KeyCode::Char('l')
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Left
+    );
+    if !is_json_key {
+        return false;
+    }
+
+    let has_nav = state
+        .json_view
+        .as_ref()
+        .is_some_and(|jv| !jv.navigable.is_empty());
+    if !has_nav {
+        return false;
+    }
+
+    let viewport = state.viewport();
+
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let jv = state.json_view.as_mut().unwrap();
+            jv.move_cursor(1);
+            if let Some(line) = jv.cursor_line() {
+                if line >= state.offset + viewport {
+                    state.offset = line.saturating_sub(viewport / 2);
+                } else if line < state.offset {
+                    state.offset = line;
+                }
+            }
+            state.dirty = true;
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let jv = state.json_view.as_mut().unwrap();
+            jv.move_cursor(-1);
+            if let Some(line) = jv.cursor_line() {
+                if line < state.offset {
+                    state.offset = line;
+                } else if line >= state.offset + viewport {
+                    state.offset = line.saturating_sub(viewport / 2);
+                }
+            }
+            state.dirty = true;
+            true
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            state.json_view.as_mut().unwrap().toggle_current();
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
+                }
+            }
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            let jv = state.json_view.as_mut().unwrap();
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string()) {
+                if !jv.expanded.contains(&path) {
+                    jv.cursor_path_save = Some(path.clone());
+                    jv.expanded.insert(path);
+                    state.rebuild();
+                    if let Some(line) =
+                        state.json_view.as_ref().and_then(|j| j.cursor_line())
+                    {
+                        let vp = state.viewport();
+                        let max = state.max_offset();
+                        if line < state.offset || line >= state.offset + vp {
+                            state.offset = line.saturating_sub(vp / 4).min(max);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            let jv = state.json_view.as_mut().unwrap();
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string()) {
+                if jv.expanded.contains(&path) {
+                    jv.cursor_path_save = Some(path.clone());
+                    jv.expanded.remove(&path);
+                    state.rebuild();
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> bool {
     let viewport = state.viewport();
     let max_offset = state.max_offset();
 
     if state.slide_mode {
         return handle_slide_keys(state, code);
+    }
+
+    // Interactive JSON: intercept j/k/Enter/h/l for node navigation
+    if state.json_view.is_some() {
+        if handle_json_keys(state, code) {
+            return false;
+        }
     }
 
     match code {
@@ -2153,6 +2284,21 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             }
 
             if !drew_inline_image {
+                // JSON cursor highlight
+                let is_json_cursor = state
+                    .json_view
+                    .as_ref()
+                    .and_then(|jv| jv.cursor_line())
+                    .is_some_and(|cl| cl == line_idx);
+                let line_bg = if is_json_cursor {
+                    theme.overlay_selected_bg
+                } else {
+                    theme.bg
+                };
+                if is_json_cursor {
+                    queue!(stdout, SetBackgroundColor(line_bg))?;
+                }
+
                 let highlights = if !state.slide_mode {
                     state.search.highlights_for_line(line_idx)
                 } else {
@@ -2168,17 +2314,21 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
                 let mut col = 0;
                 for span in spans {
-                    write_span(stdout, span, Some(theme.bg))?;
+                    write_span(stdout, span, Some(line_bg))?;
                     col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
-                    let fill_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                        if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                            Some(bg)
-                        } else {
-                            None
-                        }
-                    });
+                    let fill_bg = if is_json_cursor {
+                        Some(line_bg)
+                    } else {
+                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                                Some(bg)
+                            } else {
+                                None
+                            }
+                        })
+                    };
                     if let Some(bg) = fill_bg {
                         queue!(
                             stdout,
@@ -2190,6 +2340,9 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     } else {
                         queue!(stdout, Print(" ".repeat(content_width - col)))?;
                     }
+                }
+                if is_json_cursor {
+                    queue!(stdout, SetBackgroundColor(theme.bg))?;
                 }
             }
         } else {
