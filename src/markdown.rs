@@ -177,7 +177,7 @@ impl<'a> Renderer<'a> {
     fn flush_line_with_meta(&mut self, meta: LineMeta) {
         if !self.current_spans.is_empty() {
             let mut spans = Vec::new();
-            if self.in_blockquote {
+            let effective_meta = if self.in_blockquote {
                 spans.push(StyledSpan {
                     text: "  ┃ ".to_string(),
                     style: Style {
@@ -185,9 +185,17 @@ impl<'a> Renderer<'a> {
                         ..Default::default()
                     },
                 });
-            }
+                LineMeta::BlockQuote {
+                    bar_color: self.theme.blockquote_bar,
+                }
+            } else {
+                meta
+            };
             spans.append(&mut self.current_spans);
-            self.lines.push(Line { spans, meta });
+            self.lines.push(Line {
+                spans,
+                meta: effective_meta,
+            });
         }
     }
 
@@ -206,7 +214,9 @@ impl<'a> Renderer<'a> {
                         ..Default::default()
                     },
                 }],
-                meta: LineMeta::None,
+                meta: LineMeta::BlockQuote {
+                    bar_color: self.theme.blockquote_bar,
+                },
             });
         } else {
             self.lines.push(Line::empty());
@@ -810,6 +820,14 @@ impl<'a> Renderer<'a> {
             }
             Event::End(TagEnd::BlockQuote) => {
                 self.in_blockquote = false;
+                // Remove trailing bar-only empty line left by paragraph end
+                if let Some(last) = self.lines.last() {
+                    let is_bar_only = last.spans.len() == 1
+                        && (last.spans[0].text == "  ┃" || last.spans[0].text == "  ┃ ");
+                    if is_bar_only {
+                        self.lines.pop();
+                    }
+                }
                 self.push_empty_line();
             }
 

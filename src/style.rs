@@ -33,6 +33,9 @@ pub enum LineMeta {
     ListItem {
         list_id: usize,
     },
+    BlockQuote {
+        bar_color: Color,
+    },
     SlideBreak,
     #[allow(dead_code)]
     Image {
@@ -85,6 +88,38 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
     for line in lines {
         if line.spans.is_empty() || line.display_width() <= width {
             result.push(line.clone());
+        } else if let LineMeta::BlockQuote { bar_color } = &line.meta {
+            // Strip the blockquote prefix span, wrap at reduced width,
+            // then re-add the prefix to all wrapped lines.
+            let bar_color = *bar_color;
+            let prefix_width = 4; // "  ┃ " is 4 display columns
+            let inner_width = width.saturating_sub(prefix_width);
+            if inner_width == 0 {
+                result.push(line.clone());
+                continue;
+            }
+            let content_line = Line {
+                spans: line
+                    .spans
+                    .iter()
+                    .skip_while(|s| s.text == "  ┃ " || s.text == "  ┃")
+                    .cloned()
+                    .collect(),
+                meta: LineMeta::None,
+            };
+            let wrapped = word_wrap(&content_line, inner_width);
+            let prefix_span = StyledSpan {
+                text: "  ┃ ".to_string(),
+                style: Style {
+                    fg: Some(bar_color),
+                    ..Default::default()
+                },
+            };
+            for mut w in wrapped {
+                w.spans.insert(0, prefix_span.clone());
+                w.meta = LineMeta::BlockQuote { bar_color };
+                result.push(w);
+            }
         } else {
             let mut wrapped = word_wrap(line, width);
             // Propagate metadata to all wrapped lines for clickable types
@@ -435,5 +470,79 @@ mod tests {
         assert!(all_text.contains("normal"));
         assert!(all_text.contains("text"));
         assert!(all_text.contains("here"));
+    }
+
+    #[test]
+    fn blockquote_wrapping_preserves_prefix_on_all_lines() {
+        let bar_color = Color::Rgb {
+            r: 100,
+            g: 100,
+            b: 200,
+        };
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: "  ┃ ".to_string(),
+                    style: Style {
+                        fg: Some(bar_color),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: "this is a long blockquote that should wrap to multiple lines easily"
+                        .to_string(),
+                    style: Style {
+                        italic: true,
+                        ..Default::default()
+                    },
+                },
+            ],
+            meta: LineMeta::BlockQuote { bar_color },
+        };
+        let wrapped = wrap_lines(&[line], 30);
+        assert!(wrapped.len() >= 2, "blockquote should wrap");
+        for l in &wrapped {
+            assert!(
+                matches!(l.meta, LineMeta::BlockQuote { .. }),
+                "all wrapped lines should have BlockQuote meta"
+            );
+            assert_eq!(
+                l.spans[0].text, "  ┃ ",
+                "all wrapped lines should start with prefix"
+            );
+            assert!(
+                l.display_width() <= 30,
+                "line too wide: {}",
+                l.display_width()
+            );
+        }
+    }
+
+    #[test]
+    fn blockquote_short_line_passes_through() {
+        let bar_color = Color::Rgb {
+            r: 100,
+            g: 100,
+            b: 200,
+        };
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: "  ┃ ".to_string(),
+                    style: Style {
+                        fg: Some(bar_color),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: "short".to_string(),
+                    style: Style::default(),
+                },
+            ],
+            meta: LineMeta::BlockQuote { bar_color },
+        };
+        let wrapped = wrap_lines(&[line], 80);
+        assert_eq!(wrapped.len(), 1);
+        assert!(matches!(wrapped[0].meta, LineMeta::BlockQuote { .. }));
     }
 }
