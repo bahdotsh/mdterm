@@ -260,7 +260,8 @@ struct ViewerState {
 
     // Link picker
     link_entries: Vec<LinkEntry>,
-    link_input: String,
+    link_selected: usize,
+    link_scroll: usize,
 
     // Fuzzy heading search
     fuzzy_input: String,
@@ -358,7 +359,8 @@ impl ViewerState {
             toc_scroll: 0,
             help_scroll: 0,
             link_entries: Vec::new(),
-            link_input: String::new(),
+            link_selected: 0,
+            link_scroll: 0,
             fuzzy_input: String::new(),
             fuzzy_selected: 0,
             fuzzy_scroll: 0,
@@ -392,6 +394,13 @@ impl ViewerState {
 
     fn viewport(&self) -> usize {
         (self.rows as usize).saturating_sub(2)
+    }
+
+    fn link_picker_visible_entries(&self) -> usize {
+        let count = self.link_entries.len();
+        let viewport = self.viewport();
+        let box_h = (count + 2).min(viewport.saturating_sub(4).max(3));
+        box_h.saturating_sub(2).max(1)
     }
 
     fn max_offset(&self) -> usize {
@@ -1072,7 +1081,8 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         KeyCode::Char('f') => {
             if !state.link_entries.is_empty() {
                 reset_cursor_shape(state);
-                state.link_input.clear();
+                state.link_selected = 0;
+                state.link_scroll = 0;
                 state.mode = ViewMode::LinkPicker;
             }
         }
@@ -1408,27 +1418,56 @@ fn reset_cursor_shape(state: &mut ViewerState) {
 }
 
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
+    let count = state.link_entries.len();
+    if count == 0 {
+        state.mode = ViewMode::Normal;
+        return;
+    }
+
+    // Clamp in case file reload shrunk the link list while picker is open
+    state.link_selected = state.link_selected.min(count - 1);
+
+    let visible_entries = state.link_picker_visible_entries();
+
     match code {
         KeyCode::Esc => {
             state.mode = ViewMode::Normal;
         }
-        KeyCode::Char(c) if c.is_ascii_digit() => {
-            state.link_input.push(c);
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.link_selected = state.link_selected.saturating_sub(1);
         }
-        KeyCode::Backspace => {
-            state.link_input.pop();
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.link_selected + 1 < count {
+                state.link_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            state.link_selected = state.link_selected.saturating_sub(visible_entries);
+        }
+        KeyCode::PageDown => {
+            state.link_selected = (state.link_selected + visible_entries).min(count - 1);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.link_selected = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            state.link_selected = count.saturating_sub(1);
         }
         KeyCode::Enter => {
-            if let Ok(num) = state.link_input.parse::<usize>()
-                && num >= 1
-                && num <= state.link_entries.len()
-            {
-                let url = state.link_entries[num - 1].url.clone();
+            if let Some(entry) = state.link_entries.get(state.link_selected) {
+                let url = entry.url.clone();
                 dispatch_link(state, &url);
             }
             state.mode = ViewMode::Normal;
         }
         _ => {}
+    }
+
+    // Update scroll to keep selection visible
+    if state.link_selected >= state.link_scroll + visible_entries {
+        state.link_scroll = state.link_selected - visible_entries + 1;
+    } else if state.link_selected < state.link_scroll {
+        state.link_scroll = state.link_selected;
     }
 }
 
@@ -2471,13 +2510,14 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
     let viewport = state.viewport();
 
     let box_w = (width * 2 / 3).max(30).min(width.saturating_sub(6));
-    let max_entries = viewport.saturating_sub(6);
-    let shown = entries.len().min(max_entries);
-    let box_h = shown + 3; // title + entries + input + bottom
+    let visible_entries = state.link_picker_visible_entries();
+    let box_h = visible_entries + 2;
     let x_off = (width.saturating_sub(box_w)) / 2;
     let y_off = (viewport.saturating_sub(box_h)) / 2 + 1;
 
-    let title = " Links ";
+    let scroll = state.link_scroll;
+
+    let title = format!(" Links ({}/{}) ", state.link_selected + 1, entries.len());
     let title_len = title.chars().count();
     let top_dashes = box_w.saturating_sub(3 + title_len);
 
@@ -2488,103 +2528,118 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
         SetForegroundColor(theme.overlay_border),
         Print("╭─"),
         SetForegroundColor(theme.overlay_text),
-        Print(title),
+        Print(&title),
         SetForegroundColor(theme.overlay_border),
         Print(format!("{}╮", "─".repeat(top_dashes))),
     )?;
 
-    for (i, entry) in entries.iter().enumerate().take(shown) {
-        let num = format!(" {:>2}. ", i + 1);
-        let num_len = num.chars().count();
-        let available = box_w.saturating_sub(2 + num_len);
-        let has_text = !entry.text.is_empty() && entry.text != entry.url;
-
-        let (text_part, url_part) = if has_text {
-            let sep = " → ";
-            let sep_len = sep.chars().count();
-            let text_len = entry.text.chars().count();
-            let url_len = entry.url.chars().count();
-
-            if text_len + sep_len + url_len <= available {
-                (format!("{}{}", entry.text, sep), entry.url.clone())
-            } else if text_len + sep_len + 3 <= available {
-                let url_budget = available - text_len - sep_len;
-                let truncated_url: String = entry
-                    .url
-                    .chars()
-                    .take(url_budget.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
-                (format!("{}{}", entry.text, sep), truncated_url)
-            } else {
-                // Even text barely fits — just show truncated text
-                let truncated: String = entry
-                    .text
-                    .chars()
-                    .take(available.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
-                (truncated, String::new())
-            }
-        } else {
-            let url_display: String = if entry.url.chars().count() > available {
-                entry
-                    .url
-                    .chars()
-                    .take(available.saturating_sub(1))
-                    .collect::<String>()
-                    + "…"
-            } else {
-                entry.url.clone()
-            };
-            (String::new(), url_display)
-        };
-
-        let content_len = text_part.chars().count() + url_part.chars().count();
-        let padding = box_w.saturating_sub(2 + num_len + content_len);
-
+    for i in 0..visible_entries {
+        let entry_idx = scroll + i;
         queue!(
             stdout,
             MoveTo(x_off as u16, (y_off + 1 + i) as u16),
             SetBackgroundColor(theme.overlay_bg),
             SetForegroundColor(theme.overlay_border),
             Print("│"),
-            SetForegroundColor(theme.overlay_selected_fg),
-            Print(&num),
-            SetForegroundColor(theme.overlay_text),
-            Print(&text_part),
-            SetForegroundColor(theme.link_url),
-            Print(&url_part),
-            Print(" ".repeat(padding)),
-            SetForegroundColor(theme.overlay_border),
-            Print("│"),
         )?;
+
+        if let Some(entry) = entries.get(entry_idx) {
+            let is_selected = entry_idx == state.link_selected;
+            let marker = if is_selected { " ▸ " } else { "   " };
+            let marker_len = 3;
+            let available = box_w.saturating_sub(2 + marker_len);
+            let has_text = !entry.text.is_empty() && entry.text != entry.url;
+
+            let (text_part, url_part) = if has_text {
+                let sep = " → ";
+                let sep_len = sep.chars().count();
+                let text_len = entry.text.chars().count();
+                let url_len = entry.url.chars().count();
+
+                if text_len + sep_len + url_len <= available {
+                    (format!("{}{}", entry.text, sep), entry.url.clone())
+                } else if text_len + sep_len + 3 <= available {
+                    let url_budget = available - text_len - sep_len;
+                    let truncated_url: String = entry
+                        .url
+                        .chars()
+                        .take(url_budget.saturating_sub(1))
+                        .collect::<String>()
+                        + "…";
+                    (format!("{}{}", entry.text, sep), truncated_url)
+                } else {
+                    let truncated: String = entry
+                        .text
+                        .chars()
+                        .take(available.saturating_sub(1))
+                        .collect::<String>()
+                        + "…";
+                    (truncated, String::new())
+                }
+            } else {
+                let url_display: String = if entry.url.chars().count() > available {
+                    entry
+                        .url
+                        .chars()
+                        .take(available.saturating_sub(1))
+                        .collect::<String>()
+                        + "…"
+                } else {
+                    entry.url.clone()
+                };
+                (String::new(), url_display)
+            };
+
+            let content_len = text_part.chars().count() + url_part.chars().count();
+            let padding = box_w.saturating_sub(2 + marker_len + content_len);
+
+            if is_selected {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(theme.overlay_selected_bg),
+                    SetForegroundColor(theme.overlay_selected_fg),
+                    Print(marker),
+                    Print(&text_part),
+                    SetForegroundColor(theme.link_url),
+                    Print(&url_part),
+                    SetForegroundColor(theme.overlay_selected_fg),
+                    Print(" ".repeat(padding)),
+                    SetForegroundColor(theme.overlay_border),
+                    SetBackgroundColor(theme.overlay_bg),
+                    Print("│"),
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetForegroundColor(theme.overlay_text),
+                    Print(marker),
+                    Print(&text_part),
+                    SetForegroundColor(theme.link_url),
+                    Print(&url_part),
+                    SetForegroundColor(theme.overlay_text),
+                    Print(" ".repeat(padding)),
+                    SetForegroundColor(theme.overlay_border),
+                    Print("│"),
+                )?;
+            }
+        } else {
+            let padding = box_w.saturating_sub(2);
+            queue!(
+                stdout,
+                Print(" ".repeat(padding)),
+                SetForegroundColor(theme.overlay_border),
+                Print("│"),
+            )?;
+        }
     }
 
-    // Input row
-    let input_display = format!(" #{} █ ", state.link_input);
-    let input_padding = box_w.saturating_sub(2 + input_display.chars().count());
-    queue!(
-        stdout,
-        MoveTo(x_off as u16, (y_off + 1 + shown) as u16),
-        SetBackgroundColor(theme.overlay_bg),
-        SetForegroundColor(theme.overlay_border),
-        Print("│"),
-        SetForegroundColor(theme.search_prompt),
-        Print(&input_display),
-        SetBackgroundColor(theme.overlay_bg),
-        Print(" ".repeat(input_padding)),
-        SetForegroundColor(theme.overlay_border),
-        Print("│"),
-    )?;
-
-    let footer = " type number · Enter open · Esc close ";
+    let footer = " j/k navigate · Enter open · Esc close ";
     let footer_len = footer.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
 
     queue!(
         stdout,
-        MoveTo(x_off as u16, (y_off + 2 + shown) as u16),
+        MoveTo(x_off as u16, (y_off + 1 + visible_entries) as u16),
         SetBackgroundColor(theme.overlay_bg),
         SetForegroundColor(theme.overlay_border),
         Print("╰─"),
