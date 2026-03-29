@@ -739,17 +739,26 @@ impl ViewerState {
             return None;
         }
         let content_col = term_col - Self::GUTTER_COLS;
-        let line_idx = if self.slide_mode {
+        let (line_idx, slide_end) = if self.slide_mode {
             let start = self
                 .slide_boundaries
                 .get(self.current_slide)
                 .copied()
                 .unwrap_or(0);
-            start + (term_row - 1)
+            let end = self
+                .slide_boundaries
+                .get(self.current_slide + 1)
+                .copied()
+                .unwrap_or(self.wrapped.len());
+            (start + (term_row - 1), end)
         } else {
-            self.offset + (term_row - 1)
+            (self.offset + (term_row - 1), usize::MAX)
         };
 
+        // Don't resolve links past the current slide boundary.
+        if line_idx >= slide_end {
+            return None;
+        }
         let line = self.wrapped.get(line_idx)?;
         let mut col = 0;
         for span in &line.spans {
@@ -1782,15 +1791,24 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         state.image_cache.transmit_pending_kitty(stdout)?;
     }
 
-    // Determine which lines to show
-    let slide_end = if state.slide_mode {
-        state
+    // Determine the line range visible in the current slide (or the full
+    // document when slide mode is off).  `slide_start` replaces the per-row
+    // boundary lookups, and `slide_end` gates every `wrapped.get()` so content
+    // from the next slide never bleeds into the viewport.
+    let (slide_start, slide_end) = if state.slide_mode {
+        let start = state
+            .slide_boundaries
+            .get(state.current_slide)
+            .copied()
+            .unwrap_or(0);
+        let end = state
             .slide_boundaries
             .get(state.current_slide + 1)
             .copied()
-            .unwrap_or(state.wrapped.len())
+            .unwrap_or(state.wrapped.len());
+        (start, end)
     } else {
-        usize::MAX
+        (state.offset, usize::MAX)
     };
 
     // Scrollbar
@@ -1841,16 +1859,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     for row in 0..viewport {
         queue!(stdout, MoveTo(0, (row + 1) as u16))?;
 
-        let line_idx = if state.slide_mode {
-            let start = state
-                .slide_boundaries
-                .get(state.current_slide)
-                .copied()
-                .unwrap_or(0);
-            start + row
-        } else {
-            state.offset + row
-        };
+        let line_idx = slide_start + row;
 
         queue!(
             stdout,
@@ -1862,6 +1871,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         )?;
 
         let mut drew_inline_image = false;
+        // Clamp to current slide: lines past slide_end render as blank.
         if let Some(line) = state.wrapped.get(line_idx).filter(|_| line_idx < slide_end) {
             // Render image pixels inline (Kitty / iTerm2).
             // Suppressed when an overlay is active to prevent images bleeding through.
@@ -2009,16 +2019,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     {
         let mut row = 0;
         while row < viewport {
-            let line_idx = if state.slide_mode {
-                let start = state
-                    .slide_boundaries
-                    .get(state.current_slide)
-                    .copied()
-                    .unwrap_or(0);
-                start + row
-            } else {
-                state.offset + row
-            };
+            let line_idx = slide_start + row;
 
             if let Some(line) = state.wrapped.get(line_idx).filter(|_| line_idx < slide_end)
                 && let LineMeta::Image {
@@ -2033,16 +2034,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                 let url = url.clone();
                 let mut count = 1;
                 while first_screen_row + count < viewport {
-                    let next_idx = if state.slide_mode {
-                        let start = state
-                            .slide_boundaries
-                            .get(state.current_slide)
-                            .copied()
-                            .unwrap_or(0);
-                        start + first_screen_row + count
-                    } else {
-                        state.offset + first_screen_row + count
-                    };
+                    let next_idx = slide_start + first_screen_row + count;
                     if let Some(next) = state.wrapped.get(next_idx).filter(|_| next_idx < slide_end)
                     {
                         if let LineMeta::Image { url: ref u2, .. } = next.meta
