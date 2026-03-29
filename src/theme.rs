@@ -80,6 +80,16 @@ pub struct Theme {
     // Line numbers
     pub line_number: Color,
 
+    // JSON
+    pub json_key: Color,
+    pub json_string: Color,
+    pub json_number: Color,
+    pub json_bool: Color,
+    pub json_null: Color,
+    pub json_bracket: Color,
+    #[allow(dead_code)]
+    pub json_path: Color,
+
     is_dark: bool,
 }
 
@@ -326,6 +336,42 @@ impl Theme {
                 g: 71,
                 b: 90,
             },
+
+            json_key: Color::Rgb {
+                r: 137,
+                g: 180,
+                b: 250,
+            },
+            json_string: Color::Rgb {
+                r: 166,
+                g: 227,
+                b: 161,
+            },
+            json_number: Color::Rgb {
+                r: 250,
+                g: 179,
+                b: 135,
+            },
+            json_bool: Color::Rgb {
+                r: 249,
+                g: 226,
+                b: 175,
+            },
+            json_null: Color::Rgb {
+                r: 108,
+                g: 112,
+                b: 134,
+            },
+            json_bracket: Color::Rgb {
+                r: 127,
+                g: 132,
+                b: 156,
+            },
+            json_path: Color::Rgb {
+                r: 203,
+                g: 166,
+                b: 247,
+            },
         }
     }
 
@@ -570,6 +616,42 @@ impl Theme {
                 r: 172,
                 g: 176,
                 b: 190,
+            },
+
+            json_key: Color::Rgb {
+                r: 30,
+                g: 102,
+                b: 245,
+            },
+            json_string: Color::Rgb {
+                r: 64,
+                g: 160,
+                b: 43,
+            },
+            json_number: Color::Rgb {
+                r: 254,
+                g: 100,
+                b: 11,
+            },
+            json_bool: Color::Rgb {
+                r: 223,
+                g: 142,
+                b: 29,
+            },
+            json_null: Color::Rgb {
+                r: 140,
+                g: 143,
+                b: 161,
+            },
+            json_bracket: Color::Rgb {
+                r: 108,
+                g: 111,
+                b: 133,
+            },
+            json_path: Color::Rgb {
+                r: 136,
+                g: 57,
+                b: 239,
             },
         }
     }

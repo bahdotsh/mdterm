@@ -1,0 +1,72 @@
+{
+  "project": {
+    "name": "mdterm",
+    "version": "1.5.0",
+    "description": "A terminal-based Markdown viewer with syntax highlighting and interactive navigation",
+    "repository": "https://github.com/bahdotsh/mdterm",
+    "license": "MIT",
+    "rust_edition": "2024"
+  },
+  "authors": [
+    {"name": "Bah", "role": "maintainer", "github": "https://github.com/bahdotsh"},
+    {"name": "Alice", "role": "contributor", "github": "https://github.com/alice"},
+    {"name": "Bob", "role": "contributor", "github": "https://github.com/bob"}
+  ],
+  "features": {
+    "rendering": {
+      "syntax_highlighting": true,
+      "math_support": true,
+      "image_protocols": ["kitty", "iterm2", "sixel"],
+      "mermaid_diagrams": true
+    },
+    "navigation": {
+      "search": true,
+      "table_of_contents": true,
+      "link_picker": true,
+      "fuzzy_heading": true,
+      "slide_mode": true
+    },
+    "file_handling": {
+      "auto_reload": true,
+      "multi_file": true,
+      "stdin_support": true,
+      "max_stdin_mb": 100
+    }
+  },
+  "dependencies": [
+    {"name": "pulldown-cmark", "version": "0.11", "purpose": "CommonMark parser"},
+    {"name": "crossterm", "version": "0.28", "purpose": "Terminal control"},
+    {"name": "syntect", "version": "5", "purpose": "Syntax highlighting"},
+    {"name": "clap", "version": "4", "purpose": "CLI argument parsing"},
+    {"name": "serde_json", "version": "1", "purpose": "JSON parsing"},
+    {"name": "notify", "version": "7", "purpose": "File watcher"},
+    {"name": "image", "version": "0.25", "purpose": "Image loading"},
+    {"name": "ureq", "version": "3", "purpose": "HTTP client"}
+  ],
+  "themes": {
+    "dark": {
+      "background": "#1e1e2e",
+      "foreground": "#cdd6f4",
+      "accent": "#89b4fa"
+    },
+    "light": {
+      "background": "#eff1f5",
+      "foreground": "#4c4f69",
+      "accent": "#1e66f5"
+    }
+  },
+  "stats": {
+    "source_files": 9,
+    "total_lines": null,
+    "test_count": 129,
+    "supported_image_formats": ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"],
+    "open_issues": 0,
+    "stars": 420,
+    "active": true
+  },
+  "links": [
+    "https://github.com/bahdotsh/mdterm",
+    "https://crates.io/crates/mdterm",
+    "https://docs.rs/mdterm"
+  ]
+}

@@ -6,8 +6,15 @@ use crate::markdown;
 use crate::style::{LineMeta, wrap_lines};
 use crate::theme::Theme;
 
-pub fn to_html(content: &str, width: usize, theme: &Theme) {
-    let (lines, _) = markdown::render(content, width, theme, false);
+pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str) {
+    let (lines, _) = if filename.ends_with(".json") {
+        match crate::json::render(content, width, theme) {
+            Ok(result) => result,
+            Err(_) => markdown::render(content, width, theme, false),
+        }
+    } else {
+        markdown::render(content, width, theme, false)
+    };
     let wrapped = wrap_lines(&lines, width);
 
     let mut out = io::stdout();

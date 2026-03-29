@@ -441,13 +441,26 @@ impl ViewerState {
         let saved_offset = self.offset;
 
         let cw = self.content_width();
-        let (lines, doc_info) = crate::markdown::render_with(
-            &self.content,
-            cw,
-            &self.theme,
-            self.line_numbers,
-            &self.syntect_res,
-        );
+        let (lines, doc_info) = if self.filename.ends_with(".json") {
+            match crate::json::render(&self.content, cw, &self.theme) {
+                Ok(result) => result,
+                Err(_) => crate::markdown::render_with(
+                    &self.content,
+                    cw,
+                    &self.theme,
+                    self.line_numbers,
+                    &self.syntect_res,
+                ),
+            }
+        } else {
+            crate::markdown::render_with(
+                &self.content,
+                cw,
+                &self.theme,
+                self.line_numbers,
+                &self.syntect_res,
+            )
+        };
         // Pre-compute list content from pre-wrap lines so that word-wrapping
         // doesn't introduce artificial newlines within a single list item.
         self.list_contents.clear();

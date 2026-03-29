@@ -2,6 +2,7 @@ mod config;
 mod diagram;
 mod export;
 mod image;
+mod json;
 mod markdown;
 mod style;
 mod theme;
@@ -103,12 +104,14 @@ fn main() {
         (c, path.clone())
     };
 
+    let is_json = filename.ends_with(".json");
+
     // Export mode
     if let Some(ref fmt) = cli.export {
         match fmt.as_str() {
             "html" => {
                 let w = if width > 0 { width } else { 80 };
-                export::to_html(&content, w, &initial_theme);
+                export::to_html(&content, w, &initial_theme, &filename);
             }
             _ => {
                 eprintln!("Unknown export format '{}'. Supported: html", fmt);
@@ -141,7 +144,17 @@ fn main() {
                 .map(|(c, _)| c as usize)
                 .unwrap_or(80)
         };
-        let (lines, _) = markdown::render(&content, w, &initial_theme, line_numbers);
+        let (lines, _) = if is_json {
+            match json::render(&content, w, &initial_theme) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("JSON parse error: {}", e);
+                    process::exit(1);
+                }
+            }
+        } else {
+            markdown::render(&content, w, &initial_theme, line_numbers)
+        };
         let wrapped = style::wrap_lines(&lines, w);
         if cli.no_color {
             viewer::print_lines_plain(&wrapped);
