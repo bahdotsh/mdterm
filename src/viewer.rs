@@ -911,14 +911,14 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     let prev = (
                         state.fuzzy_selected,
                         state.fuzzy_scroll,
-                        state.fuzzy_input.len(),
+                        state.fuzzy_input.clone(),
                         state.mode,
                     );
                     handle_fuzzy(state, ke.code, ke.modifiers);
                     if (
                         state.fuzzy_selected,
                         state.fuzzy_scroll,
-                        state.fuzzy_input.len(),
+                        state.fuzzy_input.clone(),
                         state.mode,
                     ) != prev
                     {
@@ -930,7 +930,11 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
         }
         Event::Mouse(me) => match me.kind {
             MouseEventKind::ScrollDown => {
-                state.dirty = true;
+                let prev_offset = state.offset;
+                let prev_slide = state.current_slide;
+                let prev_help = state.help_scroll;
+                let prev_toc = (state.toc_selected, state.toc_scroll);
+                let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
                 match state.mode {
                     ViewMode::Help => {
                         let total = help_total_rows();
@@ -957,9 +961,21 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                         state.offset = (state.offset + 3).min(max);
                     }
                 }
+                if state.offset != prev_offset
+                    || state.current_slide != prev_slide
+                    || state.help_scroll != prev_help
+                    || (state.toc_selected, state.toc_scroll) != prev_toc
+                    || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                {
+                    state.dirty = true;
+                }
             }
             MouseEventKind::ScrollUp => {
-                state.dirty = true;
+                let prev_offset = state.offset;
+                let prev_slide = state.current_slide;
+                let prev_help = state.help_scroll;
+                let prev_toc = (state.toc_selected, state.toc_scroll);
+                let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
                 match state.mode {
                     ViewMode::Help => {
                         state.help_scroll = state.help_scroll.saturating_sub(3);
@@ -976,6 +992,14 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     _ => {
                         state.offset = state.offset.saturating_sub(3);
                     }
+                }
+                if state.offset != prev_offset
+                    || state.current_slide != prev_slide
+                    || state.help_scroll != prev_help
+                    || (state.toc_selected, state.toc_scroll) != prev_toc
+                    || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                {
+                    state.dirty = true;
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if state.mode == ViewMode::Normal => {
@@ -1893,7 +1917,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
     // Clear stale Kitty image placements before redrawing, then upload any
     // pending images (transmitted once, placed cheaply per-frame).
-    // Skip image rendering entirely when an overlay (Help) is visible so
+    // Skip image rendering entirely when an overlay is visible so
     // images don't bleed through the overlay.
     let suppress_images = !matches!(state.mode, ViewMode::Normal | ViewMode::Search);
     if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
