@@ -39,7 +39,8 @@ pub enum LineMeta {
     TaskItem {
         list_id: usize,
         checked: bool,
-        task_index: usize,
+        /// Byte offset of the `[` in `[ ]`/`[x]` in the source markdown.
+        bracket_offset: usize,
     },
     SlideBreak,
     #[allow(dead_code)]

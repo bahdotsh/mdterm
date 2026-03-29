@@ -751,89 +751,50 @@ impl ViewerState {
             .unwrap_or_default()
     }
 
-    /// Toggle a task list checkbox by its document-wide index.
-    fn toggle_task(&mut self, task_index: usize, currently_checked: bool) {
-        // Walk through all task markers in document order, skipping fenced code
-        // blocks, and find the one at task_index.
-        let markers: &[&str] = &[
-            "- [ ]", "- [x]", "- [X]", "* [ ]", "* [x]", "* [X]", "+ [ ]", "+ [x]", "+ [X]",
-        ];
-        let mut count = 0usize;
-        let mut found_pos = None;
-        let mut in_code_fence = false;
-        let mut line_start = 0;
+    /// Toggle a task list checkbox using the byte offset of `[` recorded
+    /// by pulldown-cmark during rendering.  This avoids re-parsing the
+    /// source and guarantees the toggled position matches the parser's view.
+    fn toggle_task(&mut self, bracket_offset: usize, currently_checked: bool) {
+        let content = self.content.as_bytes();
 
-        for line in self.content.split('\n') {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_code_fence = !in_code_fence;
-                line_start += line.len() + 1;
-                continue;
-            }
-            if !in_code_fence {
-                // Find the earliest task marker on this line
-                let mut earliest: Option<usize> = None;
-                for marker in markers {
-                    if let Some(p) = line.find(marker) {
-                        earliest = Some(earliest.map_or(p, |e: usize| e.min(p)));
-                    }
-                }
-                if let Some(p) = earliest {
-                    let abs = line_start + p;
-                    // Must be at start of line or preceded by whitespace (indented items)
-                    if abs == 0
-                        || self.content.as_bytes()[abs - 1] == b'\n'
-                        || self.content.as_bytes()[abs - 1] == b' '
-                        || self.content.as_bytes()[abs - 1] == b'\t'
-                    {
-                        if count == task_index {
-                            found_pos = Some(abs);
-                            break;
-                        }
-                        count += 1;
-                    }
-                }
-            }
-            line_start += line.len() + 1;
+        // Validate that the offset still points at a [?] checkbox pattern.
+        if bracket_offset + 2 >= content.len()
+            || content[bracket_offset] != b'['
+            || content[bracket_offset + 2] != b']'
+        {
+            return;
         }
 
-        if let Some(pos) = found_pos {
-            // Toggle [x]/[X] <-> [ ] — bracket content is at pos+3
-            let check_byte = self.content.as_bytes()[pos + 3];
-            let replacement = if check_byte == b'x' || check_byte == b'X' {
-                "[ ]"
-            } else {
-                "[x]"
-            };
-            // Remember original so we can revert on write failure
-            let original = if check_byte == b'X' {
-                "[X]"
-            } else if check_byte == b'x' {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            self.content.replace_range(pos + 2..pos + 5, replacement);
+        let check_byte = content[bracket_offset + 1];
+        let (replacement, original) = match check_byte {
+            b'x' => ("[ ]", "[x]"),
+            b'X' => ("[ ]", "[X]"),
+            b' ' => ("[x]", "[ ]"),
+            _ => return,
+        };
 
-            // Write back to file if sourced from a file
-            let path = &self.files[self.current_file_idx];
-            if !path.is_empty()
-                && std::path::Path::new(path).exists()
-                && std::fs::write(path, &self.content).is_err()
-            {
-                self.content.replace_range(pos + 2..pos + 5, original);
-                self.set_toast("Write failed");
-                return;
-            }
+        self.content
+            .replace_range(bracket_offset..bracket_offset + 3, replacement);
 
-            self.rebuild();
-            let label = if currently_checked {
-                "Unchecked"
-            } else {
-                "Checked"
-            };
-            self.set_toast(label);
+        // Write back to file if sourced from a file.
+        let path = &self.files[self.current_file_idx];
+        if !path.is_empty()
+            && std::path::Path::new(path).exists()
+            && std::fs::write(path, &self.content).is_err()
+        {
+            self.content
+                .replace_range(bracket_offset..bracket_offset + 3, original);
+            self.set_toast("Write failed");
+            return;
         }
+
+        self.rebuild();
+        let label = if currently_checked {
+            "Unchecked"
+        } else {
+            "Checked"
+        };
+        self.set_toast(label);
     }
 
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
@@ -1143,10 +1104,10 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                         }
                         LineMeta::TaskItem {
                             checked,
-                            task_index,
+                            bracket_offset,
                             ..
                         } => {
-                            state.toggle_task(task_index, checked);
+                            state.toggle_task(bracket_offset, checked);
                         }
                         _ => {}
                     }
