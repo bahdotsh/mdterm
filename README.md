@@ -27,7 +27,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Mermaid diagrams** — Visual rendering of flowcharts/graphs in the terminal with box-drawing characters
 - **Math rendering** — LaTeX to Unicode: `$\alpha + \beta$` renders as `α + β`
 - **Slide mode** — `--slides` treats `---` as slide separators for terminal presentations
-- **Follow mode** — `--follow` watches the file and auto-reloads on changes
+- **Auto-reload** — Automatically detects file changes and reloads (via inotify/FSEvents/kqueue)
 - **Stdin support** — Pipe markdown from any command: `curl ... | mdterm`
 - **Multiple files** — `mdterm a.md b.md`, switch with `Tab` / `Shift+Tab`
 - **HTML export** — `--export html` outputs themed, self-contained HTML
@@ -52,7 +52,6 @@ mdterm README.md                    # view a file
 mdterm a.md b.md                    # multiple files (Tab to switch)
 cat README.md | mdterm              # read from stdin
 mdterm --slides deck.md             # slide mode
-mdterm --follow notes.md            # auto-reload on changes
 mdterm --export html doc.md > out.html  # export to HTML
 mdterm --theme light README.md      # light theme
 mdterm -l README.md                 # line numbers in code blocks
@@ -141,7 +140,6 @@ Options:
   -T, --theme <THEME>      Theme: dark or light
   -w, --width <WIDTH>      Display width override (0 = auto)
   -s, --slides             Slide mode (--- as slide separators)
-  -f, --follow             Watch file for changes and auto-reload
   -l, --line-numbers       Show line numbers in code blocks
       --export <FORMAT>    Export format (html)
       --no-color           Disable colors
