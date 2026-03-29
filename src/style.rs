@@ -1,6 +1,9 @@
 use crossterm::style::Color;
 use unicode_width::UnicodeWidthStr;
 
+pub const BLOCKQUOTE_PREFIX: &str = "  ┃ ";
+pub const BLOCKQUOTE_PREFIX_TRIMMED: &str = "  ┃";
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Style {
     pub fg: Option<Color>,
@@ -85,6 +88,34 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
     for line in lines {
         if line.spans.is_empty() || line.display_width() <= width {
             result.push(line.clone());
+        } else if line
+            .spans
+            .first()
+            .is_some_and(|s| s.text == BLOCKQUOTE_PREFIX || s.text == BLOCKQUOTE_PREFIX_TRIMMED)
+        {
+            // Strip the blockquote prefix span, wrap at reduced width,
+            // then re-add the prefix to all wrapped lines.
+            let prefix_span = line.spans[0].clone();
+            let prefix_width = UnicodeWidthStr::width(BLOCKQUOTE_PREFIX);
+            let inner_width = width.saturating_sub(prefix_width);
+            if inner_width == 0 {
+                result.push(line.clone());
+                continue;
+            }
+            let content_line = Line {
+                spans: line.spans.iter().skip(1).cloned().collect(),
+                meta: LineMeta::None,
+            };
+            let wrapped = word_wrap(&content_line, inner_width);
+            let prefix_span = StyledSpan {
+                text: BLOCKQUOTE_PREFIX.to_string(),
+                style: prefix_span.style,
+            };
+            for mut w in wrapped {
+                w.spans.insert(0, prefix_span.clone());
+                w.meta = line.meta.clone();
+                result.push(w);
+            }
         } else {
             let mut wrapped = word_wrap(line, width);
             // Propagate metadata to all wrapped lines for clickable types
@@ -435,5 +466,110 @@ mod tests {
         assert!(all_text.contains("normal"));
         assert!(all_text.contains("text"));
         assert!(all_text.contains("here"));
+    }
+
+    #[test]
+    fn blockquote_wrapping_preserves_prefix_on_all_lines() {
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: BLOCKQUOTE_PREFIX.to_string(),
+                    style: Style {
+                        fg: Some(Color::Rgb {
+                            r: 100,
+                            g: 100,
+                            b: 200,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: "this is a long blockquote that should wrap to multiple lines easily"
+                        .to_string(),
+                    style: Style {
+                        italic: true,
+                        ..Default::default()
+                    },
+                },
+            ],
+            meta: LineMeta::None,
+        };
+        let wrapped = wrap_lines(&[line], 30);
+        assert!(wrapped.len() >= 2, "blockquote should wrap");
+        for l in &wrapped {
+            assert_eq!(
+                l.spans[0].text, BLOCKQUOTE_PREFIX,
+                "all wrapped lines should start with prefix"
+            );
+            assert!(
+                l.display_width() <= 30,
+                "line too wide: {}",
+                l.display_width()
+            );
+        }
+    }
+
+    #[test]
+    fn blockquote_wrapping_preserves_structural_meta() {
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: BLOCKQUOTE_PREFIX.to_string(),
+                    style: Style {
+                        fg: Some(Color::Rgb {
+                            r: 100,
+                            g: 100,
+                            b: 200,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: "a heading inside a blockquote that is long enough to wrap around"
+                        .to_string(),
+                    style: Style::default(),
+                },
+            ],
+            meta: LineMeta::Heading {
+                level: 2,
+                text: "a heading inside a blockquote that is long enough to wrap around"
+                    .to_string(),
+            },
+        };
+        let wrapped = wrap_lines(&[line], 30);
+        assert!(wrapped.len() >= 2, "blockquote heading should wrap");
+        for l in &wrapped {
+            assert_eq!(l.spans[0].text, BLOCKQUOTE_PREFIX);
+            assert!(
+                matches!(l.meta, LineMeta::Heading { .. }),
+                "structural meta should be preserved on all wrapped lines"
+            );
+        }
+    }
+
+    #[test]
+    fn blockquote_short_line_passes_through() {
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: BLOCKQUOTE_PREFIX.to_string(),
+                    style: Style {
+                        fg: Some(Color::Rgb {
+                            r: 100,
+                            g: 100,
+                            b: 200,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                StyledSpan {
+                    text: "short".to_string(),
+                    style: Style::default(),
+                },
+            ],
+            meta: LineMeta::None,
+        };
+        let wrapped = wrap_lines(&[line], 80);
+        assert_eq!(wrapped.len(), 1);
     }
 }

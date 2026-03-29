@@ -7,7 +7,10 @@ use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthStr;
 
 use crate::diagram;
-use crate::style::{CodeBlockContent, DocumentInfo, Line, LineMeta, Style, StyledSpan};
+use crate::style::{
+    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, CodeBlockContent, DocumentInfo, Line, LineMeta,
+    Style, StyledSpan,
+};
 use crate::theme::Theme;
 
 struct Renderer<'a> {
@@ -179,7 +182,7 @@ impl<'a> Renderer<'a> {
             let mut spans = Vec::new();
             if self.in_blockquote {
                 spans.push(StyledSpan {
-                    text: "  ┃ ".to_string(),
+                    text: BLOCKQUOTE_PREFIX.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
                         ..Default::default()
@@ -200,7 +203,7 @@ impl<'a> Renderer<'a> {
         if self.in_blockquote {
             self.lines.push(Line {
                 spans: vec![StyledSpan {
-                    text: "  ┃".to_string(),
+                    text: BLOCKQUOTE_PREFIX_TRIMMED.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
                         ..Default::default()
@@ -810,6 +813,15 @@ impl<'a> Renderer<'a> {
             }
             Event::End(TagEnd::BlockQuote) => {
                 self.in_blockquote = false;
+                // Remove trailing bar-only empty line left by paragraph end
+                if let Some(last) = self.lines.last() {
+                    let is_bar_only = last.spans.len() == 1
+                        && (last.spans[0].text == BLOCKQUOTE_PREFIX_TRIMMED
+                            || last.spans[0].text == BLOCKQUOTE_PREFIX);
+                    if is_bar_only {
+                        self.lines.pop();
+                    }
+                }
                 self.push_empty_line();
             }
 
