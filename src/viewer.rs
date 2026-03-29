@@ -396,6 +396,13 @@ impl ViewerState {
         (self.rows as usize).saturating_sub(2)
     }
 
+    fn link_picker_visible_entries(&self) -> usize {
+        let count = self.link_entries.len();
+        let viewport = self.viewport();
+        let box_h = (count + 2).min(viewport.saturating_sub(4).max(3));
+        box_h.saturating_sub(2).max(1)
+    }
+
     fn max_offset(&self) -> usize {
         if self.slide_mode {
             return 0; // slides handle their own offset
@@ -1417,9 +1424,10 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
         return;
     }
 
-    let viewport = state.viewport();
-    let box_h = (count + 2).min(viewport.saturating_sub(4).max(3));
-    let visible_entries = box_h.saturating_sub(2).max(1);
+    // Clamp in case file reload shrunk the link list while picker is open
+    state.link_selected = state.link_selected.min(count - 1);
+
+    let visible_entries = state.link_picker_visible_entries();
 
     match code {
         KeyCode::Esc => {
@@ -1446,8 +1454,10 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
             state.link_selected = count.saturating_sub(1);
         }
         KeyCode::Enter => {
-            let url = state.link_entries[state.link_selected].url.clone();
-            dispatch_link(state, &url);
+            if let Some(entry) = state.link_entries.get(state.link_selected) {
+                let url = entry.url.clone();
+                dispatch_link(state, &url);
+            }
             state.mode = ViewMode::Normal;
         }
         _ => {}
@@ -2500,8 +2510,8 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
     let viewport = state.viewport();
 
     let box_w = (width * 2 / 3).max(30).min(width.saturating_sub(6));
-    let box_h = (entries.len() + 2).min(viewport.saturating_sub(4).max(3));
-    let visible_entries = box_h.saturating_sub(2).max(1);
+    let visible_entries = state.link_picker_visible_entries();
+    let box_h = visible_entries + 2;
     let x_off = (width.saturating_sub(box_w)) / 2;
     let y_off = (viewport.saturating_sub(box_h)) / 2 + 1;
 
