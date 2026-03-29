@@ -991,7 +991,12 @@ impl<'a> Renderer<'a> {
                 if self.in_image {
                     self.image_alt.push_str(&text);
                 } else if self.in_table {
-                    let style = self.current_style();
+                    let mut style = self.current_style();
+                    if self.in_link {
+                        style.fg = Some(self.theme.link);
+                        style.underline = true;
+                        style.link_url = Some(self.link_url.clone());
+                    }
                     self.table_cell_spans.push(StyledSpan {
                         text: text.to_string(),
                         style,
