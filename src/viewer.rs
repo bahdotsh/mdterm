@@ -451,8 +451,7 @@ impl ViewerState {
                 self.json_view = Some(crate::json::JsonViewState::new());
             }
             let jv = self.json_view.as_ref().unwrap();
-            match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded)
-            {
+            match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded) {
                 Ok((lines, doc_info, navigable)) => {
                     let jv = self.json_view.as_mut().unwrap();
                     jv.navigable = navigable;
@@ -1195,6 +1194,8 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
             | KeyCode::Right
             | KeyCode::Char('h')
             | KeyCode::Left
+            | KeyCode::Char('L')
+            | KeyCode::Char('H')
     );
     if !is_json_key {
         return false;
@@ -1256,9 +1257,7 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
                     jv.cursor_path_save = Some(path.clone());
                     jv.expanded.insert(path);
                     state.rebuild();
-                    if let Some(line) =
-                        state.json_view.as_ref().and_then(|j| j.cursor_line())
-                    {
+                    if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
                         let vp = state.viewport();
                         let max = state.max_offset();
                         if line < state.offset || line >= state.offset + vp {
@@ -1276,6 +1275,34 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
                     jv.cursor_path_save = Some(path.clone());
                     jv.expanded.remove(&path);
                     state.rebuild();
+                }
+            }
+            true
+        }
+        KeyCode::Char('L') => {
+            state
+                .json_view
+                .as_mut()
+                .unwrap()
+                .expand_all(&state.content);
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
+                }
+            }
+            true
+        }
+        KeyCode::Char('H') => {
+            state.json_view.as_mut().unwrap().collapse_all();
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
                 }
             }
             true
@@ -2549,6 +2576,72 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             Print("─".repeat(fill)),
             SetForegroundColor(theme.position),
             Print(&pos_label),
+            SetForegroundColor(theme.border),
+            Print("─╯"),
+            SetAttribute(Attribute::Reset),
+        )?;
+        return Ok(());
+    }
+
+    // JSON-specific status bar
+    if let Some(ref jv) = state.json_view {
+        let breadcrumb = jv.breadcrumb().unwrap_or_default();
+        let bc_label = if breadcrumb.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", breadcrumb)
+        };
+        let bc_len = bc_label.chars().count();
+
+        let node_label = if jv.navigable.is_empty() {
+            String::new()
+        } else {
+            format!(" {}/{} ", jv.cursor + 1, jv.navigable.len())
+        };
+        let node_len = node_label.chars().count();
+
+        let hint = " j/k navigate · Enter toggle · L expand all · H collapse all ";
+        let hint_len = hint.chars().count();
+        let needed = 4 + bc_len + node_len + hint_len;
+        let (show_hint, fill) = if width > needed {
+            (true, width - needed)
+        } else if width > 4 + bc_len + node_len {
+            (false, width - 4 - bc_len - node_len)
+        } else {
+            (false, width.saturating_sub(4 + node_len))
+        };
+
+        queue!(
+            stdout,
+            MoveTo(0, (viewport + 1) as u16),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.border),
+            Print("╰─"),
+        )?;
+        if !bc_label.is_empty() && width > 4 + bc_len + node_len {
+            queue!(
+                stdout,
+                SetForegroundColor(theme.h2),
+                Print(&bc_label),
+            )?;
+        }
+        if show_hint {
+            queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint))?;
+        }
+        queue!(
+            stdout,
+            SetForegroundColor(theme.border),
+            Print("─".repeat(fill)),
+        )?;
+        if !node_label.is_empty() {
+            queue!(
+                stdout,
+                SetForegroundColor(theme.position),
+                Print(&node_label),
+            )?;
+        }
+        queue!(
+            stdout,
             SetForegroundColor(theme.border),
             Print("─╯"),
             SetAttribute(Attribute::Reset),

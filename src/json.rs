@@ -120,7 +120,11 @@ fn render_parse_error(
                 StyledSpan {
                     text: num_str,
                     style: Style {
-                        fg: Some(if is_err { error_color } else { theme.line_number }),
+                        fg: Some(if is_err {
+                            error_color
+                        } else {
+                            theme.line_number
+                        }),
                         dim: !is_err,
                         ..Default::default()
                     },
@@ -776,12 +780,7 @@ impl<'a> JsonRenderer<'a> {
     }
 
     /// Index label with annotation: "  [N] (M items)"
-    fn emit_index_label_with_annotation(
-        &mut self,
-        index: usize,
-        annotation: &str,
-        depth: usize,
-    ) {
+    fn emit_index_label_with_annotation(&mut self, index: usize, annotation: &str, depth: usize) {
         let indent = indent_str(depth);
         self.push_line(
             vec![
@@ -946,6 +945,37 @@ impl JsonViewState {
         if self.cursor >= self.navigable.len() {
             self.cursor = self.navigable.len().saturating_sub(1);
         }
+    }
+
+    /// Expand every expandable node in the entire document.
+    pub fn expand_all(&mut self, json_src: &str) {
+        if let Some(nav) = self.navigable.get(self.cursor) {
+            self.cursor_path_save = Some(nav.path.clone());
+        }
+        if let Ok(root) = serde_json::from_str::<Value>(json_src) {
+            let mut paths = Vec::new();
+            collect_all_children(&root, "", &mut paths);
+            for p in paths {
+                self.expanded.insert(p);
+            }
+        }
+    }
+
+    /// Collapse every expanded node in the document.
+    pub fn collapse_all(&mut self) {
+        if let Some(nav) = self.navigable.get(self.cursor) {
+            self.cursor_path_save = Some(nav.path.clone());
+        }
+        self.expanded.clear();
+    }
+
+    /// Format the current cursor path as a breadcrumb string (e.g., "data > users > [0]").
+    pub fn breadcrumb(&self) -> Option<String> {
+        let path = self.cursor_path()?;
+        if path.is_empty() {
+            return Some("root".to_string());
+        }
+        Some(format_breadcrumb(path))
     }
 }
 
@@ -1115,11 +1145,7 @@ impl<'a> CardRenderer<'a> {
         }
     }
 
-    fn render_object_content(
-        &mut self,
-        map: &serde_json::Map<String, Value>,
-        parent_path: &str,
-    ) {
+    fn render_object_content(&mut self, map: &serde_json::Map<String, Value>, parent_path: &str) {
         let (simple, sections) = group_entries(map);
 
         if !simple.is_empty() {
@@ -1186,13 +1212,7 @@ impl<'a> CardRenderer<'a> {
                     Value::Array(inner) if !inner.is_empty() => {
                         let summary = format!("{} items", inner.len());
                         let is_expanded = self.expanded.contains(&item_path);
-                        self.emit_toggle(
-                            &format!("[{}]", i),
-                            &summary,
-                            is_expanded,
-                            0,
-                            &item_path,
-                        );
+                        self.emit_toggle(&format!("[{}]", i), &summary, is_expanded, 0, &item_path);
                         if is_expanded {
                             self.open_card();
                             self.render_array_content(inner, &item_path);
@@ -1239,7 +1259,9 @@ impl<'a> CardRenderer<'a> {
             })
             .collect();
 
-        let available = self.card_width(self.nesting.saturating_sub(1)).saturating_sub(8);
+        let available = self
+            .card_width(self.nesting.saturating_sub(1))
+            .saturating_sub(8);
 
         let mut col_widths: Vec<usize> = headers
             .iter()
@@ -1567,7 +1589,9 @@ impl<'a> CardRenderer<'a> {
     }
 }
 
-fn group_entries(map: &serde_json::Map<String, Value>) -> (Vec<(&String, &Value)>, Vec<(&String, &Value)>) {
+fn group_entries(
+    map: &serde_json::Map<String, Value>,
+) -> (Vec<(&String, &Value)>, Vec<(&String, &Value)>) {
     let mut simple = Vec::new();
     let mut sections = Vec::new();
     for (key, val) in map {
@@ -1701,5 +1725,155 @@ fn cell_color(text: &str, theme: &Theme) -> Color {
         theme.json_number
     } else {
         theme.json_string
+    }
+}
+
+/// Walk all nested objects/arrays and collect their paths.
+fn collect_all_children(val: &Value, prefix: &str, out: &mut Vec<String>) {
+    match val {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                if !is_primitive_or_empty(child) {
+                    out.push(child_path.clone());
+                    collect_all_children(child, &child_path, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for (i, child) in arr.iter().enumerate() {
+                let child_path = format!("{}[{}]", prefix, i);
+                if !is_primitive_or_empty(child) {
+                    out.push(child_path.clone());
+                    collect_all_children(child, &child_path, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+enum PathSegment {
+    Key(String),
+    Index(usize),
+}
+
+fn parse_path_segments(path: &str) -> Vec<PathSegment> {
+    let mut segments = Vec::new();
+    let mut rest = path;
+    while !rest.is_empty() {
+        if rest.starts_with('[') {
+            // Array index: [N]
+            if let Some(end) = rest.find(']') {
+                if let Ok(idx) = rest[1..end].parse::<usize>() {
+                    segments.push(PathSegment::Index(idx));
+                }
+                rest = &rest[end + 1..];
+                if rest.starts_with('.') {
+                    rest = &rest[1..];
+                }
+            } else {
+                break;
+            }
+        } else {
+            // Key: up to next '.' or '['
+            let end = rest
+                .find(['.', '['])
+                .unwrap_or(rest.len());
+            segments.push(PathSegment::Key(rest[..end].to_string()));
+            rest = &rest[end..];
+            if rest.starts_with('.') {
+                rest = &rest[1..];
+            }
+        }
+    }
+    segments
+}
+
+/// Format a path string as a breadcrumb: "data.users[0]" → "data > users > [0]"
+fn format_breadcrumb(path: &str) -> String {
+    let segments = parse_path_segments(path);
+    let parts: Vec<String> = segments
+        .iter()
+        .map(|s| match s {
+            PathSegment::Key(k) => k.clone(),
+            PathSegment::Index(i) => format!("[{}]", i),
+        })
+        .collect();
+    parts.join(" > ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_all_expands_entire_document() {
+        let json = r#"{"a":1,"nested":{"b":2,"deep":{"c":3}}}"#;
+        let theme = crate::theme::Theme::dark();
+
+        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let mut state = JsonViewState::new();
+        state.navigable = nav;
+        state.expand_all(json);
+
+        // Should expand everything in the document, not just cursor's subtree
+        assert!(state.expanded.contains("nested"));
+        assert!(state.expanded.contains("nested.deep"));
+    }
+
+    #[test]
+    fn expand_all_with_arrays() {
+        let json = r#"{"items":[{"id":1,"sub":{"x":true}},{"id":2}]}"#;
+        let theme = crate::theme::Theme::dark();
+
+        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let mut state = JsonViewState::new();
+        state.navigable = nav;
+        state.expand_all(json);
+
+        assert!(state.expanded.contains("items"));
+        assert!(state.expanded.contains("items[0]"));
+        assert!(state.expanded.contains("items[0].sub"));
+        assert!(state.expanded.contains("items[1]"));
+    }
+
+    #[test]
+    fn collapse_all_clears_everything() {
+        let json = r#"{"a":1,"nested":{"b":2,"deep":{"c":3}}}"#;
+        let theme = crate::theme::Theme::dark();
+
+        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let mut state = JsonViewState::new();
+        state.navigable = nav;
+        state.expand_all(json);
+        assert!(!state.expanded.is_empty());
+
+        // Re-render with expanded state
+        let (_, _, nav2) = render_interactive(json, 80, &theme, &state.expanded).unwrap();
+        state.navigable = nav2;
+        state.restore_cursor();
+
+        state.collapse_all();
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
+    fn breadcrumb_formats_path() {
+        assert_eq!(format_breadcrumb("config"), "config");
+        assert_eq!(format_breadcrumb("config.theme"), "config > theme");
+        assert_eq!(
+            format_breadcrumb("config.theme.colors"),
+            "config > theme > colors"
+        );
+        assert_eq!(format_breadcrumb("items[0]"), "items > [0]");
+        assert_eq!(
+            format_breadcrumb("items[0].name"),
+            "items > [0] > name"
+        );
     }
 }
