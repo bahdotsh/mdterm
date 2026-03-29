@@ -202,6 +202,12 @@ graph TD
 | Row 2 | L2 | C2 | R2 |
 | Row 3 | L3 | C3 | R3 |
 
+| Links in Tables | URL |
+|-----------------|-----|
+| Internal anchor | [Jump to Math](#math-rendering) |
+| External link | [Crates.io](https://crates.io) |
+| Another external | [Docs.rs](https://docs.rs) |
+
 ## Horizontal Rules (slide separators in `--slides` mode)
 
 Content above the rule.
