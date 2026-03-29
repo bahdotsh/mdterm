@@ -452,10 +452,18 @@ impl ViewerState {
             }
             let jv = self.json_view.as_ref().unwrap();
             if jv.diagram_mode {
-                match crate::json::render_diagram(&self.content, cw, &self.theme) {
-                    Ok((lines, doc_info)) => {
+                let cursor_path = jv.cursor_path().map(|s| s.to_string());
+                match crate::json::render_diagram(
+                    &self.content,
+                    cw,
+                    &self.theme,
+                    &jv.expanded,
+                    cursor_path.as_deref(),
+                ) {
+                    Ok((lines, doc_info, navigable)) => {
                         let jv = self.json_view.as_mut().unwrap();
-                        jv.navigable.clear();
+                        jv.navigable = navigable;
+                        jv.restore_cursor();
                         (lines, doc_info)
                     }
                     Err(_) => {
@@ -1218,11 +1226,6 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         return true;
     }
 
-    // In diagram mode, skip interactive navigation keys — let normal scroll handle them
-    if state.json_view.as_ref().is_some_and(|jv| jv.diagram_mode) {
-        return false;
-    }
-
     // Pre-check: is this a JSON navigation key?
     let is_json_key = matches!(
         code,
@@ -1256,8 +1259,19 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             let jv = state.json_view.as_mut().unwrap();
+            let is_diagram = jv.diagram_mode;
             jv.move_cursor(1);
-            if let Some(line) = jv.cursor_line() {
+            if is_diagram {
+                // Diagram mode: cursor highlight is baked into the canvas,
+                // so we must rebuild. Save cursor path so restore_cursor finds it.
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+                let saved_offset = state.offset;
+                state.rebuild();
+                state.offset = saved_offset;
+            }
+            if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
                 if line >= state.offset + viewport {
                     state.offset = line.saturating_sub(viewport / 2);
                 } else if line < state.offset {
@@ -1269,8 +1283,17 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         }
         KeyCode::Char('k') | KeyCode::Up => {
             let jv = state.json_view.as_mut().unwrap();
+            let is_diagram = jv.diagram_mode;
             jv.move_cursor(-1);
-            if let Some(line) = jv.cursor_line() {
+            if is_diagram {
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+                let saved_offset = state.offset;
+                state.rebuild();
+                state.offset = saved_offset;
+            }
+            if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
                 if line < state.offset {
                     state.offset = line;
                 } else if line >= state.offset + viewport {
@@ -2631,7 +2654,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
         };
         let bc_len = bc_label.chars().count();
 
-        let node_label = if jv.diagram_mode || jv.navigable.is_empty() {
+        let node_label = if jv.navigable.is_empty() {
             String::new()
         } else {
             format!(" {}/{} ", jv.cursor + 1, jv.navigable.len())
@@ -2639,7 +2662,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
         let node_len = node_label.chars().count();
 
         let hint = if jv.diagram_mode {
-            " D card view · scroll to navigate "
+            " j/k navigate · Enter toggle · H/L collapse/expand all · D card view "
         } else {
             " j/k navigate · Enter toggle · H/L collapse/expand all · D tree view "
         };

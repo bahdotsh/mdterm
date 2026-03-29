@@ -1810,63 +1810,97 @@ fn format_breadcrumb(path: &str) -> String {
 
 // ── Diagram view ──────────────────────────────────────────────────
 
-/// Maximum tree depth rendered in the diagram.
-const DIAGRAM_MAX_DEPTH: usize = 3;
 /// Maximum children shown per node before truncating with "+N more".
 const DIAGRAM_MAX_SIBLINGS: usize = 8;
 
 /// A node in the JSON tree for diagram rendering.
 struct DiagramNode {
     id: String,
+    /// Card-explorer-compatible path for expand/collapse state.
+    nav_path: String,
     label: String,
     shape: crate::diagram::NodeShape,
     children: Vec<String>, // child node ids
+    /// Whether this node can be expanded (is a non-empty container).
+    expandable: bool,
 }
 
-/// Build diagram nodes from a JSON value, walking recursively up to max_depth.
+/// Build diagram nodes from a JSON value, expanding nodes present in `expanded`.
+///
+/// `node_id` is a display-unique identifier for the diagram (e.g. "root", "root/config").
+/// `path` is the expand/collapse path that matches card-explorer conventions
+/// (e.g. "", "config", "config.theme", "[0]").
 fn build_diagram_nodes(
     value: &Value,
     node_id: &str,
+    path: &str,
     label: &str,
-    depth: usize,
+    is_root: bool,
     nodes: &mut Vec<DiagramNode>,
+    expanded: &HashSet<String>,
 ) {
     use crate::diagram::NodeShape;
 
-    let (shape, children_iter): (NodeShape, Vec<(&str, &Value, String)>) = match value {
-        Value::Object(map) => {
-            let kids: Vec<_> = map
-                .iter()
-                .map(|(k, v)| (k.as_str(), v, format!("{}.{}", node_id, k)))
-                .collect();
-            (NodeShape::Rounded, kids)
-        }
-        Value::Array(arr) => {
-            let kids: Vec<_> = arr
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let lbl: &str = ""; // placeholder, real label built below
-                    let _ = lbl;
-                    (lbl, v, format!("{}[{}]", node_id, i))
-                })
-                .collect();
-            (NodeShape::Rectangle, kids)
-        }
+    let (shape, is_obj) = match value {
+        Value::Object(_) => (NodeShape::Rounded, true),
+        Value::Array(_) => (NodeShape::Rectangle, false),
         _ => {
-            // Leaf node
             nodes.push(DiagramNode {
                 id: node_id.to_string(),
+                nav_path: path.to_string(),
                 label: label.to_string(),
                 shape: NodeShape::Rectangle,
                 children: Vec::new(),
+                expandable: false,
             });
             return;
         }
     };
 
+    // Root is always expanded; other nodes check the `expanded` set using
+    // the card-explorer path format.
+    let is_expanded = is_root || expanded.contains(path);
+
+    if !is_expanded {
+        nodes.push(DiagramNode {
+            id: node_id.to_string(),
+            nav_path: path.to_string(),
+            label: label.to_string(),
+            shape,
+            children: Vec::new(),
+            expandable: true,
+        });
+        return;
+    }
+
+    // Build children list
+    let children_meta: Vec<(String, String, String, &Value)> = if is_obj {
+        let map = value.as_object().unwrap();
+        map.iter()
+            .map(|(k, v)| {
+                let child_id = format!("{}/{}", node_id, k);
+                let child_path = if path.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{}.{}", path, k)
+                };
+                (child_id, child_path, k.to_string(), v)
+            })
+            .collect()
+    } else {
+        let arr = value.as_array().unwrap();
+        arr.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let child_id = format!("{}[{}]", node_id, i);
+                let child_path = format!("{}[{}]", path, i);
+                (child_id, child_path, format!("[{}]", i), v)
+            })
+            .collect()
+    };
+
     let mut child_ids = Vec::new();
-    let total = children_iter.len();
+    let total = children_meta.len();
     let truncated = total > DIAGRAM_MAX_SIBLINGS;
     let show_count = if truncated {
         DIAGRAM_MAX_SIBLINGS
@@ -1874,69 +1908,48 @@ fn build_diagram_nodes(
         total
     };
 
-    for (i, (_key, child_val, child_id)) in children_iter.iter().enumerate() {
+    for (i, (child_id, child_path, key_label, child_val)) in children_meta.iter().enumerate() {
         if i >= show_count {
             break;
         }
-        let child_label = match value {
-            Value::Object(_) => {
-                // Extract the key name from the child_id
-                let key = child_id.rsplit('.').next().unwrap_or(child_id);
-                match child_val {
-                    Value::Object(m) if !m.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
-                        key.to_string()
-                    }
-                    Value::Object(m) if !m.is_empty() => {
-                        format!("{} {{{}}}", key, m.len())
-                    }
-                    Value::Array(a) if !a.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
-                        key.to_string()
-                    }
-                    Value::Array(a) if !a.is_empty() => {
-                        format!("{} [{}]", key, a.len())
-                    }
-                    _ => {
-                        let val_str = format_primitive_short(child_val);
-                        format!("{}: {}", key, val_str)
-                    }
-                }
+        let is_container = !is_primitive_or_empty(child_val);
+        let child_expanded = expanded.contains(child_path.as_str());
+
+        let child_label = match child_val {
+            Value::Object(m) if !m.is_empty() && child_expanded => key_label.clone(),
+            Value::Object(m) if !m.is_empty() => format!("{} {{{}}}", key_label, m.len()),
+            Value::Array(a) if !a.is_empty() && child_expanded => key_label.clone(),
+            Value::Array(a) if !a.is_empty() => format!("{} [{}]", key_label, a.len()),
+            _ => {
+                let val_str = format_primitive_short(child_val);
+                format!("{}: {}", key_label, val_str)
             }
-            Value::Array(_) => match child_val {
-                Value::Object(m) if !m.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
-                    format!("[{}]", i)
-                }
-                Value::Object(m) if !m.is_empty() => {
-                    format!("[{}] {{{}}}", i, m.len())
-                }
-                Value::Array(a) if !a.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
-                    format!("[{}]", i)
-                }
-                Value::Array(a) if !a.is_empty() => {
-                    format!("[{}] [{}]", i, a.len())
-                }
-                _ => {
-                    let val_str = format_primitive_short(child_val);
-                    format!("[{}]: {}", i, val_str)
-                }
-            },
-            _ => unreachable!(),
         };
 
         child_ids.push(child_id.clone());
 
-        if depth + 1 < DIAGRAM_MAX_DEPTH && !is_primitive_or_empty(child_val) {
-            build_diagram_nodes(child_val, child_id, &child_label, depth + 1, nodes);
+        if is_container {
+            build_diagram_nodes(
+                child_val,
+                child_id,
+                child_path,
+                &child_label,
+                false,
+                nodes,
+                expanded,
+            );
         } else {
-            let child_shape = match child_val {
-                Value::Object(_) => NodeShape::Rounded,
-                Value::Array(_) => NodeShape::Rectangle,
-                _ => NodeShape::Rectangle,
-            };
             nodes.push(DiagramNode {
                 id: child_id.clone(),
+                nav_path: child_path.clone(),
                 label: child_label,
-                shape: child_shape,
+                shape: match child_val {
+                    Value::Object(_) => NodeShape::Rounded,
+                    Value::Array(_) => NodeShape::Rectangle,
+                    _ => NodeShape::Rectangle,
+                },
                 children: Vec::new(),
+                expandable: false,
             });
         }
     }
@@ -1947,17 +1960,21 @@ fn build_diagram_nodes(
         child_ids.push(more_id.clone());
         nodes.push(DiagramNode {
             id: more_id,
+            nav_path: String::new(),
             label: more_label,
             shape: NodeShape::Rectangle,
             children: Vec::new(),
+            expandable: false,
         });
     }
 
     nodes.push(DiagramNode {
         id: node_id.to_string(),
+        nav_path: path.to_string(),
         label: label.to_string(),
         shape,
         children: child_ids,
+        expandable: !is_root,
     });
 }
 
@@ -1984,21 +2001,27 @@ pub fn render_diagram(
     input: &str,
     width: usize,
     theme: &Theme,
-) -> Result<(Vec<Line>, DocumentInfo), String> {
+    expanded: &HashSet<String>,
+    cursor_path: Option<&str>,
+) -> Result<(Vec<Line>, DocumentInfo, Vec<NavItem>), String> {
     use crate::diagram::{Canvas, NodeLayout, NodeShape, label_box_width};
 
     let value: Value =
         serde_json::from_str(input).map_err(|e| format!("JSON parse error: {}", e))?;
 
-    // Build the root label
-    let root_label = match &value {
-        Value::Object(m) => format!("root {{{}}}", m.len()),
-        Value::Array(a) => format!("root [{}]", a.len()),
-        _ => "root".to_string(),
-    };
+    // Root is always expanded in diagram mode, so just show "root"
+    let root_label = "root".to_string();
 
     let mut all_nodes = Vec::new();
-    build_diagram_nodes(&value, "root", &root_label, 0, &mut all_nodes);
+    build_diagram_nodes(
+        &value,
+        "root",
+        "",
+        &root_label,
+        true,
+        &mut all_nodes,
+        expanded,
+    );
 
     if all_nodes.is_empty() {
         return Ok((
@@ -2006,6 +2029,7 @@ pub fn render_diagram(
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
+            Vec::new(),
         ));
     }
 
@@ -2044,6 +2068,7 @@ pub fn render_diagram(
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
+            Vec::new(),
         ));
     }
 
@@ -2114,9 +2139,11 @@ pub fn render_diagram(
             let more_idx = all_nodes.len();
             all_nodes.push(DiagramNode {
                 id: format!("_more_{}", layer_idx),
+                nav_path: String::new(),
                 label: more_label.clone(),
                 shape: more_shape,
                 children: Vec::new(),
+                expandable: false,
             });
             node_widths.push(label_box_width(&more_label, more_shape));
             layer.push(more_idx);
@@ -2134,6 +2161,7 @@ pub fn render_diagram(
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
+            Vec::new(),
         ));
     }
 
@@ -2152,6 +2180,7 @@ pub fn render_diagram(
     let mut positions: Vec<Option<NodeLayout>> = vec![None; all_nodes.len()];
 
     let border_fg = Some(theme.code_border);
+    let cursor_border_fg = Some(theme.link);
     let text_fg = Some(theme.fg);
     let canvas_center = canvas_width / 2;
 
@@ -2175,10 +2204,21 @@ pub fn render_diagram(
             let cx = (canvas_center as isize + centers[i] as isize - layer_center as isize)
                 .max(w as isize / 2) as usize;
 
-            // Pick color based on node type
-            let node_fg = match all_nodes[idx].shape {
-                NodeShape::Rounded => Some(theme.json_key),
-                _ => text_fg,
+            let is_cursor = cursor_path.is_some_and(|cp| cp == all_nodes[idx].nav_path);
+
+            // Pick color — highlight cursor node with a distinct border
+            let node_border = if is_cursor {
+                cursor_border_fg
+            } else {
+                border_fg
+            };
+            let node_fg = if is_cursor {
+                cursor_border_fg
+            } else {
+                match all_nodes[idx].shape {
+                    NodeShape::Rounded => Some(theme.json_key),
+                    _ => text_fg,
+                }
             };
 
             canvas.draw_node(
@@ -2187,7 +2227,7 @@ pub fn render_diagram(
                 w,
                 &all_nodes[idx].label,
                 all_nodes[idx].shape,
-                border_fg,
+                node_border,
                 node_fg,
             );
 
@@ -2287,6 +2327,9 @@ pub fn render_diagram(
         meta: LineMeta::None,
     });
 
+    // The canvas content starts at line index 2 (top border + spacer)
+    let canvas_line_offset = lines.len();
+
     // Content rows
     for row_spans in &rows {
         let row_text: String = row_spans.iter().map(|s| s.text.as_str()).collect();
@@ -2351,11 +2394,30 @@ pub fn render_diagram(
         meta: LineMeta::None,
     });
 
+    // Build navigable items from expandable nodes, ordered by visual position.
+    // Use the label row (top_y + 1) mapped to the output line index.
+    let mut navigable: Vec<NavItem> = Vec::new();
+    // Collect in layer order (BFS order) so navigation follows visual top-to-bottom
+    for layer in &layers {
+        for &idx in layer {
+            if all_nodes[idx].expandable
+                && let Some(ref pos) = positions[idx]
+            {
+                let line_index = canvas_line_offset + pos.top_y + 1; // label row
+                navigable.push(NavItem {
+                    line_index,
+                    path: all_nodes[idx].nav_path.clone(),
+                });
+            }
+        }
+    }
+
     Ok((
         lines,
         DocumentInfo {
             code_blocks: Vec::new(),
         },
+        navigable,
     ))
 }
 
