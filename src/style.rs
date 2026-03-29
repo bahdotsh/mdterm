@@ -36,6 +36,12 @@ pub enum LineMeta {
     ListItem {
         list_id: usize,
     },
+    TaskItem {
+        list_id: usize,
+        checked: bool,
+        /// Byte offset of the `[` in `[ ]`/`[x]` in the source markdown.
+        bracket_offset: usize,
+    },
     SlideBreak,
     #[allow(dead_code)]
     Image {
@@ -123,7 +129,7 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
             // Other types only propagate to the first line.
             let propagate_all = matches!(
                 line.meta,
-                LineMeta::ListItem { .. } | LineMeta::Heading { .. }
+                LineMeta::ListItem { .. } | LineMeta::TaskItem { .. } | LineMeta::Heading { .. }
             );
             if propagate_all {
                 for w in &mut wrapped {

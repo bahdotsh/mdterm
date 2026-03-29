@@ -165,12 +165,23 @@ graph TD
 - [x] Code block copy (`c` key)
 - [x] Regex search (`/` with patterns)
 - [x] Scrollbar
-- [x] Mermaid/diagram detection
+- [ ] Mermaid/diagram detection
 - [x] Slide mode (`--slides`)
 - [x] HTML export (`--export html`)
 - [x] Fuzzy heading search (`:` key)
 - [x] Math rendering (LaTeX to Unicode)
 - [ ] Even more features to come!
+
+## Checkboxes
+
+- [x] Buy groceries
+- [x] Write documentation
+- [x] Fix login bug
+- [ ] Review pull request
+- [x] Set up CI/CD pipeline
+- [x] Update dependencies
+- [ ] Schedule team meeting
+- [x] Deploy to staging
 
 ## Blockquotes
 

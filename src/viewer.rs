@@ -433,6 +433,13 @@ impl ViewerState {
     }
 
     fn rebuild(&mut self) {
+        // Save the scroll position before re-rendering.  finalize_layout()
+        // adjusts the offset for image-row expansion, but when called from
+        // rebuild() the offset was already correct for the previous layout's
+        // expanded images — the delta would be double-counted.  Restoring
+        // and clamping preserves the user's scroll position.
+        let saved_offset = self.offset;
+
         let cw = self.content_width();
         let (lines, doc_info) = crate::markdown::render_with(
             &self.content,
@@ -445,7 +452,12 @@ impl ViewerState {
         // doesn't introduce artificial newlines within a single list item.
         self.list_contents.clear();
         for line in &lines {
-            if let LineMeta::ListItem { list_id } = line.meta {
+            let list_id_opt = match line.meta {
+                LineMeta::ListItem { list_id } => Some(list_id),
+                LineMeta::TaskItem { list_id, .. } => Some(list_id),
+                _ => None,
+            };
+            if let Some(list_id) = list_id_opt {
                 let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
                 let entry = self.list_contents.entry(list_id).or_default();
                 if !entry.is_empty() {
@@ -478,6 +490,7 @@ impl ViewerState {
         self.image_cache.queue_all_pre_renders(cw, bg);
 
         self.finalize_layout();
+        self.offset = saved_offset.min(self.max_offset());
         self.dirty = true;
     }
 
@@ -738,6 +751,52 @@ impl ViewerState {
             .unwrap_or_default()
     }
 
+    /// Toggle a task list checkbox using the byte offset of `[` recorded
+    /// by pulldown-cmark during rendering.  This avoids re-parsing the
+    /// source and guarantees the toggled position matches the parser's view.
+    fn toggle_task(&mut self, bracket_offset: usize, currently_checked: bool) {
+        let content = self.content.as_bytes();
+
+        // Validate that the offset still points at a [?] checkbox pattern.
+        if bracket_offset + 2 >= content.len()
+            || content[bracket_offset] != b'['
+            || content[bracket_offset + 2] != b']'
+        {
+            return;
+        }
+
+        let check_byte = content[bracket_offset + 1];
+        let (replacement, original) = match check_byte {
+            b'x' => ("[ ]", "[x]"),
+            b'X' => ("[ ]", "[X]"),
+            b' ' => ("[x]", "[ ]"),
+            _ => return,
+        };
+
+        self.content
+            .replace_range(bracket_offset..bracket_offset + 3, replacement);
+
+        // Write back to file if sourced from a file.
+        let path = &self.files[self.current_file_idx];
+        if !path.is_empty()
+            && std::path::Path::new(path).exists()
+            && std::fs::write(path, &self.content).is_err()
+        {
+            self.content
+                .replace_range(bracket_offset..bracket_offset + 3, original);
+            self.set_toast("Write failed");
+            return;
+        }
+
+        self.rebuild();
+        let label = if currently_checked {
+            "Unchecked"
+        } else {
+            "Checked"
+        };
+        self.set_toast(label);
+    }
+
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
     fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
         if term_row < 1 {
@@ -756,7 +815,10 @@ impl ViewerState {
         self.wrapped.get(line_idx).is_some_and(|l| {
             matches!(
                 l.meta,
-                LineMeta::CodeContent { .. } | LineMeta::Heading { .. } | LineMeta::ListItem { .. }
+                LineMeta::CodeContent { .. }
+                    | LineMeta::Heading { .. }
+                    | LineMeta::ListItem { .. }
+                    | LineMeta::TaskItem { .. }
             )
         })
     }
@@ -1039,6 +1101,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                             if copy_to_clipboard(&text).is_ok() {
                                 state.set_toast("List copied");
                             }
+                        }
+                        LineMeta::TaskItem {
+                            checked,
+                            bracket_offset,
+                            ..
+                        } => {
+                            state.toggle_task(bracket_offset, checked);
                         }
                         _ => {}
                     }

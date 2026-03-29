@@ -39,6 +39,11 @@ struct Renderer<'a> {
     item_has_nested_list: bool,
     list_id: usize,
 
+    // Task list state
+    source: &'a str,
+    current_task_checked: Option<bool>,
+    current_task_bracket_pos: Option<usize>,
+
     // Table state
     in_table: bool,
     table_alignments: Vec<Alignment>,
@@ -73,6 +78,7 @@ enum ListKind {
 
 impl<'a> Renderer<'a> {
     fn new(
+        source: &'a str,
         width: usize,
         theme: &'a Theme,
         line_numbers: bool,
@@ -98,6 +104,9 @@ impl<'a> Renderer<'a> {
             list_stack: Vec::new(),
             item_has_nested_list: false,
             list_id: 0,
+            source,
+            current_task_checked: None,
+            current_task_bracket_pos: None,
             in_table: false,
             table_alignments: Vec::new(),
             table_head: Vec::new(),
@@ -693,7 +702,7 @@ impl<'a> Renderer<'a> {
         self.lines.push(make_rule("╰", "┴", "╯", &col_widths));
     }
 
-    fn process(&mut self, event: Event) {
+    fn process(&mut self, event: Event, source_range: std::ops::Range<usize>) {
         match event {
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
@@ -881,9 +890,18 @@ impl<'a> Renderer<'a> {
                 );
             }
             Event::End(TagEnd::Item) => {
-                self.flush_line_with_meta(LineMeta::ListItem {
-                    list_id: self.list_id,
-                });
+                let meta = if let Some(checked) = self.current_task_checked.take() {
+                    LineMeta::TaskItem {
+                        list_id: self.list_id,
+                        checked,
+                        bracket_offset: self.current_task_bracket_pos.take().unwrap_or(0),
+                    }
+                } else {
+                    LineMeta::ListItem {
+                        list_id: self.list_id,
+                    }
+                };
+                self.flush_line_with_meta(meta);
                 if self.list_stack.len() <= 1 && self.item_has_nested_list {
                     self.push_empty_line();
                 }
@@ -1079,6 +1097,22 @@ impl<'a> Renderer<'a> {
             }
 
             Event::TaskListMarker(checked) => {
+                // Strip the bullet ("• ") from the span that was just pushed
+                // by Event::Start(Tag::Item), keeping only the indentation.
+                if let Some(last) = self.current_spans.last_mut()
+                    && let Some(pos) = last.text.rfind("• ")
+                {
+                    last.text.truncate(pos);
+                }
+
+                // Record the byte offset of `[` in the source so toggle_task
+                // can modify the file at the exact position without re-parsing.
+                let bracket_pos = self.source[source_range.clone()]
+                    .find('[')
+                    .map(|p| source_range.start + p);
+                self.current_task_bracket_pos = bracket_pos;
+                self.current_task_checked = Some(checked);
+
                 let (marker, color) = if checked {
                     ("✓ ", self.theme.task_done)
                 } else {
@@ -1532,6 +1566,7 @@ pub fn render_with(
     syntect_res: &SyntectRes,
 ) -> (Vec<Line>, DocumentInfo) {
     let mut renderer = Renderer::new(
+        input,
         width,
         theme,
         line_numbers,
@@ -1547,8 +1582,8 @@ pub fn render_with(
 
     let parser = Parser::new_ext(input, options);
 
-    for event in parser {
-        renderer.process(event);
+    for (event, range) in parser.into_offset_iter() {
+        renderer.process(event, range);
     }
 
     renderer.flush_line();
