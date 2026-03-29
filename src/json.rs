@@ -895,6 +895,8 @@ pub struct JsonViewState {
     pub navigable: Vec<NavItem>,
     /// Path of the cursor before a rebuild, used to restore position.
     pub cursor_path_save: Option<String>,
+    /// When true, show a tree diagram instead of the card explorer.
+    pub diagram_mode: bool,
 }
 
 impl JsonViewState {
@@ -904,6 +906,7 @@ impl JsonViewState {
             cursor: 0,
             navigable: Vec::new(),
             cursor_path_save: None,
+            diagram_mode: false,
         }
     }
 
@@ -1781,9 +1784,7 @@ fn parse_path_segments(path: &str) -> Vec<PathSegment> {
             }
         } else {
             // Key: up to next '.' or '['
-            let end = rest
-                .find(['.', '['])
-                .unwrap_or(rest.len());
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
             segments.push(PathSegment::Key(rest[..end].to_string()));
             rest = &rest[end..];
             if rest.starts_with('.') {
@@ -1805,6 +1806,557 @@ fn format_breadcrumb(path: &str) -> String {
         })
         .collect();
     parts.join(" > ")
+}
+
+// ── Diagram view ──────────────────────────────────────────────────
+
+/// Maximum tree depth rendered in the diagram.
+const DIAGRAM_MAX_DEPTH: usize = 3;
+/// Maximum children shown per node before truncating with "+N more".
+const DIAGRAM_MAX_SIBLINGS: usize = 8;
+
+/// A node in the JSON tree for diagram rendering.
+struct DiagramNode {
+    id: String,
+    label: String,
+    shape: crate::diagram::NodeShape,
+    children: Vec<String>, // child node ids
+}
+
+/// Build diagram nodes from a JSON value, walking recursively up to max_depth.
+fn build_diagram_nodes(
+    value: &Value,
+    node_id: &str,
+    label: &str,
+    depth: usize,
+    nodes: &mut Vec<DiagramNode>,
+) {
+    use crate::diagram::NodeShape;
+
+    let (shape, children_iter): (NodeShape, Vec<(&str, &Value, String)>) = match value {
+        Value::Object(map) => {
+            let kids: Vec<_> = map
+                .iter()
+                .map(|(k, v)| (k.as_str(), v, format!("{}.{}", node_id, k)))
+                .collect();
+            (NodeShape::Rounded, kids)
+        }
+        Value::Array(arr) => {
+            let kids: Vec<_> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let lbl: &str = ""; // placeholder, real label built below
+                    let _ = lbl;
+                    (lbl, v, format!("{}[{}]", node_id, i))
+                })
+                .collect();
+            (NodeShape::Rectangle, kids)
+        }
+        _ => {
+            // Leaf node
+            nodes.push(DiagramNode {
+                id: node_id.to_string(),
+                label: label.to_string(),
+                shape: NodeShape::Rectangle,
+                children: Vec::new(),
+            });
+            return;
+        }
+    };
+
+    let mut child_ids = Vec::new();
+    let total = children_iter.len();
+    let truncated = total > DIAGRAM_MAX_SIBLINGS;
+    let show_count = if truncated {
+        DIAGRAM_MAX_SIBLINGS
+    } else {
+        total
+    };
+
+    for (i, (_key, child_val, child_id)) in children_iter.iter().enumerate() {
+        if i >= show_count {
+            break;
+        }
+        let child_label = match value {
+            Value::Object(_) => {
+                // Extract the key name from the child_id
+                let key = child_id.rsplit('.').next().unwrap_or(child_id);
+                match child_val {
+                    Value::Object(m) if !m.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
+                        key.to_string()
+                    }
+                    Value::Object(m) if !m.is_empty() => {
+                        format!("{} {{{}}}", key, m.len())
+                    }
+                    Value::Array(a) if !a.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
+                        key.to_string()
+                    }
+                    Value::Array(a) if !a.is_empty() => {
+                        format!("{} [{}]", key, a.len())
+                    }
+                    _ => {
+                        let val_str = format_primitive_short(child_val);
+                        format!("{}: {}", key, val_str)
+                    }
+                }
+            }
+            Value::Array(_) => match child_val {
+                Value::Object(m) if !m.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
+                    format!("[{}]", i)
+                }
+                Value::Object(m) if !m.is_empty() => {
+                    format!("[{}] {{{}}}", i, m.len())
+                }
+                Value::Array(a) if !a.is_empty() && depth + 1 < DIAGRAM_MAX_DEPTH => {
+                    format!("[{}]", i)
+                }
+                Value::Array(a) if !a.is_empty() => {
+                    format!("[{}] [{}]", i, a.len())
+                }
+                _ => {
+                    let val_str = format_primitive_short(child_val);
+                    format!("[{}]: {}", i, val_str)
+                }
+            },
+            _ => unreachable!(),
+        };
+
+        child_ids.push(child_id.clone());
+
+        if depth + 1 < DIAGRAM_MAX_DEPTH && !is_primitive_or_empty(child_val) {
+            build_diagram_nodes(child_val, child_id, &child_label, depth + 1, nodes);
+        } else {
+            let child_shape = match child_val {
+                Value::Object(_) => NodeShape::Rounded,
+                Value::Array(_) => NodeShape::Rectangle,
+                _ => NodeShape::Rectangle,
+            };
+            nodes.push(DiagramNode {
+                id: child_id.clone(),
+                label: child_label,
+                shape: child_shape,
+                children: Vec::new(),
+            });
+        }
+    }
+
+    if truncated {
+        let more_id = format!("{}_more", node_id);
+        let more_label = format!("+{} more", total - show_count);
+        child_ids.push(more_id.clone());
+        nodes.push(DiagramNode {
+            id: more_id,
+            label: more_label,
+            shape: NodeShape::Rectangle,
+            children: Vec::new(),
+        });
+    }
+
+    nodes.push(DiagramNode {
+        id: node_id.to_string(),
+        label: label.to_string(),
+        shape,
+        children: child_ids,
+    });
+}
+
+fn format_primitive_short(val: &Value) -> String {
+    match val {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => {
+            if s.len() > 16 {
+                format!("\"{}…\"", &s[..14])
+            } else {
+                format!("\"{}\"", s)
+            }
+        }
+        Value::Object(m) if m.is_empty() => "{}".to_string(),
+        Value::Array(a) if a.is_empty() => "[]".to_string(),
+        _ => "…".to_string(),
+    }
+}
+
+/// Render JSON as a top-down tree diagram using the Canvas from diagram.rs.
+pub fn render_diagram(
+    input: &str,
+    width: usize,
+    theme: &Theme,
+) -> Result<(Vec<Line>, DocumentInfo), String> {
+    use crate::diagram::{Canvas, NodeLayout, NodeShape, label_box_width};
+
+    let value: Value =
+        serde_json::from_str(input).map_err(|e| format!("JSON parse error: {}", e))?;
+
+    // Build the root label
+    let root_label = match &value {
+        Value::Object(m) => format!("root {{{}}}", m.len()),
+        Value::Array(a) => format!("root [{}]", a.len()),
+        _ => "root".to_string(),
+    };
+
+    let mut all_nodes = Vec::new();
+    build_diagram_nodes(&value, "root", &root_label, 0, &mut all_nodes);
+
+    if all_nodes.is_empty() {
+        return Ok((
+            Vec::new(),
+            DocumentInfo {
+                code_blocks: Vec::new(),
+            },
+        ));
+    }
+
+    // Build lookup: id → index
+    let id_to_idx: std::collections::HashMap<String, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.clone(), i))
+        .collect();
+
+    // Assign layers via BFS from root
+    let mut layers: Vec<Vec<usize>> = Vec::new();
+    let mut visited = HashSet::new();
+    if let Some(&root_idx) = id_to_idx.get("root") {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((root_idx, 0usize));
+        visited.insert(root_idx);
+        while let Some((idx, depth)) = queue.pop_front() {
+            while layers.len() <= depth {
+                layers.push(Vec::new());
+            }
+            layers[depth].push(idx);
+            for child_id in &all_nodes[idx].children {
+                if let Some(&child_idx) = id_to_idx.get(child_id)
+                    && visited.insert(child_idx)
+                {
+                    queue.push_back((child_idx, depth + 1));
+                }
+            }
+        }
+    }
+
+    if layers.is_empty() {
+        return Ok((
+            Vec::new(),
+            DocumentInfo {
+                code_blocks: Vec::new(),
+            },
+        ));
+    }
+
+    // Calculate node widths
+    let mut node_widths: Vec<usize> = all_nodes
+        .iter()
+        .map(|n| label_box_width(&n.label, n.shape))
+        .collect();
+
+    let node_height: usize = 3;
+    let edge_gap: usize = 4;
+    let h_gap: usize = 4;
+
+    // Trim layers to fit within the available terminal width
+    let max_content_width = width.saturating_sub(10).max(40);
+    let mut removed_ids: HashSet<String> = HashSet::new();
+
+    #[allow(clippy::needless_range_loop)]
+    for layer_idx in 0..layers.len() {
+        // Exclude nodes whose parents were removed (cascade)
+        if layer_idx > 0 {
+            let mut new_layer = Vec::new();
+            for &idx in &layers[layer_idx] {
+                let node_id = &all_nodes[idx].id;
+                let parent_removed = all_nodes
+                    .iter()
+                    .any(|pn| pn.children.contains(node_id) && removed_ids.contains(&pn.id));
+                if parent_removed {
+                    removed_ids.insert(node_id.clone());
+                } else {
+                    new_layer.push(idx);
+                }
+            }
+            layers[layer_idx] = new_layer;
+        }
+
+        // If this layer is too wide, truncate and add "+N more"
+        let layer = &mut layers[layer_idx];
+        let total_w: usize = layer.iter().map(|&i| node_widths[i]).sum::<usize>()
+            + layer.len().saturating_sub(1) * h_gap;
+
+        if total_w > max_content_width && layer.len() > 1 {
+            let more_placeholder_w = label_box_width("+99 more", NodeShape::Rectangle);
+            let target = max_content_width.saturating_sub(more_placeholder_w + h_gap);
+
+            let mut keep = 0;
+            let mut running_w: usize = 0;
+            for &idx in layer.iter() {
+                let nw = node_widths[idx];
+                let next_w = running_w + nw + if keep > 0 { h_gap } else { 0 };
+                if next_w > target && keep > 0 {
+                    break;
+                }
+                running_w = next_w;
+                keep += 1;
+            }
+            keep = keep.max(1);
+
+            let removed_count = layer.len() - keep;
+            for &idx in &layer[keep..] {
+                removed_ids.insert(all_nodes[idx].id.clone());
+            }
+            layer.truncate(keep);
+
+            // Add a "+N more" summary node
+            let more_label = format!("+{} more", removed_count);
+            let more_shape = NodeShape::Rectangle;
+            let more_idx = all_nodes.len();
+            all_nodes.push(DiagramNode {
+                id: format!("_more_{}", layer_idx),
+                label: more_label.clone(),
+                shape: more_shape,
+                children: Vec::new(),
+            });
+            node_widths.push(label_box_width(&more_label, more_shape));
+            layer.push(more_idx);
+        }
+    }
+
+    // Remove empty trailing layers
+    while layers.last().is_some_and(|l| l.is_empty()) {
+        layers.pop();
+    }
+
+    if layers.is_empty() {
+        return Ok((
+            Vec::new(),
+            DocumentInfo {
+                code_blocks: Vec::new(),
+            },
+        ));
+    }
+
+    // Find widest layer
+    let mut max_layer_width: usize = 0;
+    for layer in &layers {
+        let w: usize = layer.iter().map(|&i| node_widths[i]).sum::<usize>()
+            + layer.len().saturating_sub(1) * h_gap;
+        max_layer_width = max_layer_width.max(w);
+    }
+
+    let canvas_width = (max_layer_width + 6).max(20);
+    let canvas_height = layers.len() * (node_height + edge_gap) - edge_gap;
+
+    let mut canvas = Canvas::new(canvas_width, canvas_height);
+    let mut positions: Vec<Option<NodeLayout>> = vec![None; all_nodes.len()];
+
+    let border_fg = Some(theme.code_border);
+    let text_fg = Some(theme.fg);
+    let canvas_center = canvas_width / 2;
+
+    // Draw nodes layer by layer
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let y = layer_idx * (node_height + edge_gap);
+        let widths_in_layer: Vec<usize> = layer.iter().map(|&i| node_widths[i]).collect();
+        let layer_width: usize =
+            widths_in_layer.iter().sum::<usize>() + layer.len().saturating_sub(1) * h_gap;
+
+        let mut centers: Vec<usize> = Vec::new();
+        let mut cum = 0;
+        for &w in &widths_in_layer {
+            centers.push(cum + w / 2);
+            cum += w + h_gap;
+        }
+        let layer_center = if layer_width > 0 { layer_width / 2 } else { 0 };
+
+        for (i, &idx) in layer.iter().enumerate() {
+            let w = widths_in_layer[i];
+            let cx = (canvas_center as isize + centers[i] as isize - layer_center as isize)
+                .max(w as isize / 2) as usize;
+
+            // Pick color based on node type
+            let node_fg = match all_nodes[idx].shape {
+                NodeShape::Rounded => Some(theme.json_key),
+                _ => text_fg,
+            };
+
+            canvas.draw_node(
+                cx,
+                y,
+                w,
+                &all_nodes[idx].label,
+                all_nodes[idx].shape,
+                border_fg,
+                node_fg,
+            );
+
+            positions[idx] = Some(NodeLayout {
+                center_x: cx,
+                top_y: y,
+                width: w,
+            });
+        }
+    }
+
+    // Build a fresh id→index map (includes "+more" nodes added during trimming)
+    let full_id_map: std::collections::HashMap<&str, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+
+    // Draw edges
+    let edge_fg = Some(theme.code_border);
+    for (idx, node) in all_nodes.iter().enumerate() {
+        if let Some(ref src_pos) = positions[idx] {
+            for child_id in &node.children {
+                if let Some(&child_idx) = full_id_map.get(child_id.as_str())
+                    && let Some(ref dst_pos) = positions[child_idx]
+                {
+                    let src_bottom = src_pos.top_y + 2;
+                    let dst_top = dst_pos.top_y;
+                    canvas.draw_edge_td(
+                        src_pos.center_x,
+                        src_bottom,
+                        dst_pos.center_x,
+                        dst_top,
+                        None,
+                        edge_fg,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    // Convert canvas to styled span rows
+    let rows = canvas.to_span_rows(theme);
+
+    // Wrap in a bordered block (like emit_diagram_block in markdown.rs)
+    let block_label = "JSON (tree)";
+    let block_width = width.saturating_sub(4).max(20);
+    let bc = theme.code_border;
+    let bg = theme.code_bg;
+    let mut lines = Vec::new();
+
+    // Top border
+    let label_with_pad = format!(" {} ", block_label);
+    let label_len = label_with_pad.chars().count();
+    let fill = block_width.saturating_sub(2 + label_len);
+    lines.push(Line {
+        spans: vec![
+            StyledSpan {
+                text: "  \u{256d}\u{2500}".to_string(),
+                style: Style {
+                    fg: Some(bc),
+                    bg: Some(bg),
+                    ..Default::default()
+                },
+            },
+            StyledSpan {
+                text: label_with_pad,
+                style: Style {
+                    fg: Some(theme.code_label),
+                    bg: Some(bg),
+                    ..Default::default()
+                },
+            },
+            StyledSpan {
+                text: format!("{}\u{256e}", "\u{2500}".repeat(fill)),
+                style: Style {
+                    fg: Some(bc),
+                    bg: Some(bg),
+                    ..Default::default()
+                },
+            },
+        ],
+        meta: LineMeta::None,
+    });
+
+    // Empty line after header
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("  \u{2502}{}\u{2502}", " ".repeat(block_width - 2)),
+            style: Style {
+                fg: Some(bc),
+                bg: Some(bg),
+                ..Default::default()
+            },
+        }],
+        meta: LineMeta::None,
+    });
+
+    // Content rows
+    for row_spans in &rows {
+        let row_text: String = row_spans.iter().map(|s| s.text.as_str()).collect();
+        let row_width = UnicodeWidthStr::width(row_text.as_str());
+        let padding = block_width.saturating_sub(4 + row_width);
+
+        let mut spans = Vec::new();
+        spans.push(StyledSpan {
+            text: "  \u{2502} ".to_string(),
+            style: Style {
+                fg: Some(bc),
+                bg: Some(bg),
+                ..Default::default()
+            },
+        });
+        for s in row_spans {
+            spans.push(StyledSpan {
+                text: s.text.clone(),
+                style: Style {
+                    bg: Some(bg),
+                    ..s.style.clone()
+                },
+            });
+        }
+        spans.push(StyledSpan {
+            text: format!("{} \u{2502}", " ".repeat(padding)),
+            style: Style {
+                fg: Some(bc),
+                bg: Some(bg),
+                ..Default::default()
+            },
+        });
+        lines.push(Line {
+            spans,
+            meta: LineMeta::None,
+        });
+    }
+
+    // Empty line before footer
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("  \u{2502}{}\u{2502}", " ".repeat(block_width - 2)),
+            style: Style {
+                fg: Some(bc),
+                bg: Some(bg),
+                ..Default::default()
+            },
+        }],
+        meta: LineMeta::None,
+    });
+
+    // Bottom border
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("  \u{2570}{}\u{256f}", "\u{2500}".repeat(block_width - 2)),
+            style: Style {
+                fg: Some(bc),
+                bg: Some(bg),
+                ..Default::default()
+            },
+        }],
+        meta: LineMeta::None,
+    });
+
+    Ok((
+        lines,
+        DocumentInfo {
+            code_blocks: Vec::new(),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1871,9 +2423,6 @@ mod tests {
             "config > theme > colors"
         );
         assert_eq!(format_breadcrumb("items[0]"), "items > [0]");
-        assert_eq!(
-            format_breadcrumb("items[0].name"),
-            "items > [0] > name"
-        );
+        assert_eq!(format_breadcrumb("items[0].name"), "items > [0] > name");
     }
 }

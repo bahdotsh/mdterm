@@ -451,22 +451,43 @@ impl ViewerState {
                 self.json_view = Some(crate::json::JsonViewState::new());
             }
             let jv = self.json_view.as_ref().unwrap();
-            match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded) {
-                Ok((lines, doc_info, navigable)) => {
-                    let jv = self.json_view.as_mut().unwrap();
-                    jv.navigable = navigable;
-                    jv.restore_cursor();
-                    (lines, doc_info)
+            if jv.diagram_mode {
+                match crate::json::render_diagram(&self.content, cw, &self.theme) {
+                    Ok((lines, doc_info)) => {
+                        let jv = self.json_view.as_mut().unwrap();
+                        jv.navigable.clear();
+                        (lines, doc_info)
+                    }
+                    Err(_) => {
+                        self.json_view = None;
+                        crate::markdown::render_with(
+                            &self.content,
+                            cw,
+                            &self.theme,
+                            self.line_numbers,
+                            &self.syntect_res,
+                        )
+                    }
                 }
-                Err(_) => {
-                    self.json_view = None;
-                    crate::markdown::render_with(
-                        &self.content,
-                        cw,
-                        &self.theme,
-                        self.line_numbers,
-                        &self.syntect_res,
-                    )
+            } else {
+                match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded)
+                {
+                    Ok((lines, doc_info, navigable)) => {
+                        let jv = self.json_view.as_mut().unwrap();
+                        jv.navigable = navigable;
+                        jv.restore_cursor();
+                        (lines, doc_info)
+                    }
+                    Err(_) => {
+                        self.json_view = None;
+                        crate::markdown::render_with(
+                            &self.content,
+                            cw,
+                            &self.theme,
+                            self.line_numbers,
+                            &self.syntect_res,
+                        )
+                    }
                 }
             }
         } else {
@@ -1181,6 +1202,27 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
 
 /// Returns true if the key was consumed by JSON interactive navigation.
 fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
+    // Diagram mode toggle (always available for JSON)
+    if code == KeyCode::Char('D')
+        && let Some(ref mut jv) = state.json_view
+    {
+        jv.diagram_mode = !jv.diagram_mode;
+        let is_diagram = jv.diagram_mode;
+        state.offset = 0;
+        state.rebuild();
+        state.set_toast(if is_diagram {
+            "Tree diagram"
+        } else {
+            "Card explorer"
+        });
+        return true;
+    }
+
+    // In diagram mode, skip interactive navigation keys — let normal scroll handle them
+    if state.json_view.as_ref().is_some_and(|jv| jv.diagram_mode) {
+        return false;
+    }
+
     // Pre-check: is this a JSON navigation key?
     let is_json_key = matches!(
         code,
@@ -1280,11 +1322,7 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
             true
         }
         KeyCode::Char('L') => {
-            state
-                .json_view
-                .as_mut()
-                .unwrap()
-                .expand_all(&state.content);
+            state.json_view.as_mut().unwrap().expand_all(&state.content);
             state.rebuild();
             if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
                 let vp = state.viewport();
@@ -2586,21 +2624,25 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     // JSON-specific status bar
     if let Some(ref jv) = state.json_view {
         let breadcrumb = jv.breadcrumb().unwrap_or_default();
-        let bc_label = if breadcrumb.is_empty() {
+        let bc_label = if jv.diagram_mode || breadcrumb.is_empty() {
             String::new()
         } else {
             format!(" {} ", breadcrumb)
         };
         let bc_len = bc_label.chars().count();
 
-        let node_label = if jv.navigable.is_empty() {
+        let node_label = if jv.diagram_mode || jv.navigable.is_empty() {
             String::new()
         } else {
             format!(" {}/{} ", jv.cursor + 1, jv.navigable.len())
         };
         let node_len = node_label.chars().count();
 
-        let hint = " j/k navigate · Enter toggle · L expand all · H collapse all ";
+        let hint = if jv.diagram_mode {
+            " D card view · scroll to navigate "
+        } else {
+            " j/k navigate · Enter toggle · H/L collapse/expand all · D tree view "
+        };
         let hint_len = hint.chars().count();
         let needed = 4 + bc_len + node_len + hint_len;
         let (show_hint, fill) = if width > needed {
@@ -2619,11 +2661,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             Print("╰─"),
         )?;
         if !bc_label.is_empty() && width > 4 + bc_len + node_len {
-            queue!(
-                stdout,
-                SetForegroundColor(theme.h2),
-                Print(&bc_label),
-            )?;
+            queue!(stdout, SetForegroundColor(theme.h2), Print(&bc_label),)?;
         }
         if show_hint {
             queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint))?;

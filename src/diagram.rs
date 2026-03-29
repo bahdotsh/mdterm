@@ -12,7 +12,7 @@ enum Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum NodeShape {
+pub(crate) enum NodeShape {
     Rectangle,
     Rounded,
     Diamond,
@@ -260,10 +260,11 @@ fn parse_arrow(s: &str) -> Option<(Option<String>, &str)> {
 
 // ───── Layout ─────
 
-struct NodeLayout {
-    center_x: usize,
-    top_y: usize,
-    width: usize,
+#[derive(Clone)]
+pub(crate) struct NodeLayout {
+    pub(crate) center_x: usize,
+    pub(crate) top_y: usize,
+    pub(crate) width: usize,
 }
 
 fn assign_layers(graph: &Graph) -> Vec<Vec<String>> {
@@ -403,8 +404,12 @@ fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph) {
 }
 
 fn node_box_width(node: &Node) -> usize {
-    let label_width = node.label.chars().count();
-    let width = match node.shape {
+    label_box_width(&node.label, node.shape)
+}
+
+pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
+    let label_width = label.chars().count();
+    let width = match shape {
         NodeShape::Diamond => label_width + 6,
         _ => label_width + 4,
     };
@@ -413,12 +418,12 @@ fn node_box_width(node: &Node) -> usize {
 
 // ───── Canvas ─────
 
-const CONN_UP: u8 = 1;
-const CONN_DOWN: u8 = 2;
-const CONN_LEFT: u8 = 4;
-const CONN_RIGHT: u8 = 8;
+pub(crate) const CONN_UP: u8 = 1;
+pub(crate) const CONN_DOWN: u8 = 2;
+pub(crate) const CONN_LEFT: u8 = 4;
+pub(crate) const CONN_RIGHT: u8 = 8;
 
-fn junction_char(connects: u8) -> char {
+pub(crate) fn junction_char(connects: u8) -> char {
     match connects {
         c if c == CONN_UP | CONN_DOWN => '│',
         c if c == CONN_LEFT | CONN_RIGHT => '─',
@@ -440,11 +445,11 @@ fn junction_char(connects: u8) -> char {
 }
 
 #[derive(Clone)]
-struct CanvasCell {
-    ch: char,
-    fg: Option<Color>,
-    is_node: bool,
-    connects: u8,
+pub(crate) struct CanvasCell {
+    pub(crate) ch: char,
+    pub(crate) fg: Option<Color>,
+    pub(crate) is_node: bool,
+    pub(crate) connects: u8,
 }
 
 impl Default for CanvasCell {
@@ -458,14 +463,14 @@ impl Default for CanvasCell {
     }
 }
 
-struct Canvas {
-    width: usize,
-    height: usize,
+pub(crate) struct Canvas {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
     cells: Vec<Vec<CanvasCell>>,
 }
 
 impl Canvas {
-    fn new(width: usize, height: usize) -> Self {
+    pub(crate) fn new(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
@@ -473,14 +478,14 @@ impl Canvas {
         }
     }
 
-    fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    pub(crate) fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
         }
     }
 
-    fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    pub(crate) fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
@@ -488,7 +493,7 @@ impl Canvas {
         }
     }
 
-    fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
+    pub(crate) fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
         if y < self.height && x < self.width {
             let cell = &mut self.cells[y][x];
             if !cell.is_node {
@@ -502,7 +507,7 @@ impl Canvas {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_node(
+    pub(crate) fn draw_node(
         &mut self,
         cx: usize,
         y: usize,
@@ -551,7 +556,7 @@ impl Canvas {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_edge_td(
+    pub(crate) fn draw_edge_td(
         &mut self,
         src_cx: usize,
         src_bottom_y: usize,
@@ -721,7 +726,7 @@ impl Canvas {
         }
     }
 
-    fn to_span_rows(&self, theme: &Theme) -> Vec<Vec<StyledSpan>> {
+    pub(crate) fn to_span_rows(&self, theme: &Theme) -> Vec<Vec<StyledSpan>> {
         let bg = Some(theme.code_bg);
         self.cells
             .iter()
