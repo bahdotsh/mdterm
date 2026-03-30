@@ -629,6 +629,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "serde",
+ "serde_json",
  "syntect",
  "toml",
  "unicode-width",

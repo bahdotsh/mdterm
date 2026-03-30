@@ -321,6 +321,12 @@ struct ViewerState {
 
     // Navigation history for back navigation (file index + scroll offset)
     nav_history: Vec<(usize, usize)>,
+
+    // Interactive JSON explorer state
+    json_view: Option<crate::json::JsonViewState>,
+
+    // Cached parsed JSON value (avoids re-parsing on every rebuild)
+    cached_json: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -398,6 +404,8 @@ impl ViewerState {
             cursor_on_clickable: false,
             list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
+            json_view: None,
+            cached_json: None,
         }
     }
 
@@ -441,13 +449,68 @@ impl ViewerState {
         let saved_offset = self.offset;
 
         let cw = self.content_width();
-        let (lines, doc_info) = crate::markdown::render_with(
-            &self.content,
-            cw,
-            &self.theme,
-            self.line_numbers,
-            &self.syntect_res,
-        );
+        let (lines, doc_info) = if self.filename.ends_with(".json") {
+            // Parse once and cache
+            if self.cached_json.is_none() {
+                match serde_json::from_str(&self.content) {
+                    Ok(v) => self.cached_json = Some(v),
+                    Err(_) => {
+                        // Fall back to markdown rendering on parse error
+                        self.json_view = None;
+                        self.set_toast("Invalid JSON — showing as plain text");
+                    }
+                }
+            }
+
+            if let Some(ref value) = self.cached_json {
+                if self.json_view.is_none() {
+                    self.json_view = Some(crate::json::JsonViewState::new());
+                }
+                let jv = self.json_view.as_ref().unwrap();
+                if jv.diagram_mode {
+                    let cursor_path = jv.cursor_path().map(|s| s.to_string());
+                    let h_off = jv.h_offset;
+                    let (lines, doc_info, navigable, canvas_w) = crate::json::render_diagram(
+                        value,
+                        cw,
+                        &self.theme,
+                        &jv.expanded,
+                        cursor_path.as_deref(),
+                        h_off,
+                    );
+                    let jv = self.json_view.as_mut().unwrap();
+                    jv.navigable = navigable;
+                    jv.diagram_canvas_width = canvas_w;
+                    jv.restore_cursor();
+                    (lines, doc_info)
+                } else {
+                    let (lines, doc_info, navigable) =
+                        crate::json::render_interactive(value, cw, &self.theme, &jv.expanded);
+                    let jv = self.json_view.as_mut().unwrap();
+                    jv.navigable = navigable;
+                    jv.restore_cursor();
+                    (lines, doc_info)
+                }
+            } else {
+                self.json_view = None;
+                crate::markdown::render_with(
+                    &self.content,
+                    cw,
+                    &self.theme,
+                    self.line_numbers,
+                    &self.syntect_res,
+                )
+            }
+        } else {
+            self.json_view = None;
+            crate::markdown::render_with(
+                &self.content,
+                cw,
+                &self.theme,
+                self.line_numbers,
+                &self.syntect_res,
+            )
+        };
         // Pre-compute list content from pre-wrap lines so that word-wrapping
         // doesn't introduce artificial newlines within a single list item.
         self.list_contents.clear();
@@ -669,6 +732,7 @@ impl ViewerState {
             && new_content != self.content
         {
             self.content = new_content;
+            self.cached_json = None;
             self.rebuild();
             self.set_toast("File reloaded");
             reloaded = true;
@@ -707,6 +771,8 @@ impl ViewerState {
             self.content = c;
             self.offset = 0;
             self.search.clear();
+            self.json_view = None;
+            self.cached_json = None;
             self.current_slide = 0;
             self.rebuild();
             self.watch_current_file();
@@ -1147,12 +1213,360 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
     false
 }
 
+/// Returns true if the key was consumed by JSON interactive navigation.
+fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
+    // Diagram mode toggle (always available for JSON)
+    if code == KeyCode::Char('D')
+        && let Some(ref mut jv) = state.json_view
+    {
+        jv.diagram_mode = !jv.diagram_mode;
+        let is_diagram = jv.diagram_mode;
+        jv.h_offset = 0;
+        state.offset = 0;
+        state.rebuild();
+        state.set_toast(if is_diagram {
+            "Graph view"
+        } else {
+            "Card explorer"
+        });
+        return true;
+    }
+
+    // Pre-check: is this a JSON navigation key?
+    let is_json_key = matches!(
+        code,
+        KeyCode::Char('j')
+            | KeyCode::Down
+            | KeyCode::Char('k')
+            | KeyCode::Up
+            | KeyCode::Enter
+            | KeyCode::Char(' ')
+            | KeyCode::Char('l')
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Left
+            | KeyCode::Char('L')
+            | KeyCode::Char('H')
+    );
+    if !is_json_key {
+        return false;
+    }
+
+    let has_nav = state
+        .json_view
+        .as_ref()
+        .is_some_and(|jv| !jv.navigable.is_empty());
+    if !has_nav {
+        return false;
+    }
+
+    let is_diagram = state.json_view.as_ref().is_some_and(|jv| jv.diagram_mode);
+
+    if is_diagram {
+        return handle_json_diagram_keys(state, code);
+    }
+
+    let viewport = state.viewport();
+
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let jv = state.json_view.as_mut().unwrap();
+            jv.move_cursor(1);
+            if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
+                if line >= state.offset + viewport {
+                    state.offset = line.saturating_sub(viewport / 2);
+                } else if line < state.offset {
+                    state.offset = line;
+                }
+            }
+            state.dirty = true;
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let jv = state.json_view.as_mut().unwrap();
+            jv.move_cursor(-1);
+            if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
+                if line < state.offset {
+                    state.offset = line;
+                } else if line >= state.offset + viewport {
+                    state.offset = line.saturating_sub(viewport / 2);
+                }
+            }
+            state.dirty = true;
+            true
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            state.json_view.as_mut().unwrap().toggle_current();
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
+                }
+            }
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            let jv = state.json_view.as_mut().unwrap();
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string())
+                && !jv.expanded.contains(&path)
+            {
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.insert(path);
+                state.rebuild();
+                if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                    let vp = state.viewport();
+                    let max = state.max_offset();
+                    if line < state.offset || line >= state.offset + vp {
+                        state.offset = line.saturating_sub(vp / 4).min(max);
+                    }
+                }
+            }
+            true
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            let jv = state.json_view.as_mut().unwrap();
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string())
+                && jv.expanded.contains(&path)
+            {
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.remove(&path);
+                state.rebuild();
+            }
+            true
+        }
+        KeyCode::Char('L') => {
+            if let Some(ref value) = state.cached_json {
+                state.json_view.as_mut().unwrap().expand_all(value);
+            }
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
+                }
+            }
+            true
+        }
+        KeyCode::Char('H') => {
+            state.json_view.as_mut().unwrap().collapse_all();
+            state.rebuild();
+            if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                let vp = state.viewport();
+                let max = state.max_offset();
+                if line < state.offset || line >= state.offset + vp {
+                    state.offset = line.saturating_sub(vp / 4).min(max);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Graph-aware navigation for diagram mode.
+/// j/k: move within current card or to sibling cards
+/// l: jump to child card (auto-expand if collapsed)
+/// h: jump back to parent card
+/// Enter/Space: toggle expand/collapse
+fn handle_json_diagram_keys(state: &mut ViewerState, code: KeyCode) -> bool {
+    let viewport = state.viewport();
+    let content_width = state.content_width();
+
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let jv = state.json_view.as_mut().unwrap();
+            // Move to next row within the same card, or to the next card in column
+            let cur = jv.cursor;
+            if cur + 1 < jv.navigable.len() {
+                let cur_card = jv.navigable[cur].card_id.clone();
+                // Try next row in same card first
+                if jv.navigable[cur + 1].card_id == cur_card {
+                    jv.cursor = cur + 1;
+                } else {
+                    // Jump to next card in the same column or just next navigable
+                    let cur_x = jv.navigable[cur].nav_x;
+                    // Find next item with same nav_x (same column)
+                    let next = jv.navigable[cur + 1..]
+                        .iter()
+                        .position(|n| n.nav_x == cur_x && n.card_id != cur_card)
+                        .map(|p| cur + 1 + p);
+                    jv.cursor = next.unwrap_or(cur + 1);
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            if cur > 0 {
+                let cur_card = jv.navigable[cur].card_id.clone();
+                // Try prev row in same card first
+                if jv.navigable[cur - 1].card_id == cur_card {
+                    jv.cursor = cur - 1;
+                } else {
+                    // Jump to prev card in same column
+                    let cur_x = jv.navigable[cur].nav_x;
+                    let prev = jv.navigable[..cur]
+                        .iter()
+                        .rposition(|n| n.nav_x == cur_x && n.card_id != cur_card);
+                    if let Some(p) = prev {
+                        // Jump to the last row of that card
+                        let target_card = jv.navigable[p].card_id.clone();
+                        let last_in_card = jv.navigable[p..]
+                            .iter()
+                            .rposition(|n| n.card_id == target_card)
+                            .map(|r| p + r)
+                            .unwrap_or(p);
+                        jv.cursor = last_in_card;
+                    } else {
+                        jv.cursor = cur - 1;
+                    }
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            // Jump to child card. Auto-expand if collapsed.
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            let path = jv.navigable[cur].path.clone();
+            let child_idx = jv.navigable[cur].child_nav_index;
+            let mut just_expanded = false;
+
+            if let Some(target) = child_idx {
+                // Already expanded — jump to child
+                jv.cursor = target;
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+            } else if !path.is_empty() && !jv.expanded.contains(&path) {
+                // Expand — after rebuild we'll jump to child
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.insert(path);
+                just_expanded = true;
+            } else {
+                return true; // Nothing to do
+            }
+
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+
+            // After expanding, cursor is restored to the parent row.
+            // Now jump to the newly created child.
+            if just_expanded {
+                let jv = state.json_view.as_mut().unwrap();
+                let cur = jv.cursor;
+                if cur < jv.navigable.len()
+                    && let Some(target) = jv.navigable[cur].child_nav_index
+                {
+                    jv.cursor = target;
+                    if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                        jv.cursor_path_save = Some(p);
+                    }
+                    diagram_rebuild_and_scroll(state, viewport, content_width);
+                }
+            }
+            true
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            // Jump to parent card
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            if let Some(parent_idx) = jv.navigable[cur].parent_nav_index {
+                jv.cursor = parent_idx;
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            state.json_view.as_mut().unwrap().toggle_current();
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('L') => {
+            if let Some(ref value) = state.cached_json {
+                state.json_view.as_mut().unwrap().expand_all(value);
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('H') => {
+            state.json_view.as_mut().unwrap().collapse_all();
+            let jv = state.json_view.as_mut().unwrap();
+            jv.h_offset = 0;
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Rebuild diagram, auto-pan horizontally and vertically to follow cursor.
+fn diagram_rebuild_and_scroll(state: &mut ViewerState, viewport: usize, content_width: usize) {
+    // Save cursor path for restore after rebuild
+    {
+        let jv = state.json_view.as_mut().unwrap();
+        if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+            jv.cursor_path_save = Some(p);
+        }
+    }
+
+    state.rebuild();
+
+    // Auto-pan horizontally to keep focused card visible.
+    // Card positions (nav_x, card_width) are layout-determined and don't
+    // depend on h_offset, so we can compute the correct offset from the
+    // first rebuild. Only re-render if h_offset actually changed (since
+    // h_offset controls horizontal clipping of the canvas output).
+    let jv = state.json_view.as_mut().unwrap();
+    if let Some(nav) = jv.navigable.get(jv.cursor) {
+        let card_left = nav.nav_x;
+        let card_right = nav.nav_x + nav.card_width;
+        let margin = 4usize;
+        let old_h_offset = jv.h_offset;
+
+        if card_left < jv.h_offset + margin {
+            jv.h_offset = card_left.saturating_sub(margin);
+        } else if card_right + margin > jv.h_offset + content_width {
+            jv.h_offset = (card_right + margin).saturating_sub(content_width);
+        }
+
+        if jv.h_offset != old_h_offset {
+            state.rebuild();
+        }
+    }
+
+    // Auto-scroll vertically
+    if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+        let max = state.max_offset();
+        if line < state.offset {
+            state.offset = line.saturating_sub(2);
+        } else if line >= state.offset + viewport {
+            state.offset = line.saturating_sub(viewport / 2).min(max);
+        }
+    }
+
+    state.dirty = true;
+}
+
 fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> bool {
     let viewport = state.viewport();
     let max_offset = state.max_offset();
 
     if state.slide_mode {
         return handle_slide_keys(state, code);
+    }
+
+    // Interactive JSON: intercept j/k/Enter/h/l for node navigation
+    if state.json_view.is_some() && handle_json_keys(state, code) {
+        return false;
     }
 
     match code {
@@ -2140,6 +2554,26 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             }
 
             if !drew_inline_image {
+                // JSON cursor highlight (skip in diagram mode — cards handle their own highlight)
+                let is_json_cursor = state
+                    .json_view
+                    .as_ref()
+                    .and_then(|jv| {
+                        if jv.diagram_mode {
+                            return None;
+                        }
+                        jv.cursor_line()
+                    })
+                    .is_some_and(|cl| cl == line_idx);
+                let line_bg = if is_json_cursor {
+                    theme.overlay_selected_bg
+                } else {
+                    theme.bg
+                };
+                if is_json_cursor {
+                    queue!(stdout, SetBackgroundColor(line_bg))?;
+                }
+
                 let highlights = if !state.slide_mode {
                     state.search.highlights_for_line(line_idx)
                 } else {
@@ -2155,17 +2589,21 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
 
                 let mut col = 0;
                 for span in spans {
-                    write_span(stdout, span, Some(theme.bg))?;
+                    write_span(stdout, span, Some(line_bg))?;
                     col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
-                    let fill_bg = line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                        if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                            Some(bg)
-                        } else {
-                            None
-                        }
-                    });
+                    let fill_bg = if is_json_cursor {
+                        Some(line_bg)
+                    } else {
+                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
+                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
+                                Some(bg)
+                            } else {
+                                None
+                            }
+                        })
+                    };
                     if let Some(bg) = fill_bg {
                         queue!(
                             stdout,
@@ -2177,6 +2615,9 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     } else {
                         queue!(stdout, Print(" ".repeat(content_width - col)))?;
                     }
+                }
+                if is_json_cursor {
+                    queue!(stdout, SetBackgroundColor(theme.bg))?;
                 }
             }
         } else {
@@ -2383,6 +2824,76 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             Print("─".repeat(fill)),
             SetForegroundColor(theme.position),
             Print(&pos_label),
+            SetForegroundColor(theme.border),
+            Print("─╯"),
+            SetAttribute(Attribute::Reset),
+        )?;
+        return Ok(());
+    }
+
+    // JSON-specific status bar
+    if let Some(ref jv) = state.json_view {
+        let breadcrumb = jv.breadcrumb().unwrap_or_default();
+        let bc_label = if jv.diagram_mode || breadcrumb.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", breadcrumb)
+        };
+        let bc_len = bc_label.chars().count();
+
+        let node_label = if jv.navigable.is_empty() {
+            String::new()
+        } else {
+            format!(" {}/{} ", jv.cursor + 1, jv.navigable.len())
+        };
+        let node_len = node_label.chars().count();
+
+        let hint = if jv.diagram_mode {
+            " j/k rows · h/l parent/child · Enter toggle · H/L all · D card view "
+        } else {
+            " j/k navigate · Enter toggle · H/L collapse/expand all · D graph view "
+        };
+        let hint_len = hint.chars().count();
+        let needed = 4 + bc_len + node_len + hint_len;
+        let (show_hint, fill) = if width > needed {
+            (true, width - needed)
+        } else if width > 4 + bc_len + node_len {
+            (false, width - 4 - bc_len - node_len)
+        } else {
+            (false, width.saturating_sub(4 + node_len))
+        };
+
+        queue!(
+            stdout,
+            MoveTo(0, (viewport + 1) as u16),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.border),
+            Print("╰─"),
+        )?;
+        if !bc_label.is_empty() && width > 4 + bc_len + node_len {
+            queue!(
+                stdout,
+                SetForegroundColor(theme.json_path),
+                Print(&bc_label),
+            )?;
+        }
+        if show_hint {
+            queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint))?;
+        }
+        queue!(
+            stdout,
+            SetForegroundColor(theme.border),
+            Print("─".repeat(fill)),
+        )?;
+        if !node_label.is_empty() {
+            queue!(
+                stdout,
+                SetForegroundColor(theme.position),
+                Print(&node_label),
+            )?;
+        }
+        queue!(
+            stdout,
             SetForegroundColor(theme.border),
             Print("─╯"),
             SetAttribute(Attribute::Reset),
