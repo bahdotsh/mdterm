@@ -14,7 +14,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 
 - **Interactive TUI** — Scroll, navigate with keyboard and mouse
 - **Syntax highlighting** — Code blocks highlighted via syntect (base16-ocean.dark / InspiredGitHub themes)
-- **Rich formatting** — Headings, bold, italic, strikethrough, lists, blockquotes, tables, task lists
+- **Rich formatting** — Headings, bold, italic, strikethrough, lists, blockquotes, tables, interactive checkboxes
 - **Inline images** — Renders images in the terminal via Kitty, iTerm2, or Unicode half-block fallback
 - **Clickable links** — OSC 8 hyperlinks in supporting terminals
 - **In-document search** — `/` to search with regex support, `n`/`N` to jump between matches
@@ -35,6 +35,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Line numbers** — Toggle with `l` for code blocks
 - **Config file** — `~/.config/mdterm/config.toml` for persistent preferences
 - **Word wrapping** — Responsive re-wrapping on terminal resize
+- **JSON viewer** — Render JSON files with syntax-colored keys, values, and structure
 - **Pipe-friendly** — Outputs plain styled text when stdout is piped
 
 ## Installation
@@ -50,6 +51,7 @@ cargo install --path .
 ```bash
 mdterm README.md                    # view a file
 mdterm a.md b.md                    # multiple files (Tab to switch)
+mdterm data.json                    # view a JSON file
 cat README.md | mdterm              # read from stdin
 mdterm --slides deck.md             # slide mode
 mdterm --export html doc.md > out.html  # export to HTML
