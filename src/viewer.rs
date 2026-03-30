@@ -2554,11 +2554,16 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             }
 
             if !drew_inline_image {
-                // JSON cursor highlight
+                // JSON cursor highlight (skip in diagram mode — cards handle their own highlight)
                 let is_json_cursor = state
                     .json_view
                     .as_ref()
-                    .and_then(|jv| jv.cursor_line())
+                    .and_then(|jv| {
+                        if jv.diagram_mode {
+                            return None;
+                        }
+                        jv.cursor_line()
+                    })
                     .is_some_and(|cl| cl == line_idx);
                 let line_bg = if is_json_cursor {
                     theme.overlay_selected_bg
