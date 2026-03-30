@@ -15,19 +15,8 @@ pub fn render(
     width: usize,
     theme: &Theme,
 ) -> Result<(Vec<Line>, DocumentInfo), String> {
-    let value: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(e) => {
-            let mut lines = Vec::new();
-            render_parse_error(&mut lines, input, &e, theme, width);
-            return Ok((
-                lines,
-                DocumentInfo {
-                    code_blocks: Vec::<CodeBlockContent>::new(),
-                },
-            ));
-        }
-    };
+    let value: Value =
+        serde_json::from_str(input).map_err(|e| format!("JSON parse error: {}", e))?;
     let mut renderer = JsonRenderer {
         theme,
         lines: Vec::new(),
@@ -42,121 +31,339 @@ pub fn render(
     ))
 }
 
-/// Render a styled JSON parse error with source context and caret pointer
-fn render_parse_error(
-    lines: &mut Vec<Line>,
-    input: &str,
-    err: &serde_json::Error,
-    theme: &Theme,
-    width: usize,
-) {
-    let error_color = Color::Rgb {
-        r: 243,
-        g: 139,
-        b: 168,
-    };
+// ── Shared span/line builders ─────────────────────────────────────
 
-    // Heading
-    lines.push(Line {
-        spans: vec![StyledSpan {
-            text: "  Invalid JSON".to_string(),
+/// Build a styled span for a JSON value.
+fn make_value_span(theme: &Theme, value: &Value) -> StyledSpan {
+    match value {
+        Value::String(s) => {
+            let display = format!("\"{}\"", s);
+            if s.starts_with("http://") || s.starts_with("https://") {
+                StyledSpan {
+                    text: display,
+                    style: Style {
+                        fg: Some(theme.json_string),
+                        underline: true,
+                        link_url: Some(s.clone()),
+                        ..Default::default()
+                    },
+                }
+            } else {
+                StyledSpan {
+                    text: display,
+                    style: style_fg(theme.json_string),
+                }
+            }
+        }
+        Value::Number(n) => StyledSpan {
+            text: n.to_string(),
+            style: style_fg(theme.json_number),
+        },
+        Value::Bool(b) => StyledSpan {
+            text: b.to_string(),
+            style: style_fg(theme.json_bool),
+        },
+        Value::Null => StyledSpan {
+            text: "null".to_string(),
             style: Style {
-                fg: Some(error_color),
-                bold: true,
+                fg: Some(theme.json_null),
+                dim: true,
                 ..Default::default()
             },
-        }],
-        meta: LineMeta::Heading {
-            level: 1,
-            text: "Invalid JSON".to_string(),
         },
-    });
-    let sep_w = width.min(60);
-    lines.push(Line {
-        spans: vec![StyledSpan {
-            text: "\u{2500}".repeat(sep_w),
-            style: style_fg(theme.heading_separator),
-        }],
-        meta: LineMeta::None,
-    });
-    lines.push(Line::empty());
+        Value::Object(m) if m.is_empty() => StyledSpan {
+            text: "{}".to_string(),
+            style: style_fg(theme.json_bracket),
+        },
+        Value::Array(a) if a.is_empty() => StyledSpan {
+            text: "[]".to_string(),
+            style: style_fg(theme.json_bracket),
+        },
+        Value::Object(_) => StyledSpan {
+            text: "{…}".to_string(),
+            style: style_fg(theme.json_bracket),
+        },
+        Value::Array(_) => StyledSpan {
+            text: "[…]".to_string(),
+            style: style_fg(theme.json_bracket),
+        },
+    }
+}
 
-    // Error message
-    lines.push(Line {
-        spans: vec![
-            StyledSpan {
-                text: "  Error: ".to_string(),
+/// Build spans for a "key: value" line with alignment padding.
+fn make_kv_line(theme: &Theme, key: &str, value: &Value, depth: usize, align_width: usize) -> Line {
+    let indent = indent_str(depth);
+    let key_w = UnicodeWidthStr::width(key);
+    let padding = align_width.saturating_sub(key_w);
+
+    let mut spans = vec![StyledSpan {
+        text: format!("{}{}:{} ", indent, key, " ".repeat(padding)),
+        style: Style {
+            fg: Some(theme.json_key),
+            bold: true,
+            ..Default::default()
+        },
+    }];
+
+    match value {
+        Value::Object(m) if m.is_empty() => {
+            spans.push(StyledSpan {
+                text: "{}".to_string(),
+                style: style_fg(theme.json_bracket),
+            });
+            spans.push(StyledSpan {
+                text: " empty".to_string(),
                 style: Style {
-                    fg: Some(error_color),
-                    bold: true,
+                    fg: Some(theme.json_null),
+                    dim: true,
                     ..Default::default()
                 },
-            },
-            StyledSpan {
-                text: format!("{}", err),
-                style: style_fg(theme.fg),
-            },
-        ],
-        meta: LineMeta::None,
-    });
-    lines.push(Line::empty());
-
-    // Source context around the error position
-    let err_line = err.line();
-    let err_col = err.column();
-    let source_lines: Vec<&str> = input.lines().collect();
-
-    let start = err_line.saturating_sub(3);
-    let end = (err_line + 2).min(source_lines.len());
-
-    for i in start..end {
-        let line_num = i + 1;
-        let is_err = line_num == err_line;
-        let content = source_lines.get(i).unwrap_or(&"");
-        let num_str = format!("  {:>4} \u{2502} ", line_num);
-
-        lines.push(Line {
-            spans: vec![
-                StyledSpan {
-                    text: num_str,
-                    style: Style {
-                        fg: Some(if is_err {
-                            error_color
-                        } else {
-                            theme.line_number
-                        }),
-                        dim: !is_err,
-                        ..Default::default()
-                    },
-                },
-                StyledSpan {
-                    text: content.to_string(),
-                    style: Style {
-                        fg: Some(if is_err { theme.fg } else { theme.json_null }),
-                        ..Default::default()
-                    },
-                },
-            ],
-            meta: LineMeta::None,
-        });
-
-        if is_err {
-            let pointer_pad = 9 + err_col.saturating_sub(1);
-            lines.push(Line {
-                spans: vec![StyledSpan {
-                    text: format!("{}^", " ".repeat(pointer_pad)),
-                    style: Style {
-                        fg: Some(error_color),
-                        bold: true,
-                        ..Default::default()
-                    },
-                }],
-                meta: LineMeta::None,
             });
+        }
+        Value::Array(a) if a.is_empty() => {
+            spans.push(StyledSpan {
+                text: "[]".to_string(),
+                style: style_fg(theme.json_bracket),
+            });
+            spans.push(StyledSpan {
+                text: " empty".to_string(),
+                style: Style {
+                    fg: Some(theme.json_null),
+                    dim: true,
+                    ..Default::default()
+                },
+            });
+        }
+        _ => {
+            spans.push(make_value_span(theme, value));
         }
     }
 
-    lines.push(Line::empty());
+    Line {
+        spans,
+        meta: LineMeta::None,
+    }
+}
+
+/// Build a bullet line: "  • value"
+fn make_bullet_line(theme: &Theme, value: &Value, depth: usize) -> Line {
+    let indent = indent_str(depth);
+    Line {
+        spans: vec![
+            StyledSpan {
+                text: format!("{}\u{2022} ", indent),
+                style: Style {
+                    fg: Some(theme.json_bracket),
+                    dim: true,
+                    ..Default::default()
+                },
+            },
+            make_value_span(theme, value),
+        ],
+        meta: LineMeta::None,
+    }
+}
+
+/// Build an indexed value line: "  [N] value"
+fn make_indexed_value_line(theme: &Theme, index: usize, value: &Value, depth: usize) -> Line {
+    let indent = indent_str(depth);
+    Line {
+        spans: vec![
+            StyledSpan {
+                text: format!("{}[{}] ", indent, index),
+                style: style_fg(theme.json_bracket),
+            },
+            make_value_span(theme, value),
+        ],
+        meta: LineMeta::None,
+    }
+}
+
+/// Build an indented value line (for root primitives).
+fn make_indented_value_line(theme: &Theme, value: &Value, depth: usize) -> Line {
+    let indent = indent_str(depth);
+    Line {
+        spans: vec![
+            StyledSpan {
+                text: indent,
+                style: Style::default(),
+            },
+            make_value_span(theme, value),
+        ],
+        meta: LineMeta::None,
+    }
+}
+
+/// Build table lines from an array of homogeneous objects.
+fn build_table_lines(theme: &Theme, arr: &[Value], indent: &str, available: usize) -> Vec<Line> {
+    let objects: Vec<&serde_json::Map<String, Value>> =
+        arr.iter().filter_map(|v| v.as_object()).collect();
+    if objects.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect all keys preserving first-seen order
+    let mut headers: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for obj in &objects {
+        for key in obj.keys() {
+            if seen.insert(key.clone()) {
+                headers.push(key.clone());
+            }
+        }
+    }
+
+    // Build cell text matrix
+    let rows: Vec<Vec<String>> = objects
+        .iter()
+        .map(|obj| {
+            headers
+                .iter()
+                .map(|h| match obj.get(h) {
+                    Some(v) => value_to_short_string(v),
+                    None => String::new(),
+                })
+                .collect()
+        })
+        .collect();
+
+    // Compute column widths
+    let mut col_widths: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(ci, h)| {
+            let header_w = UnicodeWidthStr::width(h.as_str());
+            let max_cell = rows
+                .iter()
+                .map(|r| UnicodeWidthStr::width(r[ci].as_str()))
+                .max()
+                .unwrap_or(0);
+            header_w.max(max_cell).max(3)
+        })
+        .collect();
+
+    // Shrink columns if total exceeds available width
+    let separators = if headers.len() > 1 {
+        (headers.len() - 1) * 3
+    } else {
+        0
+    };
+    let border_chars = 4; // "│ " prefix + " │" suffix
+    let total_need: usize = col_widths.iter().sum::<usize>() + separators + border_chars;
+    if total_need > available && available > border_chars + separators + headers.len() {
+        let usable = available - border_chars - separators;
+        let current_total: usize = col_widths.iter().sum();
+        for w in &mut col_widths {
+            *w = (*w * usable / current_total).max(3);
+        }
+    }
+
+    let bc = theme.table_border;
+    let hc = theme.table_header;
+    let mut lines = Vec::new();
+
+    // Top border
+    let top: String = col_widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("─┬─");
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("{}┌─{}─┐", indent, top),
+            style: style_fg(bc),
+        }],
+        meta: LineMeta::None,
+    });
+
+    // Header row
+    let mut hdr = vec![StyledSpan {
+        text: format!("{}│ ", indent),
+        style: style_fg(bc),
+    }];
+    for (ci, h) in headers.iter().enumerate() {
+        hdr.push(StyledSpan {
+            text: pad_or_truncate(h, col_widths[ci]),
+            style: Style {
+                fg: Some(hc),
+                bold: true,
+                ..Default::default()
+            },
+        });
+        if ci < headers.len() - 1 {
+            hdr.push(StyledSpan {
+                text: " │ ".to_string(),
+                style: style_fg(bc),
+            });
+        }
+    }
+    hdr.push(StyledSpan {
+        text: " │".to_string(),
+        style: style_fg(bc),
+    });
+    lines.push(Line {
+        spans: hdr,
+        meta: LineMeta::None,
+    });
+
+    // Header separator
+    let sep: String = col_widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("─┼─");
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("{}├─{}─┤", indent, sep),
+            style: style_fg(bc),
+        }],
+        meta: LineMeta::None,
+    });
+
+    // Data rows
+    for row in &rows {
+        let mut spans = vec![StyledSpan {
+            text: format!("{}│ ", indent),
+            style: style_fg(bc),
+        }];
+        for (ci, cell) in row.iter().enumerate() {
+            let fg = cell_color(cell, theme);
+            spans.push(StyledSpan {
+                text: pad_or_truncate(cell, col_widths[ci]),
+                style: style_fg(fg),
+            });
+            if ci < row.len() - 1 {
+                spans.push(StyledSpan {
+                    text: " │ ".to_string(),
+                    style: style_fg(bc),
+                });
+            }
+        }
+        spans.push(StyledSpan {
+            text: " │".to_string(),
+            style: style_fg(bc),
+        });
+        lines.push(Line {
+            spans,
+            meta: LineMeta::None,
+        });
+    }
+
+    // Bottom border
+    let bot: String = col_widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("─┴─");
+    lines.push(Line {
+        spans: vec![StyledSpan {
+            text: format!("{}└─{}─┘", indent, bot),
+            style: style_fg(bc),
+        }],
+        meta: LineMeta::None,
+    });
+
+    lines
 }
 
 struct JsonRenderer<'a> {
@@ -386,172 +593,12 @@ impl<'a> JsonRenderer<'a> {
         }
     }
 
-    // ── table rendering ───────────────────────────────────────────
-
     fn render_table(&mut self, arr: &[Value], depth: usize) {
-        let objects: Vec<&serde_json::Map<String, Value>> =
-            arr.iter().filter_map(|v| v.as_object()).collect();
-        if objects.is_empty() {
-            return;
-        }
-
-        // Collect all keys preserving first-seen order
-        let mut headers: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for obj in &objects {
-            for key in obj.keys() {
-                if seen.insert(key.clone()) {
-                    headers.push(key.clone());
-                }
-            }
-        }
-
-        // Build cell text matrix
-        let rows: Vec<Vec<String>> = objects
-            .iter()
-            .map(|obj| {
-                headers
-                    .iter()
-                    .map(|h| match obj.get(h) {
-                        Some(v) => value_to_short_string(v),
-                        None => String::new(),
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Compute column widths
         let indent = indent_str(depth);
         let indent_w = UnicodeWidthStr::width(indent.as_str());
         let available = self.width.saturating_sub(indent_w);
-
-        let mut col_widths: Vec<usize> = headers
-            .iter()
-            .enumerate()
-            .map(|(ci, h)| {
-                let header_w = UnicodeWidthStr::width(h.as_str());
-                let max_cell = rows
-                    .iter()
-                    .map(|r| UnicodeWidthStr::width(r[ci].as_str()))
-                    .max()
-                    .unwrap_or(0);
-                header_w.max(max_cell).max(3)
-            })
-            .collect();
-
-        // Shrink columns if total exceeds available width
-        let separators = if headers.len() > 1 {
-            (headers.len() - 1) * 3
-        } else {
-            0
-        };
-        let border_chars = 4; // "│ " prefix + " │" suffix
-        let total_need: usize = col_widths.iter().sum::<usize>() + separators + border_chars;
-        if total_need > available && available > border_chars + separators + headers.len() {
-            let usable = available - border_chars - separators;
-            let current_total: usize = col_widths.iter().sum();
-            for w in &mut col_widths {
-                *w = (*w * usable / current_total).max(3);
-            }
-        }
-
-        let bc = self.theme.table_border;
-        let hc = self.theme.table_header;
-
-        // Top border
-        let top: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{252c}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("{}\u{250c}\u{2500}{}\u{2500}\u{2510}", indent, top),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
-
-        // Header row
-        let mut hdr = vec![StyledSpan {
-            text: format!("{}\u{2502} ", indent),
-            style: style_fg(bc),
-        }];
-        for (ci, h) in headers.iter().enumerate() {
-            hdr.push(StyledSpan {
-                text: pad_or_truncate(h, col_widths[ci]),
-                style: Style {
-                    fg: Some(hc),
-                    bold: true,
-                    ..Default::default()
-                },
-            });
-            if ci < headers.len() - 1 {
-                hdr.push(StyledSpan {
-                    text: " \u{2502} ".to_string(),
-                    style: style_fg(bc),
-                });
-            }
-        }
-        hdr.push(StyledSpan {
-            text: " \u{2502}".to_string(),
-            style: style_fg(bc),
-        });
-        self.push_line(hdr, LineMeta::None);
-
-        // Header separator
-        let sep: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{253c}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("{}\u{251c}\u{2500}{}\u{2500}\u{2524}", indent, sep),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
-
-        // Data rows
-        for row in &rows {
-            let mut spans = vec![StyledSpan {
-                text: format!("{}\u{2502} ", indent),
-                style: style_fg(bc),
-            }];
-            for (ci, cell) in row.iter().enumerate() {
-                let fg = cell_color(cell, self.theme);
-                spans.push(StyledSpan {
-                    text: pad_or_truncate(cell, col_widths[ci]),
-                    style: style_fg(fg),
-                });
-                if ci < row.len() - 1 {
-                    spans.push(StyledSpan {
-                        text: " \u{2502} ".to_string(),
-                        style: style_fg(bc),
-                    });
-                }
-            }
-            spans.push(StyledSpan {
-                text: " \u{2502}".to_string(),
-                style: style_fg(bc),
-            });
-            self.push_line(spans, LineMeta::None);
-        }
-
-        // Bottom border
-        let bot: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{2534}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("{}\u{2514}\u{2500}{}\u{2500}\u{2518}", indent, bot),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
+        self.lines
+            .extend(build_table_lines(self.theme, arr, &indent, available));
     }
 
     // ── line emission helpers ─────────────────────────────────────
@@ -676,114 +723,41 @@ impl<'a> JsonRenderer<'a> {
     }
 
     fn emit_blank(&mut self) {
-        self.push_line(vec![], LineMeta::None);
+        self.lines.push(Line {
+            spans: vec![],
+            meta: LineMeta::None,
+        });
     }
 
-    /// Key: value on a single indented line with alignment padding
     fn emit_kv(&mut self, key: &str, value: &Value, depth: usize, align_width: usize) {
-        let indent = indent_str(depth);
-        let key_w = UnicodeWidthStr::width(key);
-        let padding = align_width.saturating_sub(key_w);
-
-        let mut spans = vec![StyledSpan {
-            text: format!("{}{}:{} ", indent, key, " ".repeat(padding)),
-            style: Style {
-                fg: Some(self.theme.json_key),
-                bold: true,
-                ..Default::default()
-            },
-        }];
-
-        match value {
-            Value::Object(m) if m.is_empty() => {
-                spans.push(StyledSpan {
-                    text: "{}".to_string(),
-                    style: style_fg(self.theme.json_bracket),
-                });
-                spans.push(StyledSpan {
-                    text: " empty".to_string(),
-                    style: Style {
-                        fg: Some(self.theme.json_null),
-                        dim: true,
-                        ..Default::default()
-                    },
-                });
-            }
-            Value::Array(a) if a.is_empty() => {
-                spans.push(StyledSpan {
-                    text: "[]".to_string(),
-                    style: style_fg(self.theme.json_bracket),
-                });
-                spans.push(StyledSpan {
-                    text: " empty".to_string(),
-                    style: Style {
-                        fg: Some(self.theme.json_null),
-                        dim: true,
-                        ..Default::default()
-                    },
-                });
-            }
-            _ => {
-                spans.push(self.value_span(value));
-            }
-        }
-
-        self.push_line(spans, LineMeta::None);
+        self.lines
+            .push(make_kv_line(self.theme, key, value, depth, align_width));
     }
 
-    /// Indented value on its own line (for root primitives)
     fn emit_indented_value(&mut self, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: indent,
-                    style: Style::default(),
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
+        self.lines
+            .push(make_indented_value_line(self.theme, value, depth));
     }
 
-    /// Bullet item for primitive arrays: "  \u{2022} value"
     fn emit_bullet(&mut self, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: format!("{}\u{2022} ", indent),
-                    style: Style {
-                        fg: Some(self.theme.json_bracket),
-                        dim: true,
-                        ..Default::default()
-                    },
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
+        self.lines.push(make_bullet_line(self.theme, value, depth));
     }
 
-    /// Index label for complex array items: "  [N]"
     fn emit_index_label(&mut self, index: usize, depth: usize) {
         let indent = indent_str(depth);
-        self.push_line(
-            vec![StyledSpan {
+        self.lines.push(Line {
+            spans: vec![StyledSpan {
                 text: format!("{}[{}]", indent, index),
                 style: style_fg(self.theme.json_bracket),
             }],
-            LineMeta::None,
-        );
+            meta: LineMeta::None,
+        });
     }
 
-    /// Index label with annotation: "  [N] (M items)"
     fn emit_index_label_with_annotation(&mut self, index: usize, annotation: &str, depth: usize) {
         let indent = indent_str(depth);
-        self.push_line(
-            vec![
+        self.lines.push(Line {
+            spans: vec![
                 StyledSpan {
                     text: format!("{}[{}] ", indent, index),
                     style: style_fg(self.theme.json_bracket),
@@ -797,82 +771,13 @@ impl<'a> JsonRenderer<'a> {
                     },
                 },
             ],
-            LineMeta::None,
-        );
+            meta: LineMeta::None,
+        });
     }
 
-    /// Indexed primitive value in a mixed array: "  [N] value"
     fn emit_indexed_value(&mut self, index: usize, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: format!("{}[{}] ", indent, index),
-                    style: style_fg(self.theme.json_bracket),
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
-    }
-
-    // ── span helpers ──────────────────────────────────────────────
-
-    fn value_span(&self, value: &Value) -> StyledSpan {
-        match value {
-            Value::String(s) => {
-                let display = format!("\"{}\"", s);
-                if s.starts_with("http://") || s.starts_with("https://") {
-                    StyledSpan {
-                        text: display,
-                        style: Style {
-                            fg: Some(self.theme.json_string),
-                            underline: true,
-                            link_url: Some(s.clone()),
-                            ..Default::default()
-                        },
-                    }
-                } else {
-                    StyledSpan {
-                        text: display,
-                        style: style_fg(self.theme.json_string),
-                    }
-                }
-            }
-            Value::Number(n) => StyledSpan {
-                text: n.to_string(),
-                style: style_fg(self.theme.json_number),
-            },
-            Value::Bool(b) => StyledSpan {
-                text: b.to_string(),
-                style: style_fg(self.theme.json_bool),
-            },
-            Value::Null => StyledSpan {
-                text: "null".to_string(),
-                style: Style {
-                    fg: Some(self.theme.json_null),
-                    dim: true,
-                    ..Default::default()
-                },
-            },
-            Value::Object(m) if m.is_empty() => StyledSpan {
-                text: "{}".to_string(),
-                style: style_fg(self.theme.json_bracket),
-            },
-            Value::Array(a) if a.is_empty() => StyledSpan {
-                text: "[]".to_string(),
-                style: style_fg(self.theme.json_bracket),
-            },
-            Value::Object(_) => StyledSpan {
-                text: "{\u{2026}}".to_string(),
-                style: style_fg(self.theme.json_bracket),
-            },
-            Value::Array(_) => StyledSpan {
-                text: "[\u{2026}]".to_string(),
-                style: style_fg(self.theme.json_bracket),
-            },
-        }
+        self.lines
+            .push(make_indexed_value_line(self.theme, index, value, depth));
     }
 
     fn push_line(&mut self, spans: Vec<StyledSpan>, meta: LineMeta) {
@@ -969,16 +874,14 @@ impl JsonViewState {
     }
 
     /// Expand every expandable node in the entire document.
-    pub fn expand_all(&mut self, json_src: &str) {
+    pub fn expand_all(&mut self, root: &Value) {
         if let Some(nav) = self.navigable.get(self.cursor) {
             self.cursor_path_save = Some(nav.path.clone());
         }
-        if let Ok(root) = serde_json::from_str::<Value>(json_src) {
-            let mut paths = Vec::new();
-            collect_all_children(&root, "", &mut paths);
-            for p in paths {
-                self.expanded.insert(p);
-            }
+        let mut paths = Vec::new();
+        collect_all_children(root, "", &mut paths);
+        for p in paths {
+            self.expanded.insert(p);
         }
     }
 
@@ -1002,25 +905,11 @@ impl JsonViewState {
 
 /// Render JSON interactively with expand/collapse bordered cards.
 pub fn render_interactive(
-    input: &str,
+    value: &Value,
     width: usize,
     theme: &Theme,
     expanded: &HashSet<String>,
-) -> Result<(Vec<Line>, DocumentInfo, Vec<NavItem>), String> {
-    let value: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(e) => {
-            let mut lines = Vec::new();
-            render_parse_error(&mut lines, input, &e, theme, width);
-            return Ok((
-                lines,
-                DocumentInfo {
-                    code_blocks: Vec::new(),
-                },
-                Vec::new(),
-            ));
-        }
-    };
+) -> (Vec<Line>, DocumentInfo, Vec<NavItem>) {
     let mut r = CardRenderer {
         theme,
         lines: Vec::new(),
@@ -1030,14 +919,14 @@ pub fn render_interactive(
         card_starts: Vec::new(),
         nesting: 0,
     };
-    r.render_root(&value);
-    Ok((
+    r.render_root(value);
+    (
         r.lines,
         DocumentInfo {
             code_blocks: Vec::new(),
         },
         r.navigable,
-    ))
+    )
 }
 
 struct CardRenderer<'a> {
@@ -1251,160 +1140,11 @@ impl<'a> CardRenderer<'a> {
     }
 
     fn render_table_inline(&mut self, arr: &[Value]) {
-        let objects: Vec<&serde_json::Map<String, Value>> =
-            arr.iter().filter_map(|v| v.as_object()).collect();
-        if objects.is_empty() {
-            return;
-        }
-
-        let mut headers: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for obj in &objects {
-            for key in obj.keys() {
-                if seen.insert(key.clone()) {
-                    headers.push(key.clone());
-                }
-            }
-        }
-
-        let rows: Vec<Vec<String>> = objects
-            .iter()
-            .map(|obj| {
-                headers
-                    .iter()
-                    .map(|h| match obj.get(h) {
-                        Some(v) => value_to_short_string(v),
-                        None => String::new(),
-                    })
-                    .collect()
-            })
-            .collect();
-
         let available = self
             .card_width(self.nesting.saturating_sub(1))
             .saturating_sub(8);
-
-        let mut col_widths: Vec<usize> = headers
-            .iter()
-            .enumerate()
-            .map(|(ci, h)| {
-                let hw = UnicodeWidthStr::width(h.as_str());
-                let mc = rows
-                    .iter()
-                    .map(|r| UnicodeWidthStr::width(r[ci].as_str()))
-                    .max()
-                    .unwrap_or(0);
-                hw.max(mc).max(3)
-            })
-            .collect();
-
-        let seps = if headers.len() > 1 {
-            (headers.len() - 1) * 3
-        } else {
-            0
-        };
-        let bc4 = 4;
-        let total: usize = col_widths.iter().sum::<usize>() + seps + bc4;
-        if total > available && available > bc4 + seps + headers.len() {
-            let usable = available - bc4 - seps;
-            let cur: usize = col_widths.iter().sum();
-            for w in &mut col_widths {
-                *w = (*w * usable / cur).max(3);
-            }
-        }
-
-        let bc = self.theme.table_border;
-        let hc = self.theme.table_header;
-
-        let top: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{252c}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("\u{250c}\u{2500}{}\u{2500}\u{2510}", top),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
-
-        let mut hdr = vec![StyledSpan {
-            text: "\u{2502} ".to_string(),
-            style: style_fg(bc),
-        }];
-        for (ci, h) in headers.iter().enumerate() {
-            hdr.push(StyledSpan {
-                text: pad_or_truncate(h, col_widths[ci]),
-                style: Style {
-                    fg: Some(hc),
-                    bold: true,
-                    ..Default::default()
-                },
-            });
-            if ci < headers.len() - 1 {
-                hdr.push(StyledSpan {
-                    text: " \u{2502} ".to_string(),
-                    style: style_fg(bc),
-                });
-            }
-        }
-        hdr.push(StyledSpan {
-            text: " \u{2502}".to_string(),
-            style: style_fg(bc),
-        });
-        self.push_line(hdr, LineMeta::None);
-
-        let sep: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{253c}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("\u{251c}\u{2500}{}\u{2500}\u{2524}", sep),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
-
-        for row in &rows {
-            let mut spans = vec![StyledSpan {
-                text: "\u{2502} ".to_string(),
-                style: style_fg(bc),
-            }];
-            for (ci, cell) in row.iter().enumerate() {
-                let fg = cell_color(cell, self.theme);
-                spans.push(StyledSpan {
-                    text: pad_or_truncate(cell, col_widths[ci]),
-                    style: style_fg(fg),
-                });
-                if ci < row.len() - 1 {
-                    spans.push(StyledSpan {
-                        text: " \u{2502} ".to_string(),
-                        style: style_fg(bc),
-                    });
-                }
-            }
-            spans.push(StyledSpan {
-                text: " \u{2502}".to_string(),
-                style: style_fg(bc),
-            });
-            self.push_line(spans, LineMeta::None);
-        }
-
-        let bot: String = col_widths
-            .iter()
-            .map(|w| "\u{2500}".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("\u{2500}\u{2534}\u{2500}");
-        self.push_line(
-            vec![StyledSpan {
-                text: format!("\u{2514}\u{2500}{}\u{2500}\u{2518}", bot),
-                style: style_fg(bc),
-            }],
-            LineMeta::None,
-        );
+        self.lines
+            .extend(build_table_lines(self.theme, arr, "", available));
     }
 
     // ── emit helpers ──────────────────────────────────────────
@@ -1469,156 +1209,33 @@ impl<'a> CardRenderer<'a> {
     }
 
     fn emit_kv(&mut self, key: &str, value: &Value, depth: usize, align: usize) {
-        let indent = indent_str(depth);
-        let key_w = UnicodeWidthStr::width(key);
-        let padding = align.saturating_sub(key_w);
-
-        let mut spans = vec![StyledSpan {
-            text: format!("{}{}:{} ", indent, key, " ".repeat(padding)),
-            style: Style {
-                fg: Some(self.theme.json_key),
-                bold: true,
-                ..Default::default()
-            },
-        }];
-
-        match value {
-            Value::Object(m) if m.is_empty() => {
-                spans.push(StyledSpan {
-                    text: "{}".to_string(),
-                    style: style_fg(self.theme.json_bracket),
-                });
-                spans.push(StyledSpan {
-                    text: " empty".to_string(),
-                    style: Style {
-                        fg: Some(self.theme.json_null),
-                        dim: true,
-                        ..Default::default()
-                    },
-                });
-            }
-            Value::Array(a) if a.is_empty() => {
-                spans.push(StyledSpan {
-                    text: "[]".to_string(),
-                    style: style_fg(self.theme.json_bracket),
-                });
-                spans.push(StyledSpan {
-                    text: " empty".to_string(),
-                    style: Style {
-                        fg: Some(self.theme.json_null),
-                        dim: true,
-                        ..Default::default()
-                    },
-                });
-            }
-            _ => {
-                spans.push(self.value_span(value));
-            }
-        }
-        self.push_line(spans, LineMeta::None);
+        self.push_line_obj(make_kv_line(self.theme, key, value, depth, align));
     }
 
     fn emit_bullet(&mut self, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: format!("{}\u{2022} ", indent),
-                    style: Style {
-                        fg: Some(self.theme.json_bracket),
-                        dim: true,
-                        ..Default::default()
-                    },
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
+        self.push_line_obj(make_bullet_line(self.theme, value, depth));
     }
 
     fn emit_indexed_value(&mut self, index: usize, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: format!("{}[{}] ", indent, index),
-                    style: style_fg(self.theme.json_bracket),
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
+        self.push_line_obj(make_indexed_value_line(self.theme, index, value, depth));
     }
 
     fn emit_indented_value(&mut self, value: &Value, depth: usize) {
-        let indent = indent_str(depth);
-        let val = self.value_span(value);
-        self.push_line(
-            vec![
-                StyledSpan {
-                    text: indent,
-                    style: Style::default(),
-                },
-                val,
-            ],
-            LineMeta::None,
-        );
+        self.push_line_obj(make_indented_value_line(self.theme, value, depth));
     }
 
     fn emit_blank(&mut self) {
         self.push_line(vec![], LineMeta::None);
     }
 
-    fn value_span(&self, value: &Value) -> StyledSpan {
-        match value {
-            Value::String(s) => {
-                let display = format!("\"{}\"", s);
-                if s.starts_with("http://") || s.starts_with("https://") {
-                    StyledSpan {
-                        text: display,
-                        style: Style {
-                            fg: Some(self.theme.json_string),
-                            underline: true,
-                            link_url: Some(s.clone()),
-                            ..Default::default()
-                        },
-                    }
-                } else {
-                    StyledSpan {
-                        text: display,
-                        style: style_fg(self.theme.json_string),
-                    }
-                }
-            }
-            Value::Number(n) => StyledSpan {
-                text: n.to_string(),
-                style: style_fg(self.theme.json_number),
-            },
-            Value::Bool(b) => StyledSpan {
-                text: b.to_string(),
-                style: style_fg(self.theme.json_bool),
-            },
-            Value::Null => StyledSpan {
-                text: "null".to_string(),
-                style: Style {
-                    fg: Some(self.theme.json_null),
-                    dim: true,
-                    ..Default::default()
-                },
-            },
-            _ => StyledSpan {
-                text: String::new(),
-                style: Style::default(),
-            },
-        }
+    fn push_line_obj(&mut self, line: Line) {
+        self.lines.push(line);
     }
 }
 
-fn group_entries(
-    map: &serde_json::Map<String, Value>,
-) -> (Vec<(&String, &Value)>, Vec<(&String, &Value)>) {
+type EntryList<'a> = Vec<(&'a String, &'a Value)>;
+
+fn group_entries(map: &serde_json::Map<String, Value>) -> (EntryList<'_>, EntryList<'_>) {
     let mut simple = Vec::new();
     let mut sections = Vec::new();
     for (key, val) in map {
@@ -1701,8 +1318,10 @@ fn should_render_as_table(arr: &[Value]) -> bool {
 fn value_to_short_string(v: &Value) -> String {
     match v {
         Value::String(s) => {
-            if s.len() > 40 {
-                format!("{}\u{2026}", &s[..39])
+            let char_count = s.chars().count();
+            if char_count > 40 {
+                let truncated: String = s.chars().take(39).collect();
+                format!("{}\u{2026}", truncated)
             } else {
                 s.clone()
             }
@@ -2145,24 +1764,20 @@ fn format_primitive_short(val: &Value) -> String {
 }
 
 /// Render JSON as a left-to-right graph of connected cards (jsoncrack style).
-/// Render JSON as a left-to-right graph of connected cards.
 /// Returns (lines, doc_info, navigable_items, canvas_width).
 pub fn render_diagram(
-    input: &str,
+    value: &Value,
     width: usize,
     theme: &Theme,
     expanded: &HashSet<String>,
     cursor_path: Option<&str>,
     h_offset: usize,
-) -> Result<(Vec<Line>, DocumentInfo, Vec<NavItem>, usize), String> {
+) -> (Vec<Line>, DocumentInfo, Vec<NavItem>, usize) {
     use crate::diagram::{Canvas, CardDrawRow};
-
-    let value: Value =
-        serde_json::from_str(input).map_err(|e| format!("JSON parse error: {}", e))?;
 
     let mut all_cards = Vec::new();
     build_graph_cards(
-        &value,
+        value,
         "root",
         "",
         "root",
@@ -2173,14 +1788,14 @@ pub fn render_diagram(
     );
 
     if all_cards.is_empty() {
-        return Ok((
+        return (
             Vec::new(),
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
             Vec::new(),
             0,
-        ));
+        );
     }
 
     // Build id → index lookup
@@ -2219,14 +1834,14 @@ pub fn render_diagram(
     }
 
     if columns.is_empty() {
-        return Ok((
+        return (
             Vec::new(),
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
             Vec::new(),
             0,
-        ));
+        );
     }
 
     // ── Card dimensions ──
@@ -2567,9 +2182,6 @@ pub fn render_diagram(
                 for j in child_nav_idx..nav_len {
                     if navigable[j].card_id == *child_id {
                         parent_indices[j] = Some(i);
-                    } else if navigable[j].card_id != navigable[child_nav_idx].card_id {
-                        // Moved past the child card's items (they may not be contiguous
-                        // due to column ordering, so we scan all)
                     }
                 }
             }
@@ -2582,14 +2194,14 @@ pub fn render_diagram(
         navigable[i].child_nav_index = child_indices[i];
     }
 
-    Ok((
+    (
         lines,
         DocumentInfo {
             code_blocks: Vec::new(),
         },
         navigable,
         canvas_width,
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -2600,11 +2212,12 @@ mod tests {
     fn expand_all_expands_entire_document() {
         let json = r#"{"a":1,"nested":{"b":2,"deep":{"c":3}}}"#;
         let theme = crate::theme::Theme::dark();
+        let value: Value = serde_json::from_str(json).unwrap();
 
-        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let (_, _, nav) = render_interactive(&value, 80, &theme, &HashSet::new());
         let mut state = JsonViewState::new();
         state.navigable = nav;
-        state.expand_all(json);
+        state.expand_all(&value);
 
         // Should expand everything in the document, not just cursor's subtree
         assert!(state.expanded.contains("nested"));
@@ -2615,11 +2228,12 @@ mod tests {
     fn expand_all_with_arrays() {
         let json = r#"{"items":[{"id":1,"sub":{"x":true}},{"id":2}]}"#;
         let theme = crate::theme::Theme::dark();
+        let value: Value = serde_json::from_str(json).unwrap();
 
-        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let (_, _, nav) = render_interactive(&value, 80, &theme, &HashSet::new());
         let mut state = JsonViewState::new();
         state.navigable = nav;
-        state.expand_all(json);
+        state.expand_all(&value);
 
         assert!(state.expanded.contains("items"));
         assert!(state.expanded.contains("items[0]"));
@@ -2631,15 +2245,16 @@ mod tests {
     fn collapse_all_clears_everything() {
         let json = r#"{"a":1,"nested":{"b":2,"deep":{"c":3}}}"#;
         let theme = crate::theme::Theme::dark();
+        let value: Value = serde_json::from_str(json).unwrap();
 
-        let (_, _, nav) = render_interactive(json, 80, &theme, &HashSet::new()).unwrap();
+        let (_, _, nav) = render_interactive(&value, 80, &theme, &HashSet::new());
         let mut state = JsonViewState::new();
         state.navigable = nav;
-        state.expand_all(json);
+        state.expand_all(&value);
         assert!(!state.expanded.is_empty());
 
         // Re-render with expanded state
-        let (_, _, nav2) = render_interactive(json, 80, &theme, &state.expanded).unwrap();
+        let (_, _, nav2) = render_interactive(&value, 80, &theme, &state.expanded);
         state.navigable = nav2;
         state.restore_cursor();
 

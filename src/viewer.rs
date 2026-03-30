@@ -324,6 +324,9 @@ struct ViewerState {
 
     // Interactive JSON explorer state
     json_view: Option<crate::json::JsonViewState>,
+
+    // Cached parsed JSON value (avoids re-parsing on every rebuild)
+    cached_json: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -402,6 +405,7 @@ impl ViewerState {
             list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
             json_view: None,
+            cached_json: None,
         }
     }
 
@@ -446,60 +450,56 @@ impl ViewerState {
 
         let cw = self.content_width();
         let (lines, doc_info) = if self.filename.ends_with(".json") {
-            // Initialize JSON view state on first render
-            if self.json_view.is_none() {
-                self.json_view = Some(crate::json::JsonViewState::new());
+            // Parse once and cache
+            if self.cached_json.is_none() {
+                match serde_json::from_str(&self.content) {
+                    Ok(v) => self.cached_json = Some(v),
+                    Err(_) => {
+                        // Fall back to markdown rendering on parse error
+                        self.json_view = None;
+                        self.cached_json = None;
+                    }
+                }
             }
-            let jv = self.json_view.as_ref().unwrap();
-            if jv.diagram_mode {
-                let cursor_path = jv.cursor_path().map(|s| s.to_string());
-                let h_off = jv.h_offset;
-                match crate::json::render_diagram(
+
+            if let Some(ref value) = self.cached_json {
+                if self.json_view.is_none() {
+                    self.json_view = Some(crate::json::JsonViewState::new());
+                }
+                let jv = self.json_view.as_ref().unwrap();
+                if jv.diagram_mode {
+                    let cursor_path = jv.cursor_path().map(|s| s.to_string());
+                    let h_off = jv.h_offset;
+                    let (lines, doc_info, navigable, canvas_w) = crate::json::render_diagram(
+                        value,
+                        cw,
+                        &self.theme,
+                        &jv.expanded,
+                        cursor_path.as_deref(),
+                        h_off,
+                    );
+                    let jv = self.json_view.as_mut().unwrap();
+                    jv.navigable = navigable;
+                    jv.diagram_canvas_width = canvas_w;
+                    jv.restore_cursor();
+                    (lines, doc_info)
+                } else {
+                    let (lines, doc_info, navigable) =
+                        crate::json::render_interactive(value, cw, &self.theme, &jv.expanded);
+                    let jv = self.json_view.as_mut().unwrap();
+                    jv.navigable = navigable;
+                    jv.restore_cursor();
+                    (lines, doc_info)
+                }
+            } else {
+                self.json_view = None;
+                crate::markdown::render_with(
                     &self.content,
                     cw,
                     &self.theme,
-                    &jv.expanded,
-                    cursor_path.as_deref(),
-                    h_off,
-                ) {
-                    Ok((lines, doc_info, navigable, canvas_w)) => {
-                        let jv = self.json_view.as_mut().unwrap();
-                        jv.navigable = navigable;
-                        jv.diagram_canvas_width = canvas_w;
-                        jv.restore_cursor();
-                        (lines, doc_info)
-                    }
-                    Err(_) => {
-                        self.json_view = None;
-                        crate::markdown::render_with(
-                            &self.content,
-                            cw,
-                            &self.theme,
-                            self.line_numbers,
-                            &self.syntect_res,
-                        )
-                    }
-                }
-            } else {
-                match crate::json::render_interactive(&self.content, cw, &self.theme, &jv.expanded)
-                {
-                    Ok((lines, doc_info, navigable)) => {
-                        let jv = self.json_view.as_mut().unwrap();
-                        jv.navigable = navigable;
-                        jv.restore_cursor();
-                        (lines, doc_info)
-                    }
-                    Err(_) => {
-                        self.json_view = None;
-                        crate::markdown::render_with(
-                            &self.content,
-                            cw,
-                            &self.theme,
-                            self.line_numbers,
-                            &self.syntect_res,
-                        )
-                    }
-                }
+                    self.line_numbers,
+                    &self.syntect_res,
+                )
             }
         } else {
             self.json_view = None;
@@ -732,6 +732,7 @@ impl ViewerState {
             && new_content != self.content
         {
             self.content = new_content;
+            self.cached_json = None;
             self.rebuild();
             self.set_toast("File reloaded");
             reloaded = true;
@@ -771,6 +772,7 @@ impl ViewerState {
             self.offset = 0;
             self.search.clear();
             self.json_view = None;
+            self.cached_json = None;
             self.current_slide = 0;
             self.rebuild();
             self.watch_current_file();
@@ -1307,17 +1309,17 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         }
         KeyCode::Char('l') | KeyCode::Right => {
             let jv = state.json_view.as_mut().unwrap();
-            if let Some(path) = jv.cursor_path().map(|s| s.to_string()) {
-                if !jv.expanded.contains(&path) {
-                    jv.cursor_path_save = Some(path.clone());
-                    jv.expanded.insert(path);
-                    state.rebuild();
-                    if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
-                        let vp = state.viewport();
-                        let max = state.max_offset();
-                        if line < state.offset || line >= state.offset + vp {
-                            state.offset = line.saturating_sub(vp / 4).min(max);
-                        }
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string())
+                && !jv.expanded.contains(&path)
+            {
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.insert(path);
+                state.rebuild();
+                if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+                    let vp = state.viewport();
+                    let max = state.max_offset();
+                    if line < state.offset || line >= state.offset + vp {
+                        state.offset = line.saturating_sub(vp / 4).min(max);
                     }
                 }
             }
@@ -1325,17 +1327,19 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         }
         KeyCode::Char('h') | KeyCode::Left => {
             let jv = state.json_view.as_mut().unwrap();
-            if let Some(path) = jv.cursor_path().map(|s| s.to_string()) {
-                if jv.expanded.contains(&path) {
-                    jv.cursor_path_save = Some(path.clone());
-                    jv.expanded.remove(&path);
-                    state.rebuild();
-                }
+            if let Some(path) = jv.cursor_path().map(|s| s.to_string())
+                && jv.expanded.contains(&path)
+            {
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.remove(&path);
+                state.rebuild();
             }
             true
         }
         KeyCode::Char('L') => {
-            state.json_view.as_mut().unwrap().expand_all(&state.content);
+            if let Some(ref value) = state.cached_json {
+                state.json_view.as_mut().unwrap().expand_all(value);
+            }
             state.rebuild();
             if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
                 let vp = state.viewport();
@@ -1487,7 +1491,9 @@ fn handle_json_diagram_keys(state: &mut ViewerState, code: KeyCode) -> bool {
             true
         }
         KeyCode::Char('L') => {
-            state.json_view.as_mut().unwrap().expand_all(&state.content);
+            if let Some(ref value) = state.cached_json {
+                state.json_view.as_mut().unwrap().expand_all(value);
+            }
             diagram_rebuild_and_scroll(state, viewport, content_width);
             true
         }
@@ -1553,10 +1559,8 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
     }
 
     // Interactive JSON: intercept j/k/Enter/h/l for node navigation
-    if state.json_view.is_some() {
-        if handle_json_keys(state, code) {
-            return false;
-        }
+    if state.json_view.is_some() && handle_json_keys(state, code) {
+        return false;
     }
 
     match code {
@@ -2856,7 +2860,11 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             Print("╰─"),
         )?;
         if !bc_label.is_empty() && width > 4 + bc_len + node_len {
-            queue!(stdout, SetForegroundColor(theme.h2), Print(&bc_label),)?;
+            queue!(
+                stdout,
+                SetForegroundColor(theme.json_path),
+                Print(&bc_label),
+            )?;
         }
         if show_hint {
             queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint))?;

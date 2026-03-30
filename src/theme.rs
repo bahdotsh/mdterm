@@ -87,7 +87,6 @@ pub struct Theme {
     pub json_bool: Color,
     pub json_null: Color,
     pub json_bracket: Color,
-    #[allow(dead_code)]
     pub json_path: Color,
 
     is_dark: bool,
