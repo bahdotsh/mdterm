@@ -1105,6 +1105,15 @@ impl ImageCache {
         Ok(())
     }
 
+    /// Reset all `placement_created` flags so placements are recreated on the
+    /// next `transmit_pending_kitty_unicode` call. Must be called after
+    /// `kitty_unicode_delete_all` which clears placements in the terminal.
+    pub fn reset_kitty_unicode_placements(&mut self) {
+        for ki in self.kitty_unicode_images.values_mut().flatten() {
+            ki.placement_created = false;
+        }
+    }
+
     /// Transmit any Kitty Unicode placeholder images and create virtual placements.
     /// Call this once per frame, before rendering placeholder characters.
     pub fn transmit_pending_kitty_unicode(&mut self, stdout: &mut impl Write) -> io::Result<()> {
@@ -1424,6 +1433,9 @@ fn pre_render_image(
             })
         }
         ImageProtocol::KittyUnicode => {
+            // Clamp cols to DIACRITICS table size — each column needs a
+            // combining diacritic and we only have 256 entries.
+            let cols = cols.min(DIACRITICS.len());
             let target_w = (cols as u32 * cell_metrics.cell_w_px).max(1);
             let target_h = (rows as u32 * cell_metrics.cell_h_px).max(1);
             let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);

@@ -2411,6 +2411,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
             }
             crate::image::ImageProtocol::KittyUnicode => {
                 crate::image::kitty_unicode_delete_all(stdout)?;
+                state.image_cache.reset_kitty_unicode_placements();
                 state.image_cache.transmit_pending_kitty_unicode(stdout)?;
             }
             _ => {}
