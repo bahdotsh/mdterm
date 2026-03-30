@@ -886,6 +886,18 @@ impl<'a> JsonRenderer<'a> {
 pub struct NavItem {
     pub line_index: usize,
     pub path: String,
+    /// Card ID this row belongs to (graph view only).
+    pub card_id: String,
+    /// X position of the card for horizontal auto-pan.
+    pub nav_x: usize,
+    /// Width of the card for horizontal auto-pan.
+    pub card_width: usize,
+    /// If this row links to a child card, that card's id.
+    pub child_card_id: Option<String>,
+    /// Nav index of the parent row that connects to this card.
+    pub parent_nav_index: Option<usize>,
+    /// Nav index of the first row in the child card.
+    pub child_nav_index: Option<usize>,
 }
 
 /// State for the interactive JSON explorer.
@@ -897,6 +909,10 @@ pub struct JsonViewState {
     pub cursor_path_save: Option<String>,
     /// When true, show a tree diagram instead of the card explorer.
     pub diagram_mode: bool,
+    /// Horizontal scroll offset for diagram mode.
+    pub h_offset: usize,
+    /// Total canvas width of the last diagram render.
+    pub diagram_canvas_width: usize,
 }
 
 impl JsonViewState {
@@ -907,6 +923,8 @@ impl JsonViewState {
             navigable: Vec::new(),
             cursor_path_save: None,
             diagram_mode: false,
+            h_offset: 0,
+            diagram_canvas_width: 0,
         }
     }
 
@@ -1411,6 +1429,12 @@ impl<'a> CardRenderer<'a> {
         self.navigable.push(NavItem {
             line_index,
             path: path.to_string(),
+            card_id: String::new(),
+            nav_x: 0,
+            card_width: 0,
+            child_card_id: None,
+            parent_nav_index: None,
+            child_nav_index: None,
         });
 
         self.push_line(
@@ -1808,72 +1832,160 @@ fn format_breadcrumb(path: &str) -> String {
     parts.join(" > ")
 }
 
-// ── Diagram view ──────────────────────────────────────────────────
+// ── Horizontal clipping for graph view ───────────────────────────
 
-/// Maximum children shown per node before truncating with "+N more".
-const DIAGRAM_MAX_SIBLINGS: usize = 8;
+/// Clip a row of spans to the visible window `[h_offset, h_offset + visible_width)`.
+/// Characters before h_offset are dropped; characters past visible_width are truncated.
+fn clip_spans_horizontal(
+    spans: &[StyledSpan],
+    h_offset: usize,
+    visible_width: usize,
+) -> Vec<StyledSpan> {
+    if h_offset == 0 && visible_width == usize::MAX {
+        return spans.to_vec();
+    }
+    let end = h_offset + visible_width;
+    let mut result = Vec::new();
+    let mut col = 0usize;
 
-/// A node in the JSON tree for diagram rendering.
-struct DiagramNode {
-    id: String,
-    /// Card-explorer-compatible path for expand/collapse state.
-    nav_path: String,
-    label: String,
-    shape: crate::diagram::NodeShape,
-    children: Vec<String>, // child node ids
-    /// Whether this node can be expanded (is a non-empty container).
-    expandable: bool,
+    for span in spans {
+        let span_w = UnicodeWidthStr::width(span.text.as_str());
+        let span_end = col + span_w;
+
+        if span_end <= h_offset || col >= end {
+            // Entirely outside the visible window
+            col = span_end;
+            continue;
+        }
+
+        // Compute which chars are visible
+        let skip_left = h_offset.saturating_sub(col);
+        let take = (span_end.min(end) - col).saturating_sub(skip_left);
+
+        if take == 0 {
+            col = span_end;
+            continue;
+        }
+
+        // Walk chars, skipping skip_left display columns, taking `take` columns
+        let mut text = String::new();
+        let mut skipped = 0usize;
+        let mut taken = 0usize;
+        for ch in span.text.chars() {
+            let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+            if skipped < skip_left {
+                skipped += cw;
+                continue;
+            }
+            if taken + cw > take {
+                break;
+            }
+            text.push(ch);
+            taken += cw;
+        }
+
+        if !text.is_empty() {
+            result.push(StyledSpan {
+                text,
+                style: span.style.clone(),
+            });
+        }
+
+        col = span_end;
+    }
+
+    result
 }
 
-/// Build diagram nodes from a JSON value, expanding nodes present in `expanded`.
-///
-/// `node_id` is a display-unique identifier for the diagram (e.g. "root", "root/config").
-/// `path` is the expand/collapse path that matches card-explorer conventions
-/// (e.g. "", "config", "config.theme", "[0]").
-fn build_diagram_nodes(
+// ── Graph view (jsoncrack-style) ──────────────────────────────────
+
+/// Maximum rows shown per card before truncating with "+N more".
+const GRAPH_MAX_ROWS: usize = 12;
+
+/// A card in the JSON graph.  Each JSON object/array becomes one card
+/// containing all of its key-value pairs as rows.
+struct GraphCard {
+    id: String,
+    title: String,
+    rows: Vec<GraphCardRow>,
+}
+
+struct GraphCardRow {
+    key: String,
+    value_text: String,
+    value_color: Option<Color>,
+    /// If this row links to an expanded child card, its id.
+    child_card_id: Option<String>,
+    /// Navigation path for expand/collapse.
+    nav_path: String,
+    /// True when the child is expanded and an edge should be drawn.
+    is_connector: bool,
+}
+
+/// Build graph cards from a JSON value. Each object/array becomes one card
+/// containing rows for all its children. Primitive values are shown inline;
+/// nested containers either show a summary (collapsed) or link to a child card
+/// (expanded). No depth limit — the user can expand anything.
+#[allow(clippy::too_many_arguments)]
+fn build_graph_cards(
     value: &Value,
     node_id: &str,
     path: &str,
-    label: &str,
+    title: &str,
     is_root: bool,
-    nodes: &mut Vec<DiagramNode>,
+    cards: &mut Vec<GraphCard>,
     expanded: &HashSet<String>,
+    theme: &Theme,
 ) {
-    use crate::diagram::NodeShape;
+    let is_obj = matches!(value, Value::Object(_));
+    let is_arr = matches!(value, Value::Array(_));
 
-    let (shape, is_obj) = match value {
-        Value::Object(_) => (NodeShape::Rounded, true),
-        Value::Array(_) => (NodeShape::Rectangle, false),
-        _ => {
-            nodes.push(DiagramNode {
-                id: node_id.to_string(),
-                nav_path: path.to_string(),
-                label: label.to_string(),
-                shape: NodeShape::Rectangle,
-                children: Vec::new(),
-                expandable: false,
-            });
-            return;
-        }
-    };
-
-    // Root is always expanded; other nodes check the `expanded` set using
-    // the card-explorer path format.
-    let is_expanded = is_root || expanded.contains(path);
-
-    if !is_expanded {
-        nodes.push(DiagramNode {
+    if !is_obj && !is_arr {
+        // Primitive at root — single card with one inline row
+        let val_text = format_primitive_short(value);
+        let val_color = primitive_color(value, theme);
+        cards.push(GraphCard {
             id: node_id.to_string(),
-            nav_path: path.to_string(),
-            label: label.to_string(),
-            shape,
-            children: Vec::new(),
-            expandable: true,
+            title: title.to_string(),
+            rows: vec![GraphCardRow {
+                key: String::new(),
+                value_text: val_text,
+                value_color: Some(val_color),
+                child_card_id: None,
+                nav_path: path.to_string(),
+                is_connector: false,
+            }],
         });
         return;
     }
 
-    // Build children list
+    let is_expanded = is_root || expanded.contains(path);
+
+    if !is_expanded {
+        // Collapsed card — single row showing count so it's clearly expandable
+        let summary = if is_obj {
+            let m = value.as_object().unwrap();
+            format!("▶ {{{} keys}}", m.len())
+        } else {
+            let a = value.as_array().unwrap();
+            format!("▶ [{} items]", a.len())
+        };
+        cards.push(GraphCard {
+            id: node_id.to_string(),
+            title: title.to_string(),
+            rows: vec![GraphCardRow {
+                key: String::new(),
+                value_text: summary,
+                value_color: Some(theme.json_bracket),
+                child_card_id: None,
+                nav_path: path.to_string(),
+                is_connector: false,
+            }],
+        });
+        return;
+    }
+
+    // Collect children metadata: (child_id, child_path, key_label, &Value)
     let children_meta: Vec<(String, String, String, &Value)> = if is_obj {
         let map = value.as_object().unwrap();
         map.iter()
@@ -1894,88 +2006,122 @@ fn build_diagram_nodes(
             .map(|(i, v)| {
                 let child_id = format!("{}[{}]", node_id, i);
                 let child_path = format!("{}[{}]", path, i);
-                (child_id, child_path, format!("[{}]", i), v)
+                (child_id, child_path, format!("#{}", i + 1), v)
             })
             .collect()
     };
 
-    let mut child_ids = Vec::new();
     let total = children_meta.len();
-    let truncated = total > DIAGRAM_MAX_SIBLINGS;
-    let show_count = if truncated {
-        DIAGRAM_MAX_SIBLINGS
-    } else {
-        total
-    };
+    let truncated = total > GRAPH_MAX_ROWS;
+    let show_count = if truncated { GRAPH_MAX_ROWS } else { total };
+
+    let mut rows = Vec::new();
 
     for (i, (child_id, child_path, key_label, child_val)) in children_meta.iter().enumerate() {
         if i >= show_count {
             break;
         }
+
         let is_container = !is_primitive_or_empty(child_val);
-        let child_expanded = expanded.contains(child_path.as_str());
 
-        let child_label = match child_val {
-            Value::Object(m) if !m.is_empty() && child_expanded => key_label.clone(),
-            Value::Object(m) if !m.is_empty() => format!("{} {{{}}}", key_label, m.len()),
-            Value::Array(a) if !a.is_empty() && child_expanded => key_label.clone(),
-            Value::Array(a) if !a.is_empty() => format!("{} [{}]", key_label, a.len()),
-            _ => {
-                let val_str = format_primitive_short(child_val);
-                format!("{}: {}", key_label, val_str)
-            }
-        };
-
-        child_ids.push(child_id.clone());
-
-        if is_container {
-            build_diagram_nodes(
-                child_val,
-                child_id,
-                child_path,
-                &child_label,
-                false,
-                nodes,
-                expanded,
-            );
-        } else {
-            nodes.push(DiagramNode {
-                id: child_id.clone(),
+        if !is_container {
+            // Primitive or empty — inline value
+            let val_text = format_primitive_short(child_val);
+            let val_color = primitive_color(child_val, theme);
+            rows.push(GraphCardRow {
+                key: key_label.clone(),
+                value_text: val_text,
+                value_color: Some(val_color),
+                child_card_id: None,
                 nav_path: child_path.clone(),
-                label: child_label,
-                shape: match child_val {
-                    Value::Object(_) => NodeShape::Rounded,
-                    Value::Array(_) => NodeShape::Rectangle,
-                    _ => NodeShape::Rectangle,
-                },
-                children: Vec::new(),
-                expandable: false,
+                is_connector: false,
             });
+        } else {
+            let child_expanded = expanded.contains(child_path.as_str());
+
+            if child_expanded {
+                // Expanded child → single connector row + child card
+                let child_title = if is_arr {
+                    format!("{} {}", title, key_label)
+                } else {
+                    key_label.clone()
+                };
+                rows.push(GraphCardRow {
+                    key: key_label.clone(),
+                    value_text: String::new(),
+                    value_color: None,
+                    child_card_id: Some(child_id.clone()),
+                    nav_path: child_path.clone(),
+                    is_connector: true,
+                });
+                build_graph_cards(
+                    child_val,
+                    child_id,
+                    child_path,
+                    &child_title,
+                    false, // user must explicitly expand
+                    cards,
+                    expanded,
+                    theme,
+                );
+            } else {
+                // Collapsed child — summary with ▶ indicator
+                let summary = match child_val {
+                    Value::Object(m) => format!("▶ {{{}}}", m.len()),
+                    Value::Array(a) => format!("▶ [{}]", a.len()),
+                    _ => "…".to_string(),
+                };
+                rows.push(GraphCardRow {
+                    key: key_label.clone(),
+                    value_text: summary,
+                    value_color: Some(theme.json_bracket),
+                    child_card_id: None,
+                    nav_path: child_path.clone(),
+                    is_connector: false,
+                });
+            }
         }
     }
 
     if truncated {
-        let more_id = format!("{}_more", node_id);
-        let more_label = format!("+{} more", total - show_count);
-        child_ids.push(more_id.clone());
-        nodes.push(DiagramNode {
-            id: more_id,
+        rows.push(GraphCardRow {
+            key: String::new(),
+            value_text: format!("+{} more", total - show_count),
+            value_color: Some(theme.overlay_muted),
+            child_card_id: None,
             nav_path: String::new(),
-            label: more_label,
-            shape: NodeShape::Rectangle,
-            children: Vec::new(),
-            expandable: false,
+            is_connector: false,
         });
     }
 
-    nodes.push(DiagramNode {
+    // Handle empty container
+    if rows.is_empty() {
+        let empty_text = if is_obj { "{}" } else { "[]" };
+        rows.push(GraphCardRow {
+            key: String::new(),
+            value_text: empty_text.to_string(),
+            value_color: Some(theme.json_bracket),
+            child_card_id: None,
+            nav_path: String::new(),
+            is_connector: false,
+        });
+    }
+
+    cards.push(GraphCard {
         id: node_id.to_string(),
-        nav_path: path.to_string(),
-        label: label.to_string(),
-        shape,
-        children: child_ids,
-        expandable: !is_root,
+        title: title.to_string(),
+        rows,
     });
+}
+
+fn primitive_color(val: &Value, theme: &Theme) -> Color {
+    match val {
+        Value::String(_) => theme.json_string,
+        Value::Number(_) => theme.json_number,
+        Value::Bool(_) => theme.json_bool,
+        Value::Null => theme.json_null,
+        Value::Object(_) | Value::Array(_) => theme.json_bracket,
+    }
 }
 
 fn format_primitive_short(val: &Value) -> String {
@@ -1984,8 +2130,10 @@ fn format_primitive_short(val: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            if s.len() > 16 {
-                format!("\"{}…\"", &s[..14])
+            let char_count = s.chars().count();
+            if char_count > 40 {
+                let truncated: String = s.chars().take(37).collect();
+                format!("\"{}...\"", truncated)
             } else {
                 format!("\"{}\"", s)
             }
@@ -1996,420 +2144,442 @@ fn format_primitive_short(val: &Value) -> String {
     }
 }
 
-/// Render JSON as a top-down tree diagram using the Canvas from diagram.rs.
+/// Render JSON as a left-to-right graph of connected cards (jsoncrack style).
+/// Render JSON as a left-to-right graph of connected cards.
+/// Returns (lines, doc_info, navigable_items, canvas_width).
 pub fn render_diagram(
     input: &str,
     width: usize,
     theme: &Theme,
     expanded: &HashSet<String>,
     cursor_path: Option<&str>,
-) -> Result<(Vec<Line>, DocumentInfo, Vec<NavItem>), String> {
-    use crate::diagram::{Canvas, NodeLayout, NodeShape, label_box_width};
+    h_offset: usize,
+) -> Result<(Vec<Line>, DocumentInfo, Vec<NavItem>, usize), String> {
+    use crate::diagram::{Canvas, CardDrawRow};
 
     let value: Value =
         serde_json::from_str(input).map_err(|e| format!("JSON parse error: {}", e))?;
 
-    // Root is always expanded in diagram mode, so just show "root"
-    let root_label = "root".to_string();
-
-    let mut all_nodes = Vec::new();
-    build_diagram_nodes(
+    let mut all_cards = Vec::new();
+    build_graph_cards(
         &value,
         "root",
         "",
-        &root_label,
+        "root",
         true,
-        &mut all_nodes,
+        &mut all_cards,
         expanded,
+        theme,
     );
 
-    if all_nodes.is_empty() {
+    if all_cards.is_empty() {
         return Ok((
             Vec::new(),
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
             Vec::new(),
+            0,
         ));
     }
 
-    // Build lookup: id → index
-    let id_to_idx: std::collections::HashMap<String, usize> = all_nodes
+    // Build id → index lookup
+    let id_to_idx: std::collections::HashMap<&str, usize> = all_cards
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.id.clone(), i))
+        .map(|(i, c)| (c.id.as_str(), i))
         .collect();
 
-    // Assign layers via BFS from root
-    let mut layers: Vec<Vec<usize>> = Vec::new();
-    let mut visited = HashSet::new();
-    if let Some(&root_idx) = id_to_idx.get("root") {
+    // ── Column assignment via BFS from root ──
+    let mut columns: Vec<Vec<usize>> = Vec::new();
+    let mut card_col: Vec<usize> = vec![0; all_cards.len()];
+    {
+        let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
-        queue.push_back((root_idx, 0usize));
-        visited.insert(root_idx);
-        while let Some((idx, depth)) = queue.pop_front() {
-            while layers.len() <= depth {
-                layers.push(Vec::new());
+        if let Some(&root_idx) = id_to_idx.get("root") {
+            queue.push_back((root_idx, 0usize));
+            visited.insert(root_idx);
+        }
+        while let Some((idx, col)) = queue.pop_front() {
+            while columns.len() <= col {
+                columns.push(Vec::new());
             }
-            layers[depth].push(idx);
-            for child_id in &all_nodes[idx].children {
-                if let Some(&child_idx) = id_to_idx.get(child_id)
+            columns[col].push(idx);
+            card_col[idx] = col;
+
+            for row in &all_cards[idx].rows {
+                if let Some(ref child_id) = row.child_card_id
+                    && let Some(&child_idx) = id_to_idx.get(child_id.as_str())
                     && visited.insert(child_idx)
                 {
-                    queue.push_back((child_idx, depth + 1));
+                    queue.push_back((child_idx, col + 1));
                 }
             }
         }
     }
 
-    if layers.is_empty() {
+    if columns.is_empty() {
         return Ok((
             Vec::new(),
             DocumentInfo {
                 code_blocks: Vec::new(),
             },
             Vec::new(),
+            0,
         ));
     }
 
-    // Calculate node widths
-    let mut node_widths: Vec<usize> = all_nodes
+    // ── Card dimensions ──
+    let max_card_width = 60usize;
+    let min_card_width = 12usize;
+    let h_gap = 8usize;
+    let v_gap = 2usize;
+
+    let card_widths: Vec<usize> = all_cards
         .iter()
-        .map(|n| label_box_width(&n.label, n.shape))
+        .map(|card| {
+            let title_w = card.title.chars().count() + 6; // "╭─ title ─╮"
+            let max_key = card
+                .rows
+                .iter()
+                .map(|r| r.key.chars().count())
+                .max()
+                .unwrap_or(0);
+            let max_val = card
+                .rows
+                .iter()
+                .map(|r| {
+                    if r.is_connector {
+                        4 // "──▶ "
+                    } else {
+                        r.value_text.chars().count()
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+            let row_w = max_key + max_val + 5; // "│ key  value │"
+            title_w.max(row_w).max(min_card_width).min(max_card_width)
+        })
         .collect();
 
-    let node_height: usize = 3;
-    let edge_gap: usize = 4;
-    let h_gap: usize = 4;
+    let card_heights: Vec<usize> = all_cards
+        .iter()
+        .map(|card| {
+            let row_count = card.rows.len().max(1);
+            row_count + 2 // top border + rows + bottom border
+        })
+        .collect();
 
-    // Trim layers to fit within the available terminal width
-    let max_content_width = width.saturating_sub(10).max(40);
-    let mut removed_ids: HashSet<String> = HashSet::new();
+    // Column widths = max card width in each column
+    let col_widths: Vec<usize> = columns
+        .iter()
+        .map(|col| {
+            col.iter()
+                .map(|&idx| card_widths[idx])
+                .max()
+                .unwrap_or(min_card_width)
+        })
+        .collect();
 
-    #[allow(clippy::needless_range_loop)]
-    for layer_idx in 0..layers.len() {
-        // Exclude nodes whose parents were removed (cascade)
-        if layer_idx > 0 {
-            let mut new_layer = Vec::new();
-            for &idx in &layers[layer_idx] {
-                let node_id = &all_nodes[idx].id;
-                let parent_removed = all_nodes
-                    .iter()
-                    .any(|pn| pn.children.contains(node_id) && removed_ids.contains(&pn.id));
-                if parent_removed {
-                    removed_ids.insert(node_id.clone());
-                } else {
-                    new_layer.push(idx);
-                }
+    // Column x positions
+    let mut col_x: Vec<usize> = Vec::with_capacity(columns.len());
+    {
+        let mut x = 2; // left margin
+        for (i, &cw) in col_widths.iter().enumerate() {
+            col_x.push(x);
+            if i + 1 < col_widths.len() {
+                x += cw + h_gap;
             }
-            layers[layer_idx] = new_layer;
-        }
-
-        // If this layer is too wide, truncate and add "+N more"
-        let layer = &mut layers[layer_idx];
-        let total_w: usize = layer.iter().map(|&i| node_widths[i]).sum::<usize>()
-            + layer.len().saturating_sub(1) * h_gap;
-
-        if total_w > max_content_width && layer.len() > 1 {
-            let more_placeholder_w = label_box_width("+99 more", NodeShape::Rectangle);
-            let target = max_content_width.saturating_sub(more_placeholder_w + h_gap);
-
-            let mut keep = 0;
-            let mut running_w: usize = 0;
-            for &idx in layer.iter() {
-                let nw = node_widths[idx];
-                let next_w = running_w + nw + if keep > 0 { h_gap } else { 0 };
-                if next_w > target && keep > 0 {
-                    break;
-                }
-                running_w = next_w;
-                keep += 1;
-            }
-            keep = keep.max(1);
-
-            let removed_count = layer.len() - keep;
-            for &idx in &layer[keep..] {
-                removed_ids.insert(all_nodes[idx].id.clone());
-            }
-            layer.truncate(keep);
-
-            // Add a "+N more" summary node
-            let more_label = format!("+{} more", removed_count);
-            let more_shape = NodeShape::Rectangle;
-            let more_idx = all_nodes.len();
-            all_nodes.push(DiagramNode {
-                id: format!("_more_{}", layer_idx),
-                nav_path: String::new(),
-                label: more_label.clone(),
-                shape: more_shape,
-                children: Vec::new(),
-                expandable: false,
-            });
-            node_widths.push(label_box_width(&more_label, more_shape));
-            layer.push(more_idx);
         }
     }
 
-    // Remove empty trailing layers
-    while layers.last().is_some_and(|l| l.is_empty()) {
-        layers.pop();
+    // ── Vertical positioning ──
+    // For each child card, try to align it with the parent row that references it.
+    // Process columns left to right. Resolve overlaps by pushing down.
+    struct CardPos {
+        left_x: usize,
+        top_y: usize,
+        width: usize,
+        height: usize,
+        row_ys: Vec<usize>, // y coordinate of each content row (filled after drawing)
     }
+    let mut positions: Vec<Option<CardPos>> = (0..all_cards.len()).map(|_| None).collect();
 
-    if layers.is_empty() {
-        return Ok((
-            Vec::new(),
-            DocumentInfo {
-                code_blocks: Vec::new(),
-            },
-            Vec::new(),
-        ));
-    }
+    // Column 0: start at y=1
+    for (ci, col) in columns.iter().enumerate() {
+        let mut next_y = 1usize;
 
-    // Find widest layer
-    let mut max_layer_width: usize = 0;
-    for layer in &layers {
-        let w: usize = layer.iter().map(|&i| node_widths[i]).sum::<usize>()
-            + layer.len().saturating_sub(1) * h_gap;
-        max_layer_width = max_layer_width.max(w);
-    }
+        for &idx in col {
+            let w = col_widths[ci];
+            let h = card_heights[idx];
 
-    let canvas_width = (max_layer_width + 6).max(20);
-    let canvas_height = layers.len() * (node_height + edge_gap) - edge_gap;
-
-    let mut canvas = Canvas::new(canvas_width, canvas_height);
-    let mut positions: Vec<Option<NodeLayout>> = vec![None; all_nodes.len()];
-
-    let border_fg = Some(theme.code_border);
-    let cursor_border_fg = Some(theme.link);
-    let text_fg = Some(theme.fg);
-    let canvas_center = canvas_width / 2;
-
-    // Draw nodes layer by layer
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        let y = layer_idx * (node_height + edge_gap);
-        let widths_in_layer: Vec<usize> = layer.iter().map(|&i| node_widths[i]).collect();
-        let layer_width: usize =
-            widths_in_layer.iter().sum::<usize>() + layer.len().saturating_sub(1) * h_gap;
-
-        let mut centers: Vec<usize> = Vec::new();
-        let mut cum = 0;
-        for &w in &widths_in_layer {
-            centers.push(cum + w / 2);
-            cum += w + h_gap;
-        }
-        let layer_center = if layer_width > 0 { layer_width / 2 } else { 0 };
-
-        for (i, &idx) in layer.iter().enumerate() {
-            let w = widths_in_layer[i];
-            let cx = (canvas_center as isize + centers[i] as isize - layer_center as isize)
-                .max(w as isize / 2) as usize;
-
-            let is_cursor = cursor_path.is_some_and(|cp| cp == all_nodes[idx].nav_path);
-
-            // Pick color — highlight cursor node with a distinct border
-            let node_border = if is_cursor {
-                cursor_border_fg
+            // Compute ideal y: align with the parent row that references this card
+            let ideal_y = if ci == 0 {
+                next_y
             } else {
-                border_fg
-            };
-            let node_fg = if is_cursor {
-                cursor_border_fg
-            } else {
-                match all_nodes[idx].shape {
-                    NodeShape::Rounded => Some(theme.json_key),
-                    _ => text_fg,
+                // Find the parent card and row that references this card
+                let mut found_y = next_y;
+                'outer: for &parent_idx in &columns[ci - 1] {
+                    if let Some(ref parent_pos) = positions[parent_idx] {
+                        for (ri, row) in all_cards[parent_idx].rows.iter().enumerate() {
+                            if row.child_card_id.as_deref() == Some(&all_cards[idx].id) {
+                                // Align this card's first content row with parent's row
+                                let parent_row_y = parent_pos.top_y + 1 + ri;
+                                found_y = parent_row_y.saturating_sub(1); // align top border near row
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
+                found_y
             };
 
-            canvas.draw_node(
-                cx,
-                y,
-                w,
-                &all_nodes[idx].label,
-                all_nodes[idx].shape,
-                node_border,
-                node_fg,
-            );
-
-            positions[idx] = Some(NodeLayout {
-                center_x: cx,
+            let y = ideal_y.max(next_y);
+            positions[idx] = Some(CardPos {
+                left_x: col_x[ci],
                 top_y: y,
                 width: w,
+                height: h,
+                row_ys: Vec::new(),
             });
+            next_y = y + h + v_gap;
         }
     }
 
-    // Build a fresh id→index map (includes "+more" nodes added during trimming)
-    let full_id_map: std::collections::HashMap<&str, usize> = all_nodes
+    // ── Canvas size ──
+    let canvas_width = {
+        let last_col = columns.len() - 1;
+        col_x[last_col] + col_widths[last_col] + 2
+    };
+    let canvas_height = positions
         .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), i))
-        .collect();
+        .filter_map(|p| p.as_ref().map(|p| p.top_y + p.height))
+        .max()
+        .unwrap_or(1)
+        + 1;
 
-    // Draw edges
-    let edge_fg = Some(theme.code_border);
-    for (idx, node) in all_nodes.iter().enumerate() {
-        if let Some(ref src_pos) = positions[idx] {
-            for child_id in &node.children {
-                if let Some(&child_idx) = full_id_map.get(child_id.as_str())
-                    && let Some(ref dst_pos) = positions[child_idx]
-                {
-                    let src_bottom = src_pos.top_y + 2;
-                    let dst_top = dst_pos.top_y;
-                    canvas.draw_edge_td(
-                        src_pos.center_x,
-                        src_bottom,
-                        dst_pos.center_x,
-                        dst_top,
-                        None,
-                        edge_fg,
-                        None,
-                    );
+    let mut canvas = Canvas::new(canvas_width, canvas_height);
+
+    let border_fg = Some(theme.code_border);
+    let cursor_highlight = Some(theme.link);
+    let key_fg = Some(theme.json_key);
+
+    // Determine which card is focused (contains the cursor)
+    let focused_card_idx: Option<usize> = cursor_path.and_then(|cp| {
+        all_cards
+            .iter()
+            .position(|card| card.rows.iter().any(|r| r.nav_path == cp))
+    });
+
+    // Highlight bg for the focused card
+    let focus_bg = Some(Color::Rgb {
+        r: 40,
+        g: 42,
+        b: 54,
+    });
+
+    // ── Draw cards ──
+    for (idx, card) in all_cards.iter().enumerate() {
+        let pos = match positions[idx].as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Build draw rows
+        let draw_rows: Vec<CardDrawRow> = card
+            .rows
+            .iter()
+            .map(|r| CardDrawRow {
+                key: r.key.clone(),
+                value_text: r.value_text.clone(),
+                value_color: r.value_color,
+                is_connector: r.is_connector,
+            })
+            .collect();
+
+        // Determine which rows to highlight (cursor row within focused card)
+        let is_focused = focused_card_idx == Some(idx);
+        let mut highlight_rows = HashSet::new();
+        if is_focused && let Some(cp) = cursor_path {
+            for (ri, row) in card.rows.iter().enumerate() {
+                if row.nav_path == cp {
+                    highlight_rows.insert(ri);
                 }
+            }
+        }
+
+        let card_border = if is_focused {
+            cursor_highlight
+        } else {
+            border_fg
+        };
+        let card_title_fg = if is_focused {
+            cursor_highlight
+        } else {
+            Some(theme.json_key)
+        };
+
+        let row_ys = canvas.draw_card(
+            pos.left_x,
+            pos.top_y,
+            pos.width,
+            &card.title,
+            &draw_rows,
+            card_border,
+            card_title_fg,
+            key_fg,
+            &highlight_rows,
+            cursor_highlight,
+            if is_focused { focus_bg } else { None },
+        );
+
+        // Store row y positions for edge routing
+        if let Some(p) = positions[idx].as_mut() {
+            p.row_ys = row_ys;
+        }
+    }
+
+    // ── Draw edges (staggered to avoid overlap) ──
+    let edge_fg = Some(theme.code_border);
+    for (idx, card) in all_cards.iter().enumerate() {
+        let src_pos = match positions[idx].as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Count connector rows for stagger calculation
+        let connector_indices: Vec<usize> = card
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.child_card_id.is_some())
+            .map(|(ri, _)| ri)
+            .collect();
+        let num_connectors = connector_indices.len();
+
+        for (ri, row) in card.rows.iter().enumerate() {
+            if let Some(ref child_id) = row.child_card_id
+                && let Some(&child_idx) = id_to_idx.get(child_id.as_str())
+                && let Some(ref dst_pos) = positions[child_idx]
+            {
+                let src_right_x = src_pos.left_x + src_pos.width - 1;
+                let src_cy = if ri < src_pos.row_ys.len() {
+                    src_pos.row_ys[ri]
+                } else {
+                    src_pos.top_y + 1
+                };
+                let dst_left_x = dst_pos.left_x;
+                let dst_cy = dst_pos.top_y + 1; // title row of child
+
+                // Compute staggered mid_x to avoid edge overlap
+                let mid_x_override = if num_connectors > 1 {
+                    let edge_idx = connector_indices
+                        .iter()
+                        .position(|&ci| ci == ri)
+                        .unwrap_or(0);
+                    let gap = dst_left_x.saturating_sub(src_right_x + 2);
+                    let step = gap / (num_connectors + 1);
+                    Some(src_right_x + 1 + step * (edge_idx + 1))
+                } else {
+                    None
+                };
+
+                canvas.draw_edge_lr(
+                    src_pos.left_x + src_pos.width / 2,
+                    src_right_x,
+                    src_cy,
+                    dst_left_x,
+                    dst_cy,
+                    None,
+                    edge_fg,
+                    None,
+                    mid_x_override,
+                );
             }
         }
     }
 
-    // Convert canvas to styled span rows
+    // ── Convert canvas to styled output ──
     let rows = canvas.to_span_rows(theme);
 
-    // Wrap in a bordered block (like emit_diagram_block in markdown.rs)
-    let block_label = "JSON (tree)";
-    let block_width = width.saturating_sub(4).max(20);
-    let bc = theme.code_border;
-    let bg = theme.code_bg;
     let mut lines = Vec::new();
+    let canvas_line_offset = 0;
+    let visible_width = width;
 
-    // Top border
-    let label_with_pad = format!(" {} ", block_label);
-    let label_len = label_with_pad.chars().count();
-    let fill = block_width.saturating_sub(2 + label_len);
-    lines.push(Line {
-        spans: vec![
-            StyledSpan {
-                text: "  \u{256d}\u{2500}".to_string(),
-                style: Style {
-                    fg: Some(bc),
-                    bg: Some(bg),
-                    ..Default::default()
-                },
-            },
-            StyledSpan {
-                text: label_with_pad,
-                style: Style {
-                    fg: Some(theme.code_label),
-                    bg: Some(bg),
-                    ..Default::default()
-                },
-            },
-            StyledSpan {
-                text: format!("{}\u{256e}", "\u{2500}".repeat(fill)),
-                style: Style {
-                    fg: Some(bc),
-                    bg: Some(bg),
-                    ..Default::default()
-                },
-            },
-        ],
-        meta: LineMeta::None,
-    });
-
-    // Empty line after header
-    lines.push(Line {
-        spans: vec![StyledSpan {
-            text: format!("  \u{2502}{}\u{2502}", " ".repeat(block_width - 2)),
-            style: Style {
-                fg: Some(bc),
-                bg: Some(bg),
-                ..Default::default()
-            },
-        }],
-        meta: LineMeta::None,
-    });
-
-    // The canvas content starts at line index 2 (top border + spacer)
-    let canvas_line_offset = lines.len();
-
-    // Content rows
+    // Direct canvas rows with horizontal clipping
     for row_spans in &rows {
-        let row_text: String = row_spans.iter().map(|s| s.text.as_str()).collect();
-        let row_width = UnicodeWidthStr::width(row_text.as_str());
-        let padding = block_width.saturating_sub(4 + row_width);
-
-        let mut spans = Vec::new();
-        spans.push(StyledSpan {
-            text: "  \u{2502} ".to_string(),
-            style: Style {
-                fg: Some(bc),
-                bg: Some(bg),
-                ..Default::default()
-            },
-        });
-        for s in row_spans {
-            spans.push(StyledSpan {
-                text: s.text.clone(),
-                style: Style {
-                    bg: Some(bg),
-                    ..s.style.clone()
-                },
-            });
-        }
-        spans.push(StyledSpan {
-            text: format!("{} \u{2502}", " ".repeat(padding)),
-            style: Style {
-                fg: Some(bc),
-                bg: Some(bg),
-                ..Default::default()
-            },
-        });
+        let clipped = clip_spans_horizontal(row_spans, h_offset, visible_width);
         lines.push(Line {
-            spans,
+            spans: clipped,
             meta: LineMeta::None,
         });
     }
 
-    // Empty line before footer
-    lines.push(Line {
-        spans: vec![StyledSpan {
-            text: format!("  \u{2502}{}\u{2502}", " ".repeat(block_width - 2)),
-            style: Style {
-                fg: Some(bc),
-                bg: Some(bg),
-                ..Default::default()
-            },
-        }],
-        meta: LineMeta::None,
-    });
-
-    // Bottom border
-    lines.push(Line {
-        spans: vec![StyledSpan {
-            text: format!("  \u{2570}{}\u{256f}", "\u{2500}".repeat(block_width - 2)),
-            style: Style {
-                fg: Some(bc),
-                bg: Some(bg),
-                ..Default::default()
-            },
-        }],
-        meta: LineMeta::None,
-    });
-
-    // Build navigable items from expandable nodes, ordered by visual position.
-    // Use the label row (top_y + 1) mapped to the output line index.
+    // ── Build navigable items ──
+    // ALL rows in all cards are navigable. Each item knows its card_id,
+    // and parent/child links for graph-aware navigation.
+    // Order: by column (left to right), then by y position.
     let mut navigable: Vec<NavItem> = Vec::new();
-    // Collect in layer order (BFS order) so navigation follows visual top-to-bottom
-    for layer in &layers {
-        for &idx in layer {
-            if all_nodes[idx].expandable
-                && let Some(ref pos) = positions[idx]
-            {
-                let line_index = canvas_line_offset + pos.top_y + 1; // label row
+
+    for col in &columns {
+        for &idx in col {
+            let card = &all_cards[idx];
+            let pos = match positions[idx].as_ref() {
+                Some(p) => p,
+                None => continue,
+            };
+
+            for (ri, row) in card.rows.iter().enumerate() {
+                let y = if ri < pos.row_ys.len() {
+                    pos.row_ys[ri]
+                } else {
+                    pos.top_y + 1 + ri
+                };
+                let line_index = canvas_line_offset + y;
                 navigable.push(NavItem {
                     line_index,
-                    path: all_nodes[idx].nav_path.clone(),
+                    path: row.nav_path.clone(),
+                    card_id: card.id.clone(),
+                    nav_x: pos.left_x,
+                    card_width: pos.width,
+                    child_card_id: row.child_card_id.clone(),
+                    parent_nav_index: None, // filled in below
+                    child_nav_index: None,  // filled in below
                 });
             }
         }
+    }
+
+    // ── Build parent/child nav indices ──
+    // For each nav item that has a child_card_id, find the first nav item
+    // in that child card. For each card, find the parent nav item that
+    // connects to it.
+    let nav_len = navigable.len();
+    let mut parent_indices: Vec<Option<usize>> = vec![None; nav_len];
+    let mut child_indices: Vec<Option<usize>> = vec![None; nav_len];
+
+    for i in 0..nav_len {
+        if let Some(ref child_id) = navigable[i].child_card_id {
+            // Find the first nav item belonging to this child card
+            if let Some(child_nav_idx) = navigable.iter().position(|n| n.card_id == *child_id) {
+                child_indices[i] = Some(child_nav_idx);
+                // Mark all items in the child card as having this parent
+                for j in child_nav_idx..nav_len {
+                    if navigable[j].card_id == *child_id {
+                        parent_indices[j] = Some(i);
+                    } else if navigable[j].card_id != navigable[child_nav_idx].card_id {
+                        // Moved past the child card's items (they may not be contiguous
+                        // due to column ordering, so we scan all)
+                    }
+                }
+            }
+        }
+    }
+
+    // Write the indices into nav items
+    for i in 0..nav_len {
+        navigable[i].parent_nav_index = parent_indices[i];
+        navigable[i].child_nav_index = child_indices[i];
     }
 
     Ok((
@@ -2418,6 +2588,7 @@ pub fn render_diagram(
             code_blocks: Vec::new(),
         },
         navigable,
+        canvas_width,
     ))
 }
 

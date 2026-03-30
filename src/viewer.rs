@@ -453,16 +453,19 @@ impl ViewerState {
             let jv = self.json_view.as_ref().unwrap();
             if jv.diagram_mode {
                 let cursor_path = jv.cursor_path().map(|s| s.to_string());
+                let h_off = jv.h_offset;
                 match crate::json::render_diagram(
                     &self.content,
                     cw,
                     &self.theme,
                     &jv.expanded,
                     cursor_path.as_deref(),
+                    h_off,
                 ) {
-                    Ok((lines, doc_info, navigable)) => {
+                    Ok((lines, doc_info, navigable, canvas_w)) => {
                         let jv = self.json_view.as_mut().unwrap();
                         jv.navigable = navigable;
+                        jv.diagram_canvas_width = canvas_w;
                         jv.restore_cursor();
                         (lines, doc_info)
                     }
@@ -1216,10 +1219,11 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
     {
         jv.diagram_mode = !jv.diagram_mode;
         let is_diagram = jv.diagram_mode;
+        jv.h_offset = 0;
         state.offset = 0;
         state.rebuild();
         state.set_toast(if is_diagram {
-            "Tree diagram"
+            "Graph view"
         } else {
             "Card explorer"
         });
@@ -1254,23 +1258,18 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         return false;
     }
 
+    let is_diagram = state.json_view.as_ref().is_some_and(|jv| jv.diagram_mode);
+
+    if is_diagram {
+        return handle_json_diagram_keys(state, code);
+    }
+
     let viewport = state.viewport();
 
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             let jv = state.json_view.as_mut().unwrap();
-            let is_diagram = jv.diagram_mode;
             jv.move_cursor(1);
-            if is_diagram {
-                // Diagram mode: cursor highlight is baked into the canvas,
-                // so we must rebuild. Save cursor path so restore_cursor finds it.
-                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
-                    jv.cursor_path_save = Some(p);
-                }
-                let saved_offset = state.offset;
-                state.rebuild();
-                state.offset = saved_offset;
-            }
             if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
                 if line >= state.offset + viewport {
                     state.offset = line.saturating_sub(viewport / 2);
@@ -1283,16 +1282,7 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         }
         KeyCode::Char('k') | KeyCode::Up => {
             let jv = state.json_view.as_mut().unwrap();
-            let is_diagram = jv.diagram_mode;
             jv.move_cursor(-1);
-            if is_diagram {
-                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
-                    jv.cursor_path_save = Some(p);
-                }
-                let saved_offset = state.offset;
-                state.rebuild();
-                state.offset = saved_offset;
-            }
             if let Some(line) = state.json_view.as_ref().and_then(|jv| jv.cursor_line()) {
                 if line < state.offset {
                     state.offset = line;
@@ -1370,6 +1360,188 @@ fn handle_json_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         }
         _ => false,
     }
+}
+
+/// Graph-aware navigation for diagram mode.
+/// j/k: move within current card or to sibling cards
+/// l: jump to child card (auto-expand if collapsed)
+/// h: jump back to parent card
+/// Enter/Space: toggle expand/collapse
+fn handle_json_diagram_keys(state: &mut ViewerState, code: KeyCode) -> bool {
+    let viewport = state.viewport();
+    let content_width = state.content_width();
+
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let jv = state.json_view.as_mut().unwrap();
+            // Move to next row within the same card, or to the next card in column
+            let cur = jv.cursor;
+            if cur + 1 < jv.navigable.len() {
+                let cur_card = jv.navigable[cur].card_id.clone();
+                // Try next row in same card first
+                if jv.navigable[cur + 1].card_id == cur_card {
+                    jv.cursor = cur + 1;
+                } else {
+                    // Jump to next card in the same column or just next navigable
+                    let cur_x = jv.navigable[cur].nav_x;
+                    // Find next item with same nav_x (same column)
+                    let next = jv.navigable[cur + 1..]
+                        .iter()
+                        .position(|n| n.nav_x == cur_x && n.card_id != cur_card)
+                        .map(|p| cur + 1 + p);
+                    jv.cursor = next.unwrap_or(cur + 1);
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            if cur > 0 {
+                let cur_card = jv.navigable[cur].card_id.clone();
+                // Try prev row in same card first
+                if jv.navigable[cur - 1].card_id == cur_card {
+                    jv.cursor = cur - 1;
+                } else {
+                    // Jump to prev card in same column
+                    let cur_x = jv.navigable[cur].nav_x;
+                    let prev = jv.navigable[..cur]
+                        .iter()
+                        .rposition(|n| n.nav_x == cur_x && n.card_id != cur_card);
+                    if let Some(p) = prev {
+                        // Jump to the last row of that card
+                        let target_card = jv.navigable[p].card_id.clone();
+                        let last_in_card = jv.navigable[p..]
+                            .iter()
+                            .rposition(|n| n.card_id == target_card)
+                            .map(|r| p + r)
+                            .unwrap_or(p);
+                        jv.cursor = last_in_card;
+                    } else {
+                        jv.cursor = cur - 1;
+                    }
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            // Jump to child card. Auto-expand if collapsed.
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            let path = jv.navigable[cur].path.clone();
+            let child_idx = jv.navigable[cur].child_nav_index;
+            let mut just_expanded = false;
+
+            if let Some(target) = child_idx {
+                // Already expanded — jump to child
+                jv.cursor = target;
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+            } else if !path.is_empty() && !jv.expanded.contains(&path) {
+                // Expand — after rebuild we'll jump to child
+                jv.cursor_path_save = Some(path.clone());
+                jv.expanded.insert(path);
+                just_expanded = true;
+            } else {
+                return true; // Nothing to do
+            }
+
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+
+            // After expanding, cursor is restored to the parent row.
+            // Now jump to the newly created child.
+            if just_expanded {
+                let jv = state.json_view.as_mut().unwrap();
+                let cur = jv.cursor;
+                if cur < jv.navigable.len()
+                    && let Some(target) = jv.navigable[cur].child_nav_index
+                {
+                    jv.cursor = target;
+                    if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                        jv.cursor_path_save = Some(p);
+                    }
+                    diagram_rebuild_and_scroll(state, viewport, content_width);
+                }
+            }
+            true
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            // Jump to parent card
+            let jv = state.json_view.as_mut().unwrap();
+            let cur = jv.cursor;
+            if let Some(parent_idx) = jv.navigable[cur].parent_nav_index {
+                jv.cursor = parent_idx;
+                if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+                    jv.cursor_path_save = Some(p);
+                }
+            }
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            state.json_view.as_mut().unwrap().toggle_current();
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('L') => {
+            state.json_view.as_mut().unwrap().expand_all(&state.content);
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        KeyCode::Char('H') => {
+            state.json_view.as_mut().unwrap().collapse_all();
+            let jv = state.json_view.as_mut().unwrap();
+            jv.h_offset = 0;
+            diagram_rebuild_and_scroll(state, viewport, content_width);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Rebuild diagram, auto-pan horizontally and vertically to follow cursor.
+fn diagram_rebuild_and_scroll(state: &mut ViewerState, viewport: usize, content_width: usize) {
+    // Save cursor path for restore after rebuild
+    {
+        let jv = state.json_view.as_mut().unwrap();
+        if let Some(p) = jv.cursor_path().map(|s| s.to_string()) {
+            jv.cursor_path_save = Some(p);
+        }
+    }
+
+    state.rebuild();
+
+    // Auto-pan horizontally to keep focused card visible
+    let jv = state.json_view.as_mut().unwrap();
+    if let Some(nav) = jv.navigable.get(jv.cursor) {
+        let card_left = nav.nav_x;
+        let card_right = nav.nav_x + nav.card_width;
+        let margin = 4usize;
+
+        if card_left < jv.h_offset + margin {
+            jv.h_offset = card_left.saturating_sub(margin);
+        } else if card_right + margin > jv.h_offset + content_width {
+            jv.h_offset = (card_right + margin).saturating_sub(content_width);
+        }
+
+        // Re-render with updated h_offset (rebuild uses h_offset from jv)
+        state.rebuild();
+    }
+
+    // Auto-scroll vertically
+    if let Some(line) = state.json_view.as_ref().and_then(|j| j.cursor_line()) {
+        let max = state.max_offset();
+        if line < state.offset {
+            state.offset = line.saturating_sub(2);
+        } else if line >= state.offset + viewport {
+            state.offset = line.saturating_sub(viewport / 2).min(max);
+        }
+    }
+
+    state.dirty = true;
 }
 
 fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> bool {
@@ -2662,9 +2834,9 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
         let node_len = node_label.chars().count();
 
         let hint = if jv.diagram_mode {
-            " j/k navigate · Enter toggle · H/L collapse/expand all · D card view "
+            " j/k rows · h/l parent/child · Enter toggle · H/L all · D card view "
         } else {
-            " j/k navigate · Enter toggle · H/L collapse/expand all · D tree view "
+            " j/k navigate · Enter toggle · H/L collapse/expand all · D graph view "
         };
         let hint_len = hint.chars().count();
         let needed = 4 + bc_len + node_len + hint_len;
