@@ -2663,12 +2663,14 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         }
     }
 
-    // iTerm2/Sixel: overlay images in a second pass (1 escape sequence per image,
+    // iTerm2/Sixel/Terminology: overlay images in a second pass (1 escape sequence per image,
     // not per-row, so scrolling stays smooth).
     if !suppress_images
         && matches!(
             state.image_cache.protocol(),
-            crate::image::ImageProtocol::Iterm2 | crate::image::ImageProtocol::Sixel
+            crate::image::ImageProtocol::Iterm2
+                | crate::image::ImageProtocol::Sixel
+                | crate::image::ImageProtocol::Terminology
         )
     {
         let mut row = 0;
@@ -2702,7 +2704,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                         break;
                     }
                 }
-                // +1 for title bar row
+                // +1 for title bar row; GUTTER_COLS is the 0-based content column start
                 state.image_cache.render_block_image(
                     stdout,
                     &url,
@@ -2710,6 +2712,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     count,
                     content_width,
                     (first_screen_row + 1) as u16,
+                    ViewerState::GUTTER_COLS as u16,
                 )?;
                 row += count;
                 continue;
