@@ -88,6 +88,7 @@ pub struct Theme {
     pub json_null: Color,
     pub json_bracket: Color,
     pub json_path: Color,
+    pub json_focus_bg: Color,
 
     is_dark: bool,
 }
@@ -371,6 +372,11 @@ impl Theme {
                 g: 166,
                 b: 247,
             },
+            json_focus_bg: Color::Rgb {
+                r: 40,
+                g: 42,
+                b: 54,
+            },
         }
     }
 
@@ -651,6 +657,11 @@ impl Theme {
                 r: 136,
                 g: 57,
                 b: 239,
+            },
+            json_focus_bg: Color::Rgb {
+                r: 220,
+                g: 224,
+                b: 232,
             },
         }
     }

@@ -457,7 +457,7 @@ impl ViewerState {
                     Err(_) => {
                         // Fall back to markdown rendering on parse error
                         self.json_view = None;
-                        self.cached_json = None;
+                        self.set_toast("Invalid JSON — showing as plain text");
                     }
                 }
             }
@@ -1520,12 +1520,17 @@ fn diagram_rebuild_and_scroll(state: &mut ViewerState, viewport: usize, content_
 
     state.rebuild();
 
-    // Auto-pan horizontally to keep focused card visible
+    // Auto-pan horizontally to keep focused card visible.
+    // Card positions (nav_x, card_width) are layout-determined and don't
+    // depend on h_offset, so we can compute the correct offset from the
+    // first rebuild. Only re-render if h_offset actually changed (since
+    // h_offset controls horizontal clipping of the canvas output).
     let jv = state.json_view.as_mut().unwrap();
     if let Some(nav) = jv.navigable.get(jv.cursor) {
         let card_left = nav.nav_x;
         let card_right = nav.nav_x + nav.card_width;
         let margin = 4usize;
+        let old_h_offset = jv.h_offset;
 
         if card_left < jv.h_offset + margin {
             jv.h_offset = card_left.saturating_sub(margin);
@@ -1533,8 +1538,9 @@ fn diagram_rebuild_and_scroll(state: &mut ViewerState, viewport: usize, content_
             jv.h_offset = (card_right + margin).saturating_sub(content_width);
         }
 
-        // Re-render with updated h_offset (rebuild uses h_offset from jv)
-        state.rebuild();
+        if jv.h_offset != old_h_offset {
+            state.rebuild();
+        }
     }
 
     // Auto-scroll vertically

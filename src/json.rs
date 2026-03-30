@@ -213,15 +213,15 @@ fn build_table_lines(theme: &Theme, arr: &[Value], indent: &str, available: usiz
         }
     }
 
-    // Build cell text matrix
-    let rows: Vec<Vec<String>> = objects
+    // Build cell text + type matrix (preserve type for correct coloring)
+    let rows: Vec<Vec<(String, CellType)>> = objects
         .iter()
         .map(|obj| {
             headers
                 .iter()
                 .map(|h| match obj.get(h) {
-                    Some(v) => value_to_short_string(v),
-                    None => String::new(),
+                    Some(v) => (value_to_short_string(v), CellType::from_value(v)),
+                    None => (String::new(), CellType::String),
                 })
                 .collect()
         })
@@ -235,7 +235,7 @@ fn build_table_lines(theme: &Theme, arr: &[Value], indent: &str, available: usiz
             let header_w = UnicodeWidthStr::width(h.as_str());
             let max_cell = rows
                 .iter()
-                .map(|r| UnicodeWidthStr::width(r[ci].as_str()))
+                .map(|r| UnicodeWidthStr::width(r[ci].0.as_str()))
                 .max()
                 .unwrap_or(0);
             header_w.max(max_cell).max(3)
@@ -326,10 +326,10 @@ fn build_table_lines(theme: &Theme, arr: &[Value], indent: &str, available: usiz
             text: format!("{}│ ", indent),
             style: style_fg(bc),
         }];
-        for (ci, cell) in row.iter().enumerate() {
-            let fg = cell_color(cell, theme);
+        for (ci, (text, cell_type)) in row.iter().enumerate() {
+            let fg = cell_type.color(theme);
             spans.push(StyledSpan {
-                text: pad_or_truncate(cell, col_widths[ci]),
+                text: pad_or_truncate(text, col_widths[ci]),
                 style: style_fg(fg),
             });
             if ci < row.len() - 1 {
@@ -856,8 +856,12 @@ impl JsonViewState {
         if self.navigable.is_empty() {
             return;
         }
-        let new = (self.cursor as i32 + delta).clamp(0, self.navigable.len() as i32 - 1);
-        self.cursor = new as usize;
+        let last = self.navigable.len() - 1;
+        if delta > 0 {
+            self.cursor = (self.cursor + delta as usize).min(last);
+        } else {
+            self.cursor = self.cursor.saturating_sub(delta.unsigned_abs() as usize);
+        }
     }
 
     /// After a rebuild, restore cursor to the same path (or clamp).
@@ -1362,15 +1366,32 @@ fn pad_or_truncate(s: &str, width: usize) -> String {
     }
 }
 
-fn cell_color(text: &str, theme: &Theme) -> Color {
-    if text == "null" {
-        theme.json_null
-    } else if text == "true" || text == "false" {
-        theme.json_bool
-    } else if text.parse::<f64>().is_ok() && !text.is_empty() {
-        theme.json_number
-    } else {
-        theme.json_string
+/// Tracks the JSON type of a table cell for accurate coloring.
+#[derive(Clone, Copy)]
+enum CellType {
+    String,
+    Number,
+    Bool,
+    Null,
+}
+
+impl CellType {
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Null => CellType::Null,
+            Value::Bool(_) => CellType::Bool,
+            Value::Number(_) => CellType::Number,
+            _ => CellType::String,
+        }
+    }
+
+    fn color(self, theme: &Theme) -> Color {
+        match self {
+            CellType::Null => theme.json_null,
+            CellType::Bool => theme.json_bool,
+            CellType::Number => theme.json_number,
+            CellType::String => theme.json_string,
+        }
     }
 }
 
@@ -1987,11 +2008,7 @@ pub fn render_diagram(
     });
 
     // Highlight bg for the focused card
-    let focus_bg = Some(Color::Rgb {
-        r: 40,
-        g: 42,
-        b: 54,
-    });
+    let focus_bg = Some(theme.json_focus_bg);
 
     // ── Draw cards ──
     for (idx, card) in all_cards.iter().enumerate() {
