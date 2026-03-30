@@ -2403,9 +2403,18 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     // Skip image rendering entirely when an overlay is visible so
     // images don't bleed through the overlay.
     let suppress_images = !matches!(state.mode, ViewMode::Normal | ViewMode::Search);
-    if !suppress_images && state.image_cache.protocol() == crate::image::ImageProtocol::Kitty {
-        crate::image::kitty_delete_all(stdout)?;
-        state.image_cache.transmit_pending_kitty(stdout)?;
+    if !suppress_images {
+        match state.image_cache.protocol() {
+            crate::image::ImageProtocol::Kitty => {
+                crate::image::kitty_delete_all(stdout)?;
+                state.image_cache.transmit_pending_kitty(stdout)?;
+            }
+            crate::image::ImageProtocol::KittyUnicode => {
+                crate::image::kitty_unicode_delete_all(stdout)?;
+                state.image_cache.transmit_pending_kitty_unicode(stdout)?;
+            }
+            _ => {}
+        }
     }
 
     // Determine the line range visible in the current slide (or the full

@@ -10,6 +10,10 @@ use image::{DynamicImage, GenericImageView, imageops::FilterType};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImageProtocol {
     Kitty,
+    /// Kitty protocol with Unicode placeholders — works through tmux by uploading
+    /// image data via DCS passthrough and using U+10EEEE placeholder characters
+    /// for placement instead of direct Kitty placement commands.
+    KittyUnicode,
     Iterm2,
     Sixel,
     /// Universal fallback: render images using Unicode half-block characters (▀)
@@ -22,6 +26,9 @@ pub fn detect_protocol() -> ImageProtocol {
     if let Ok(proto) = std::env::var("MDTERM_IMAGE_PROTOCOL") {
         match proto.to_lowercase().as_str() {
             "kitty" => return ImageProtocol::Kitty,
+            "kittyunicode" | "kitty-unicode" | "kitty_unicode" => {
+                return ImageProtocol::KittyUnicode;
+            }
             "iterm2" => return ImageProtocol::Iterm2,
             "sixel" => return ImageProtocol::Sixel,
             "halfblock" => return ImageProtocol::HalfBlock,
@@ -29,7 +36,32 @@ pub fn detect_protocol() -> ImageProtocol {
         }
     }
 
-    // Kitty checks first (more efficient: upload once, place per-frame)
+    // When inside tmux, standard Kitty placement commands don't work.
+    // Use Unicode placeholder method instead: upload via DCS passthrough,
+    // place via U+10EEEE characters that tmux treats as normal text.
+    let in_tmux = std::env::var("TMUX").is_ok();
+    if in_tmux {
+        if let Ok(term) = std::env::var("TERM_PROGRAM") {
+            match term.as_str() {
+                "ghostty" | "WezTerm" => return ImageProtocol::KittyUnicode,
+                "iTerm.app" => return ImageProtocol::Iterm2,
+                _ => {}
+            }
+        }
+        if let Ok(term) = std::env::var("TERM")
+            && (term == "xterm-ghostty" || term == "xterm-kitty")
+        {
+            return ImageProtocol::KittyUnicode;
+        }
+        if std::env::var("KITTY_WINDOW_ID").is_ok() {
+            return ImageProtocol::KittyUnicode;
+        }
+        if std::env::var("KONSOLE_VERSION").is_ok() {
+            return ImageProtocol::KittyUnicode;
+        }
+    }
+
+    // Kitty checks (more efficient: upload once, place per-frame)
     if std::env::var("KITTY_WINDOW_ID").is_ok() {
         return ImageProtocol::Kitty;
     }
@@ -181,6 +213,120 @@ fn place_kitty_image(
 pub fn kitty_delete_all(stdout: &mut impl Write) -> io::Result<()> {
     stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\")?;
     Ok(())
+}
+
+// ── Kitty Unicode placeholder protocol (for tmux) ─────────────────────────
+
+/// Combining diacritics used for row/column encoding in the Kitty Unicode
+/// placeholder method. These are combining class 230 characters from Unicode
+/// with no decomposition mappings.
+/// Source: <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>
+const DIACRITICS: [char; 256] = [
+    '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}',
+    '\u{033E}', '\u{033F}', '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}',
+    '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}', '\u{035B}', '\u{0363}',
+    '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
+    '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}', '\u{036E}', '\u{036F}',
+    '\u{0483}', '\u{0484}', '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}',
+    '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}', '\u{0598}', '\u{0599}',
+    '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
+    '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}',
+    '\u{0610}', '\u{0611}', '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}',
+    '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}', '\u{0659}', '\u{065A}',
+    '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
+    '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}',
+    '\u{06E1}', '\u{06E2}', '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EB}',
+    '\u{06EC}', '\u{0730}', '\u{0732}', '\u{0733}', '\u{0735}', '\u{0736}',
+    '\u{073A}', '\u{073D}', '\u{073F}', '\u{0740}', '\u{0741}', '\u{0743}',
+    '\u{0745}', '\u{0747}', '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}',
+    '\u{07ED}', '\u{07EE}', '\u{07EF}', '\u{07F0}', '\u{07F1}', '\u{07F3}',
+    '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}', '\u{081B}', '\u{081C}',
+    '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}', '\u{0822}',
+    '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}',
+    '\u{082B}', '\u{082C}', '\u{082D}', '\u{0951}', '\u{0953}', '\u{0954}',
+    '\u{0F82}', '\u{0F83}', '\u{0F86}', '\u{0F87}', '\u{135D}', '\u{135E}',
+    '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}', '\u{1A76}',
+    '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}',
+    '\u{1B6B}', '\u{1B6D}', '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}',
+    '\u{1B72}', '\u{1B73}', '\u{1CD0}', '\u{1CD1}', '\u{1CD2}', '\u{1CDA}',
+    '\u{1CDB}', '\u{1CE0}', '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}',
+    '\u{1DC5}', '\u{1DC6}', '\u{1DC7}', '\u{1DC8}', '\u{1DC9}', '\u{1DCB}',
+    '\u{1DCC}', '\u{1DD1}', '\u{1DD2}', '\u{1DD3}', '\u{1DD4}', '\u{1DD5}',
+    '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}', '\u{1DDA}', '\u{1DDB}',
+    '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
+    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}',
+    '\u{20D0}', '\u{20D1}', '\u{20D4}', '\u{20D5}', '\u{20D6}', '\u{20D7}',
+    '\u{20DB}', '\u{20DC}', '\u{20E1}', '\u{20E7}', '\u{20E9}', '\u{20F0}',
+    '\u{2CEF}', '\u{2CF0}', '\u{2CF1}', '\u{2DE0}', '\u{2DE1}', '\u{2DE2}',
+    '\u{2DE3}', '\u{2DE4}', '\u{2DE5}', '\u{2DE6}', '\u{2DE7}', '\u{2DE8}',
+    '\u{2DE9}', '\u{2DEA}', '\u{2DEB}', '\u{2DEC}', '\u{2DED}', '\u{2DEE}',
+    '\u{2DEF}', '\u{2DF0}', '\u{2DF1}', '\u{2DF2}', '\u{2DF3}', '\u{2DF4}',
+    '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}', '\u{2DF9}', '\u{2DFA}',
+    '\u{2DFB}', '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}', '\u{A66F}',
+    '\u{A67C}', '\u{A67D}', '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}',
+    '\u{A8E2}', '\u{A8E3}', '\u{A8E4}', '\u{A8E5}',
+];
+
+/// Wrap a Kitty graphics escape sequence in tmux DCS passthrough.
+/// Inner `\x1b` bytes are doubled so tmux forwards them correctly.
+fn tmux_wrap(kitty_escape: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(kitty_escape.len() * 2 + 20);
+    out.extend_from_slice(b"\x1bPtmux;");
+    for &byte in kitty_escape {
+        if byte == 0x1b {
+            out.push(0x1b);
+        }
+        out.push(byte);
+    }
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// Transmit image data via tmux DCS passthrough to the outer terminal.
+fn transmit_kitty_image_tmux(
+    stdout: &mut impl Write,
+    png_data: &[u8],
+    id: u32,
+) -> io::Result<()> {
+    let b64 = BASE64.encode(png_data);
+    let chunk_size = 4096;
+    let total_chunks = b64.len().div_ceil(chunk_size);
+
+    for (i, chunk) in b64.as_bytes().chunks(chunk_size).enumerate() {
+        let more = if i < total_chunks - 1 { 1 } else { 0 };
+        let mut kitty_seq = Vec::new();
+        if i == 0 {
+            kitty_seq.extend_from_slice(
+                format!("\x1b_Ga=t,f=100,t=d,i={},q=2,m={};", id, more).as_bytes(),
+            );
+        } else {
+            kitty_seq.extend_from_slice(format!("\x1b_Gm={};", more).as_bytes());
+        }
+        kitty_seq.extend_from_slice(chunk);
+        kitty_seq.extend_from_slice(b"\x1b\\");
+        stdout.write_all(&tmux_wrap(&kitty_seq))?;
+    }
+    Ok(())
+}
+
+/// Create a virtual placement (U=1) for Unicode placeholder rendering via tmux.
+fn create_virtual_placement_tmux(
+    stdout: &mut impl Write,
+    id: u32,
+    cols: usize,
+    rows: usize,
+) -> io::Result<()> {
+    let kitty_seq = format!(
+        "\x1b_Ga=p,U=1,i={},c={},r={},q=2;\x1b\\",
+        id, cols, rows
+    );
+    stdout.write_all(&tmux_wrap(kitty_seq.as_bytes()))
+}
+
+/// Delete all Kitty image placements via tmux DCS passthrough.
+pub fn kitty_unicode_delete_all(stdout: &mut impl Write) -> io::Result<()> {
+    let kitty_seq = b"\x1b_Ga=d,d=a\x1b\\";
+    stdout.write_all(&tmux_wrap(kitty_seq))
 }
 
 // ── Sixel graphics protocol ─────────────────────────────────────────────────
@@ -448,6 +594,17 @@ struct KittyImage {
     pending_png: Option<Vec<u8>>,
 }
 
+/// Pre-rendered Kitty Unicode placeholder image for tmux environments.
+struct KittyUnicodeImage {
+    id: u32,
+    cols: usize,
+    rows: usize,
+    /// PNG data waiting to be transmitted; `None` once uploaded.
+    pending_png: Option<Vec<u8>>,
+    /// Whether the virtual placement has been created.
+    placement_created: bool,
+}
+
 /// Pre-rendered iTerm2 image: full image cached, crops computed on demand.
 struct Iterm2Image {
     cols: usize,
@@ -496,6 +653,12 @@ enum PreRenderedResult {
         cell_h_px: u32,
         png: Vec<u8>,
     },
+    KittyUnicode {
+        id: u32,
+        cols: usize,
+        rows: usize,
+        png: Vec<u8>,
+    },
     Iterm2 {
         cols: usize,
         total_rows: usize,
@@ -524,6 +687,8 @@ pub struct ImageCache {
 
     // Kitty: image uploaded once, placed per-frame (None = encode failed)
     kitty_images: HashMap<String, Option<KittyImage>>,
+    // Kitty Unicode placeholder: for tmux environments
+    kitty_unicode_images: HashMap<String, Option<KittyUnicodeImage>>,
     next_kitty_id: u32,
 
     // iTerm2: pre-cropped strips cached per image (None = encode failed)
@@ -558,6 +723,7 @@ impl ImageCache {
             images: HashMap::new(),
             protocol,
             kitty_images: HashMap::new(),
+            kitty_unicode_images: HashMap::new(),
             // Starts at 0; wrapping_add(1) before first use ensures IDs begin at 1.
             // ID 0 is reserved in the Kitty protocol ("the last image").
             next_kitty_id: 0,
@@ -587,6 +753,7 @@ impl ImageCache {
         {
             self.cell_metrics = new;
             self.kitty_images.clear();
+            self.kitty_unicode_images.clear();
             self.iterm2_images.clear();
             self.sixel_images.clear();
             // Cancel stale in-flight pre-renders
@@ -719,6 +886,9 @@ impl ImageCache {
     pub fn is_ready_to_render(&self, url: &str) -> bool {
         match self.protocol {
             ImageProtocol::Kitty => self.kitty_images.get(url).is_some_and(|o| o.is_some()),
+            ImageProtocol::KittyUnicode => {
+                self.kitty_unicode_images.get(url).is_some_and(|o| o.is_some())
+            }
             ImageProtocol::Iterm2 => self.iterm2_images.get(url).is_some_and(|o| o.is_some()),
             ImageProtocol::Sixel => self.sixel_images.get(url).is_some_and(|o| o.is_some()),
             ImageProtocol::HalfBlock => self.halfblock_images.contains_key(url),
@@ -744,9 +914,13 @@ impl ImageCache {
         let protocol = self.protocol;
         let cell_metrics = self.cell_metrics;
 
-        let kitty_id = if protocol == ImageProtocol::Kitty {
+        let kitty_id = if matches!(protocol, ImageProtocol::Kitty | ImageProtocol::KittyUnicode) {
             self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
-            if self.next_kitty_id == 0 {
+            // ID 0 is reserved; for KittyUnicode also stay within 24-bit range
+            // since the image ID is encoded in the foreground color.
+            if self.next_kitty_id == 0
+                || (protocol == ImageProtocol::KittyUnicode && self.next_kitty_id > 0x00FF_FFFF)
+            {
                 self.next_kitty_id = 1;
             }
             self.next_kitty_id
@@ -768,6 +942,7 @@ impl ImageCache {
     pub fn queue_all_pre_renders(&mut self, content_width: usize, bg: (u8, u8, u8)) {
         if content_width != self.last_render_width {
             self.kitty_images.clear();
+            self.kitty_unicode_images.clear();
             self.iterm2_images.clear();
             self.sixel_images.clear();
             self.halfblock_images.clear();
@@ -821,6 +996,18 @@ impl ImageCache {
                                 target_h,
                                 cell_h_px,
                                 pending_png: Some(png),
+                            }),
+                        );
+                    }
+                    PreRenderedResult::KittyUnicode { id, cols, rows, png } => {
+                        self.kitty_unicode_images.insert(
+                            url,
+                            Some(KittyUnicodeImage {
+                                id,
+                                cols,
+                                rows,
+                                pending_png: Some(png),
+                                placement_created: false,
                             }),
                         );
                     }
@@ -897,6 +1084,9 @@ impl ImageCache {
     ) -> io::Result<bool> {
         match self.protocol {
             ImageProtocol::Kitty => self.render_kitty_row(stdout, url, image_row, content_width),
+            ImageProtocol::KittyUnicode => {
+                self.render_kitty_unicode_row(stdout, url, image_row, content_width)
+            }
             ImageProtocol::HalfBlock => {
                 self.render_halfblock_row(stdout, url, image_row, content_width, bg)
             }
@@ -910,6 +1100,21 @@ impl ImageCache {
         for ki in self.kitty_images.values_mut().flatten() {
             if let Some(png_data) = ki.pending_png.take() {
                 transmit_kitty_image(stdout, &png_data, ki.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Transmit any Kitty Unicode placeholder images and create virtual placements.
+    /// Call this once per frame, before rendering placeholder characters.
+    pub fn transmit_pending_kitty_unicode(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        for ki in self.kitty_unicode_images.values_mut().flatten() {
+            if let Some(png_data) = ki.pending_png.take() {
+                transmit_kitty_image_tmux(stdout, &png_data, ki.id)?;
+            }
+            if !ki.placement_created {
+                create_virtual_placement_tmux(stdout, ki.id, ki.cols, ki.rows)?;
+                ki.placement_created = true;
             }
         }
         Ok(())
@@ -940,6 +1145,47 @@ impl ImageCache {
         place_kitty_image(stdout, ki.id, ki.cols, src_y, ki.target_w, src_h)?;
         // Kitty doesn't advance cursor — write spaces to fill the content width
         write!(stdout, "{}", " ".repeat(content_width - x_offset))?;
+        Ok(true)
+    }
+
+    fn render_kitty_unicode_row(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        image_row: usize,
+        content_width: usize,
+    ) -> io::Result<bool> {
+        let ki = match self.kitty_unicode_images.get(url).and_then(|o| o.as_ref()) {
+            Some(ki) => ki,
+            None => return Ok(false),
+        };
+        if image_row >= ki.rows {
+            return Ok(false);
+        }
+
+        let x_offset = content_width.saturating_sub(ki.cols) / 2;
+        if x_offset > 0 {
+            write!(stdout, "{}", " ".repeat(x_offset))?;
+        }
+
+        // Encode image ID as 24-bit RGB foreground color
+        let r = (ki.id >> 16) & 0xFF;
+        let g = (ki.id >> 8) & 0xFF;
+        let b = ki.id & 0xFF;
+        write!(stdout, "\x1b[38;2;{};{};{}m", r, g, b)?;
+
+        let row_diacritic = DIACRITICS[image_row];
+        for &col_diacritic in &DIACRITICS[..ki.cols] {
+            write!(stdout, "\u{10EEEE}{}{}", row_diacritic, col_diacritic)?;
+        }
+
+        // Reset foreground color
+        write!(stdout, "\x1b[39m")?;
+
+        let used = x_offset + ki.cols;
+        if used < content_width {
+            write!(stdout, "{}", " ".repeat(content_width - used))?;
+        }
         Ok(true)
     }
 
@@ -1174,6 +1420,18 @@ fn pre_render_image(
                 target_w,
                 target_h,
                 cell_h_px: cell_metrics.cell_h_px,
+                png,
+            })
+        }
+        ImageProtocol::KittyUnicode => {
+            let target_w = (cols as u32 * cell_metrics.cell_w_px).max(1);
+            let target_h = (rows as u32 * cell_metrics.cell_h_px).max(1);
+            let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+            let png = encode_png(&resized)?;
+            Some(PreRenderedResult::KittyUnicode {
+                id: kitty_id,
+                cols,
+                rows,
                 png,
             })
         }
