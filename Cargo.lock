@@ -616,7 +616,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "mdterm"
-version = "1.5.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "clap",
