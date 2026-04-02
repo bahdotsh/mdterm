@@ -965,26 +965,32 @@ impl ImageCache {
         // the render channel is replaced before the thread completes (M3 fix).
         let temp_files_ref = Arc::clone(&self.temp_files);
         std::thread::spawn(move || {
+            // SAFETY (AssertUnwindSafe): all captured values are either owned
+            // or wrapped in Arc/Mutex, which are both Send + unwind-safe at the
+            // API level.  The Terminology arm acquires the mutex for a single
+            // Vec::push and releases it immediately — no code between lock() and
+            // the implicit drop can panic — so the closure cannot poison the
+            // mutex from the inside.  Poison from other threads is recovered via
+            // unwrap_or_else in the Terminology arm.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if protocol == ImageProtocol::Terminology {
-                    pre_render_terminology(&img, &url_owned, content_width, cell_metrics).map(
-                        |ti| {
-                            // Register the temp path in the shared registry *before*
-                            // sending it back, so it survives channel replacement.
-                            // Recover from mutex poison: we still want to register
-                            // the path even if a previous thread panicked holding
-                            // the lock (the inner Vec is still valid data).
-                            if ti.is_temp {
-                                let mut files =
-                                    temp_files_ref.lock().unwrap_or_else(|e| e.into_inner());
-                                files.push(ti.path.clone());
-                            }
-                            PreRenderedResult::Terminology { img: ti }
-                        },
-                    )
-                } else {
-                    pre_render_image(&img, protocol, content_width, cell_metrics, bg, kitty_id)
-                }
+                // `then` (lazy) is intentional: `TerminologyCtx` borrows
+                // `temp_files_ref`, which is a local — `then_some` would
+                // evaluate eagerly and fail the borrow checker.
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let terminology =
+                    (protocol == ImageProtocol::Terminology).then(|| TerminologyCtx {
+                        url: url_owned.as_str(),
+                        temp_files: &temp_files_ref,
+                    });
+                pre_render_image(
+                    &img,
+                    protocol,
+                    content_width,
+                    cell_metrics,
+                    bg,
+                    kitty_id,
+                    terminology.as_ref(),
+                )
             }))
             .unwrap_or(None);
             let _ = sender.send((url_for_send, content_width, result));
@@ -1598,6 +1604,18 @@ fn blend_alpha(pixel: image::Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
 
 // ── Fetching ────────────────────────────────────────────────────────────────
 
+/// Extra context required by the [`ImageProtocol::Terminology`] pre-render
+/// arm.  Pass `None` for all other protocols; the fields are only accessed
+/// inside the `Terminology` match arm.
+struct TerminologyCtx<'a> {
+    /// Original image URL (or file path), used to derive a stable path for
+    /// the temporary file that Terminology reads.
+    url: &'a str,
+    /// Shared registry of temporary-file paths; entries are cleaned up on
+    /// resize, theme change, or process exit.
+    temp_files: &'a Arc<Mutex<Vec<String>>>,
+}
+
 /// Pre-render an image for a specific protocol on a background thread.
 fn pre_render_image(
     img: &DynamicImage,
@@ -1606,6 +1624,7 @@ fn pre_render_image(
     cell_metrics: CellMetrics,
     bg: (u8, u8, u8),
     kitty_id: u32,
+    terminology: Option<&TerminologyCtx<'_>>,
 ) -> Option<PreRenderedResult> {
     let (img_w, img_h) = img.dimensions();
     let (cols, rows) = calc_display_cells(
@@ -1686,8 +1705,28 @@ fn pre_render_image(
                 resized,
             })
         }
-        // Terminology is handled before this function is called (in queue_pre_render).
-        ImageProtocol::Terminology => None,
+        ImageProtocol::Terminology => {
+            let ctx = terminology
+                .expect("pre_render_image: Terminology protocol requires a TerminologyCtx");
+            pre_render_terminology(img, ctx.url, content_width, cell_metrics).map(|ti| {
+                if ti.is_temp {
+                    // Register the temp path in the shared registry *before* wrapping
+                    // the result, so it is cleaned up even if the render channel is
+                    // replaced before the result is polled (e.g. on a resize event).
+                    //
+                    // SAFETY (AssertUnwindSafe): the MutexGuard `files` is held only
+                    // for the single `push` call and is immediately dropped.  No code
+                    // between `lock()` and the implicit drop can panic, so this
+                    // closure cannot poison the mutex.  Poison from other threads is
+                    // handled by `unwrap_or_else`: Vec::push either completes or has
+                    // not run yet when a panic occurs, so the contents are always
+                    // consistent.
+                    let mut files = ctx.temp_files.lock().unwrap_or_else(|e| e.into_inner());
+                    files.push(ti.path.to_owned());
+                }
+                PreRenderedResult::Terminology { img: ti }
+            })
+        }
     }
 }
 
@@ -2741,17 +2780,18 @@ mod tests {
     /// `TMUX` is unset, regardless of other env vars.
     #[test]
     fn detect_terminology_protocol() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        let saved_terminology = std::env::var("TERMINOLOGY").ok();
-        let saved_tmux = std::env::var("TMUX").ok();
-        let saved_kitty = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_term_program = std::env::var("TERM_PROGRAM").ok();
-        let saved_term = std::env::var("TERM").ok();
-        let saved_lc_terminal = std::env::var("LC_TERMINAL").ok();
-        let saved_mlterm = std::env::var("MLTERM").ok();
-        let saved_konsole = std::env::var("KONSOLE_VERSION").ok();
-        let saved_override = std::env::var("MDTERM_IMAGE_PROTOCOL").ok();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&[
+            "TERMINOLOGY",
+            "TMUX",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "TERM",
+            "LC_TERMINAL",
+            "MLTERM",
+            "KONSOLE_VERSION",
+            "MDTERM_IMAGE_PROTOCOL",
+        ]);
 
         // Safety: test holds ENV_LOCK mutex, preventing concurrent env mutation.
         unsafe {
@@ -2767,35 +2807,26 @@ mod tests {
         }
 
         let proto = detect_protocol();
-
-        restore_env("TERMINOLOGY", saved_terminology);
-        restore_env("TMUX", saved_tmux);
-        restore_env("KITTY_WINDOW_ID", saved_kitty);
-        restore_env("TERM_PROGRAM", saved_term_program);
-        restore_env("TERM", saved_term);
-        restore_env("LC_TERMINAL", saved_lc_terminal);
-        restore_env("MLTERM", saved_mlterm);
-        restore_env("KONSOLE_VERSION", saved_konsole);
-        restore_env("MDTERM_IMAGE_PROTOCOL", saved_override);
-
         assert_eq!(proto, ImageProtocol::Terminology);
+        // _env restores all saved vars on drop.
     }
 
     /// When `TERMINOLOGY=1` AND `TMUX` is also set, the `ESC }` protocol cannot
     /// pass through tmux DCS — fall back to `HalfBlock`.
     #[test]
     fn detect_terminology_blocked_in_tmux() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        let saved_terminology = std::env::var("TERMINOLOGY").ok();
-        let saved_tmux = std::env::var("TMUX").ok();
-        let saved_kitty = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_term_program = std::env::var("TERM_PROGRAM").ok();
-        let saved_term = std::env::var("TERM").ok();
-        let saved_lc_terminal = std::env::var("LC_TERMINAL").ok();
-        let saved_mlterm = std::env::var("MLTERM").ok();
-        let saved_konsole = std::env::var("KONSOLE_VERSION").ok();
-        let saved_override = std::env::var("MDTERM_IMAGE_PROTOCOL").ok();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&[
+            "TERMINOLOGY",
+            "TMUX",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "TERM",
+            "LC_TERMINAL",
+            "MLTERM",
+            "KONSOLE_VERSION",
+            "MDTERM_IMAGE_PROTOCOL",
+        ]);
 
         // Safety: test holds ENV_LOCK mutex, preventing concurrent env mutation.
         unsafe {
@@ -2812,20 +2843,11 @@ mod tests {
 
         let proto = detect_protocol();
 
-        restore_env("TERMINOLOGY", saved_terminology);
-        restore_env("TMUX", saved_tmux);
-        restore_env("KITTY_WINDOW_ID", saved_kitty);
-        restore_env("TERM_PROGRAM", saved_term_program);
-        restore_env("TERM", saved_term);
-        restore_env("LC_TERMINAL", saved_lc_terminal);
-        restore_env("MLTERM", saved_mlterm);
-        restore_env("KONSOLE_VERSION", saved_konsole);
-        restore_env("MDTERM_IMAGE_PROTOCOL", saved_override);
-
         // TMUX present → KittyUnicode *only* if TERM_PROGRAM is ghostty/WezTerm etc.
         // Since we cleared those, and TMUX is set, the tmux branch runs first but
         // none of its arms match → falls through entirely to HalfBlock.
         assert_eq!(proto, ImageProtocol::HalfBlock);
+        // _env restores all saved vars on drop.
     }
 
     /// The Terminology escape sequence bytes must be well-formed:
@@ -3022,14 +3044,31 @@ mod tests {
         }
     }
 
-    // ── env restoration helper (used by Terminology detection tests) ─────────
+    // ── env save/restore helpers (used by Terminology detection tests) ─────────
 
-    fn restore_env(key: &str, saved: Option<String>) {
-        // Safety: callers hold ENV_LOCK mutex, preventing concurrent env mutation.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
+    /// RAII guard that saves a set of environment variables on construction and
+    /// restores them on drop. Callers must hold `ENV_LOCK` for the duration.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: callers hold ENV_LOCK mutex, preventing concurrent env mutation.
+            unsafe {
+                for (key, val) in &self.saved {
+                    match val {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
         }
     }
