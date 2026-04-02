@@ -1826,7 +1826,20 @@ fn pre_render_terminology(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SEC: Verify we own the directory before using it. `create_dir_all`
+        // succeeds silently if the directory already exists — even if it was
+        // pre-created by a local attacker. An ownership mismatch means we must
+        // not write temp files there (the attacker could read or replace them).
+        // Use symlink_metadata (not metadata) so a symlink planted at the path
+        // is detected as non-dir and rejected, closing a symlink-substitution vector.
+        let meta = std::fs::symlink_metadata(&priv_dir).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
+        if meta.uid() != unsafe { libc::getuid() } {
+            return None;
+        }
         let _ = std::fs::set_permissions(&priv_dir, std::fs::Permissions::from_mode(0o700));
     }
 
