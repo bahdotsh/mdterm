@@ -1711,9 +1711,9 @@ fn terminology_path_safe(path: &str) -> bool {
     path.bytes().all(|b| b >= 0x20 && b != 0x7f && b != b';')
 }
 
-/// Generate a random 12-byte hex suffix using `/dev/urandom` (Unix) or
-/// `RtlGenRandom` (Windows via the `getrandom`-free fallback below).
-/// Falls back to PID + timestamp if neither is available.
+/// Generate a random suffix from 8 random bytes encoded as a 16-character hex
+/// string, using `/dev/urandom` on Unix.
+/// Falls back to PID + timestamp if `/dev/urandom` is unavailable.
 fn random_hex_suffix() -> String {
     let mut buf = [0u8; 8];
 
