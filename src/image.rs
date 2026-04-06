@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Write};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
@@ -16,6 +16,11 @@ pub enum ImageProtocol {
     KittyUnicode,
     Iterm2,
     Sixel,
+    /// Enlightenment [Terminology] terminal: file-path-based inline images.
+    /// Detected via `TERMINOLOGY=1` env var when not inside tmux.
+    ///
+    /// [Terminology]: https://www.enlightenment.org/about-terminology
+    Terminology,
     /// Universal fallback: render images using Unicode half-block characters (▀)
     /// with foreground/background colors. Works in any terminal with color support.
     HalfBlock,
@@ -31,6 +36,7 @@ pub fn detect_protocol() -> ImageProtocol {
             }
             "iterm2" => return ImageProtocol::Iterm2,
             "sixel" => return ImageProtocol::Sixel,
+            "terminology" => return ImageProtocol::Terminology,
             "halfblock" => return ImageProtocol::HalfBlock,
             _ => {}
         }
@@ -94,6 +100,10 @@ pub fn detect_protocol() -> ImageProtocol {
     }
     if std::env::var("MLTERM").is_ok() {
         return ImageProtocol::Sixel;
+    }
+    // Terminology: file-path-based protocol. Must not be inside tmux.
+    if std::env::var("TERMINOLOGY").is_ok() && std::env::var("TMUX").is_err() {
+        return ImageProtocol::Terminology;
     }
     ImageProtocol::HalfBlock
 }
@@ -624,6 +634,22 @@ struct HalfBlockImage {
     resized: DynamicImage,
 }
 
+/// Pre-rendered Terminology image: a local filesystem path Terminology will read.
+/// For remote URLs a temp PNG file is written to a temporary directory.
+struct TerminologyImage {
+    /// Absolute path to the image file. Guaranteed to contain no NUL or `;`
+    /// characters (paths failing this check are rejected at construction time).
+    path: String,
+    /// Display width in terminal columns (≤ 511).
+    cols: u32,
+    /// Display height in terminal rows (≤ 511).
+    rows: u32,
+    /// `true` if mdterm created this file and must delete it on cleanup.
+    is_temp: bool,
+    /// Pre-computed `"#".repeat(cols)` for efficient placeholder row rendering.
+    hashes: String,
+}
+
 /// Result from a background pre-render thread.
 enum PreRenderedResult {
     Kitty {
@@ -661,6 +687,10 @@ enum PreRenderedResult {
         rows: usize,
         resized: DynamicImage,
     },
+    Terminology {
+        /// The `TerminologyImage` resolved during pre-render.
+        img: TerminologyImage,
+    },
 }
 
 pub struct ImageCache {
@@ -681,6 +711,17 @@ pub struct ImageCache {
 
     // Half-block: resized images for Unicode block rendering
     halfblock_images: HashMap<String, HalfBlockImage>,
+    // Terminology: path-based images (None = pre-render failed)
+    terminology_images: HashMap<String, Option<TerminologyImage>>,
+    /// Paths of temp PNG files we created; deleted on cache clear / Drop.
+    ///
+    /// This is an `Arc<Mutex<...>>` so that background pre-render threads can
+    /// register their temp file path *before* sending back the result.  This
+    /// prevents leaks when the render channel is replaced mid-flight (e.g. on
+    /// terminal resize): the thread still pushes its path into the registry even
+    /// if the channel's receiver has been dropped, and `delete_temp_files` will
+    /// clean it up on the next cache-clear or `Drop`.
+    temp_files: Arc<Mutex<Vec<String>>>,
 
     last_render_width: usize,
     cell_metrics: CellMetrics,
@@ -712,6 +753,8 @@ impl ImageCache {
             iterm2_images: HashMap::new(),
             sixel_images: HashMap::new(),
             halfblock_images: HashMap::new(),
+            terminology_images: HashMap::new(),
+            temp_files: Arc::new(Mutex::new(Vec::new())),
             last_render_width: 0,
             cell_metrics: get_cell_metrics(),
             sender,
@@ -744,6 +787,8 @@ impl ImageCache {
             self.render_receiver = render_receiver;
             self.render_in_flight.clear();
             self.halfblock_images.clear();
+            self.delete_temp_files();
+            self.terminology_images.clear();
         } else {
             self.cell_metrics = new;
         }
@@ -874,6 +919,10 @@ impl ImageCache {
                 .is_some_and(|o| o.is_some()),
             ImageProtocol::Iterm2 => self.iterm2_images.get(url).is_some_and(|o| o.is_some()),
             ImageProtocol::Sixel => self.sixel_images.get(url).is_some_and(|o| o.is_some()),
+            ImageProtocol::Terminology => self
+                .terminology_images
+                .get(url)
+                .is_some_and(|o| o.is_some()),
             ImageProtocol::HalfBlock => self.halfblock_images.contains_key(url),
         }
     }
@@ -911,12 +960,40 @@ impl ImageCache {
             0
         };
 
+        let url_for_send = url_owned.clone();
+        // Clone the Arc so the background thread can register temp paths even if
+        // the render channel is replaced before the thread completes (M3 fix).
+        let temp_files_ref = Arc::clone(&self.temp_files);
         std::thread::spawn(move || {
+            // SAFETY (AssertUnwindSafe): all captured values are either owned
+            // or wrapped in Arc/Mutex, which are both Send + unwind-safe at the
+            // API level.  The Terminology arm acquires the mutex for a single
+            // Vec::push and releases it immediately — no code between lock() and
+            // the implicit drop can panic — so the closure cannot poison the
+            // mutex from the inside.  Poison from other threads is recovered via
+            // unwrap_or_else in the Terminology arm.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pre_render_image(&img, protocol, content_width, cell_metrics, bg, kitty_id)
+                // `then` (lazy) is intentional: `TerminologyCtx` borrows
+                // `temp_files_ref`, which is a local — `then_some` would
+                // evaluate eagerly and fail the borrow checker.
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let terminology =
+                    (protocol == ImageProtocol::Terminology).then(|| TerminologyCtx {
+                        url: url_owned.as_str(),
+                        temp_files: &temp_files_ref,
+                    });
+                pre_render_image(
+                    &img,
+                    protocol,
+                    content_width,
+                    cell_metrics,
+                    bg,
+                    kitty_id,
+                    terminology.as_ref(),
+                )
             }))
             .unwrap_or(None);
-            let _ = sender.send((url_owned, content_width, result));
+            let _ = sender.send((url_for_send, content_width, result));
         });
     }
 
@@ -929,6 +1006,8 @@ impl ImageCache {
             self.iterm2_images.clear();
             self.sixel_images.clear();
             self.halfblock_images.clear();
+            self.delete_temp_files();
+            self.terminology_images.clear();
             // Cancel stale in-flight pre-renders for the old width
             let (render_sender, render_receiver) = mpsc::channel();
             self.render_sender = render_sender;
@@ -1053,6 +1132,12 @@ impl ImageCache {
                             },
                         );
                     }
+                    PreRenderedResult::Terminology { img } => {
+                        // Note: if img.is_temp, the path was already registered in
+                        // the shared temp_files registry by the background thread
+                        // (before sending).  No need to push again here.
+                        self.terminology_images.insert(url, Some(img));
+                    }
                 }
                 any = true;
             }
@@ -1079,6 +1164,29 @@ impl ImageCache {
                 self.render_halfblock_row(stdout, url, image_row, content_width, bg)
             }
             ImageProtocol::Iterm2 | ImageProtocol::Sixel => Ok(false),
+            // Terminology renders the whole block in a later pass via absolute cursor
+            // positioning.  We still need to claim the row here (return true) so the
+            // normal text-rendering path doesn't write styled spans into these cells —
+            // those would show as dark lines around the image.  Write plain spaces so
+            // the row is clean before Terminology overlays the image.
+            //
+            // We write exactly `content_width` spaces regardless of centering, because
+            // the caller has already positioned the cursor at the start of the content
+            // area.  The Terminology block overlay then positions via absolute MoveTo,
+            // so the two passes are independent and covering the full row is correct.
+            ImageProtocol::Terminology => {
+                if self
+                    .terminology_images
+                    .get(url)
+                    .and_then(|o| o.as_ref())
+                    .is_some()
+                {
+                    write!(stdout, "{}", " ".repeat(content_width))?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
         }
     }
 
@@ -1342,8 +1450,107 @@ impl ImageCache {
         Ok(())
     }
 
-    /// Render a visible block of an image using the current protocol (iTerm2 or Sixel).
+    /// Delete all tracked temp files from disk and clear the list.
+    ///
+    /// This drains the `Arc<Mutex<Vec<String>>>` registry, which is also shared
+    /// with background threads.  Any thread that completes after this point but
+    /// before the next `delete_temp_files` call will push its path into the
+    /// (now-empty) list; it will be cleaned up on the subsequent call or on Drop.
+    ///
+    /// Recovers from a poisoned mutex (a previous thread panicked while holding
+    /// the lock) — we still want to drain and delete even in that case.
+    fn delete_temp_files(&mut self) {
+        let mut files = match self.temp_files.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        for path in files.drain(..) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Emit the [Terminology] inline image escape sequence for a visible image block.
+    ///
+    /// [Terminology]: https://www.enlightenment.org/about-terminology
+    ///
+    /// Protocol format (from Terminology's tycat.c / prnt()):
+    ///   Header (NUL-terminated):  ESC } i c # <cols> ; <rows> ; <path> NUL
+    ///   Per row (NUL-terminated): ESC } i b NUL  <cols × '#'>  ESC } i e NUL
+    ///
+    /// `\x1b}` = byte 0x1B followed by `}` (0x7D) — verified against tycat.c source
+    /// (`snprintf(buf, ..., "%c}ic#%i;%i;%s", 0x1b, ...)`).
+    ///
+    /// `screen_y` is 0-based; cursor positioning uses 1-based ANSI coords.
+    /// `content_col` is the 0-based terminal column where the content area starts
+    /// (i.e. after the left gutter `│ `). `content_width` is the width of that
+    /// area in columns. The image is centered horizontally within the content area,
+    /// matching the behaviour of all other protocols (Kitty, iTerm2, Sixel, HalfBlock).
+    /// Each placeholder row is positioned explicitly with MoveTo — no `\n` — safe inside a TUI.
+    ///
+    /// **Scroll limitation:** Unlike iTerm2/Sixel, Terminology does not support sub-rectangle
+    /// rendering. When a large image is partially scrolled off-screen, this method always
+    /// renders from the image top. The caller is responsible for only calling this method
+    /// when the full image block is visible (or partially visible starting from row 0).
+    pub fn render_terminology_block(
+        &self,
+        stdout: &mut impl Write,
+        url: &str,
+        screen_y: u16,
+        content_col: u16,
+        content_width: usize,
+    ) -> io::Result<()> {
+        let ti = match self.terminology_images.get(url).and_then(|o| o.as_ref()) {
+            Some(ti) => ti,
+            None => return Ok(()),
+        };
+
+        // Center the image within the content area, same as all other protocols.
+        let x_offset = content_width.saturating_sub(ti.cols as usize) / 2;
+        let start_col = content_col as usize + x_offset;
+
+        // Position at first row, centered column (+1 for the title bar row, +1 for 1-based cols).
+        write!(
+            stdout,
+            "\x1b[{};{}H",
+            (screen_y as u32).saturating_add(1),
+            (start_col as u32).saturating_add(1)
+        )?;
+
+        // Header: ESC } i c # <cols> ; <rows> ; <path> NUL
+        // Path is guaranteed to contain no NUL or ';' (checked at construction time).
+        stdout.write_all(b"\x1b}ic#")?;
+        write!(stdout, "{};{};{}", ti.cols, ti.rows, ti.path)?;
+        stdout.write_all(b"\0")?;
+
+        // Placeholder rows: one MoveTo per row so we never rely on \n inside the TUI.
+        // Terminology replaces the '#' cells with image pixels in-place.
+        // Use pre-computed hashes string from TerminologyImage to avoid repeated allocation.
+        debug_assert_eq!(
+            ti.hashes.len(),
+            ti.cols as usize,
+            "TerminologyImage hashes field out of sync with cols"
+        );
+        for r in 0..ti.rows {
+            write!(
+                stdout,
+                "\x1b[{};{}H",
+                (screen_y as u32).saturating_add(1).saturating_add(r),
+                (start_col as u32).saturating_add(1)
+            )?;
+            stdout.write_all(b"\x1b}ib\0")?;
+            stdout.write_all(ti.hashes.as_bytes())?;
+            stdout.write_all(b"\x1b}ie\0")?;
+        }
+
+        Ok(())
+    }
+
+    /// Render a visible block of an image using the current protocol (iTerm2, Sixel, or Terminology).
     /// Dispatches to the protocol-specific method.
+    ///
+    /// `content_col` is the 0-based terminal column where content starts (after the left gutter).
+    /// Only used by the Terminology protocol.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_block_image(
         &mut self,
         stdout: &mut impl Write,
@@ -1352,6 +1559,7 @@ impl ImageCache {
         num_rows: usize,
         content_width: usize,
         screen_y: u16,
+        content_col: u16,
     ) -> io::Result<()> {
         match self.protocol {
             ImageProtocol::Iterm2 => {
@@ -1360,8 +1568,17 @@ impl ImageCache {
             ImageProtocol::Sixel => {
                 self.render_sixel_block(stdout, url, first_row, num_rows, content_width, screen_y)
             }
+            ImageProtocol::Terminology => {
+                self.render_terminology_block(stdout, url, screen_y, content_col, content_width)
+            }
             _ => Ok(()),
         }
+    }
+}
+
+impl Drop for ImageCache {
+    fn drop(&mut self) {
+        self.delete_temp_files();
     }
 }
 
@@ -1387,6 +1604,18 @@ fn blend_alpha(pixel: image::Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
 
 // ── Fetching ────────────────────────────────────────────────────────────────
 
+/// Extra context required by the [`ImageProtocol::Terminology`] pre-render
+/// arm.  Pass `None` for all other protocols; the fields are only accessed
+/// inside the `Terminology` match arm.
+struct TerminologyCtx<'a> {
+    /// Original image URL (or file path), used to derive a stable path for
+    /// the temporary file that Terminology reads.
+    url: &'a str,
+    /// Shared registry of temporary-file paths; entries are cleaned up on
+    /// resize, theme change, or process exit.
+    temp_files: &'a Arc<Mutex<Vec<String>>>,
+}
+
 /// Pre-render an image for a specific protocol on a background thread.
 fn pre_render_image(
     img: &DynamicImage,
@@ -1395,6 +1624,7 @@ fn pre_render_image(
     cell_metrics: CellMetrics,
     bg: (u8, u8, u8),
     kitty_id: u32,
+    terminology: Option<&TerminologyCtx<'_>>,
 ) -> Option<PreRenderedResult> {
     let (img_w, img_h) = img.dimensions();
     let (cols, rows) = calc_display_cells(
@@ -1475,7 +1705,222 @@ fn pre_render_image(
                 resized,
             })
         }
+        ImageProtocol::Terminology => {
+            let ctx = terminology
+                .expect("pre_render_image: Terminology protocol requires a TerminologyCtx");
+            pre_render_terminology(img, ctx.url, content_width, cell_metrics).map(|ti| {
+                if ti.is_temp {
+                    // Register the temp path in the shared registry *before* wrapping
+                    // the result, so it is cleaned up even if the render channel is
+                    // replaced before the result is polled (e.g. on a resize event).
+                    //
+                    // SAFETY (AssertUnwindSafe): the MutexGuard `files` is held only
+                    // for the single `push` call and is immediately dropped.  No code
+                    // between `lock()` and the implicit drop can panic, so this
+                    // closure cannot poison the mutex.  Poison from other threads is
+                    // handled by `unwrap_or_else`: Vec::push either completes or has
+                    // not run yet when a panic occurs, so the contents are always
+                    // consistent.
+                    let mut files = ctx.temp_files.lock().unwrap_or_else(|e| e.into_inner());
+                    files.push(ti.path.to_owned());
+                }
+                PreRenderedResult::Terminology { img: ti }
+            })
+        }
     }
+}
+
+/// Validate that a path intended for the Terminology protocol escape sequence
+/// contains no bytes that would corrupt or inject into the
+/// `ESC } i c # <cols> ; <rows> ; <path> NUL` framing.
+///
+/// Blocked categories:
+/// - **Control bytes (0x00–0x1F):** NUL truncates the sequence; ESC (`\x1b`) could
+///   start a second injected escape sequence; CR/LF could confuse line-oriented
+///   terminal parsers.
+/// - **DEL (0x7F):** a control character on most systems.
+/// - **Semicolon (`;`):** field separator in the protocol header — would split
+///   `<cols>;<rows>;<path>` at the wrong position, redirecting Terminology to a
+///   different file.
+///
+/// All other bytes (printable ASCII + valid UTF-8 multibyte sequences) are allowed.
+/// Since this function receives a `&str`, the input is guaranteed to be valid UTF-8
+/// with no interior NUL bytes; the `b == 0` case is kept for explicitness.
+fn terminology_path_safe(path: &str) -> bool {
+    path.bytes().all(|b| b >= 0x20 && b != 0x7f && b != b';')
+}
+
+/// Generate a random suffix from 8 random bytes encoded as a 16-character hex
+/// string, using `/dev/urandom` on Unix.
+/// Falls back to PID + timestamp if `/dev/urandom` is unavailable.
+fn random_hex_suffix() -> String {
+    let mut buf = [0u8; 8];
+
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+            && f.read_exact(&mut buf).is_ok()
+        {
+            return buf.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+
+    // Fallback: mix PID, counter, and nanosecond timestamp for uniqueness.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!("{:08x}{:08x}", std::process::id() ^ ts, n)
+}
+
+/// Pre-render step for the Terminology protocol.
+/// Resolves the image to a local filesystem path.
+/// - If `url` is a local path that currently exists on disk, returns it as-is
+///   (after canonicalization to an absolute path), provided the resolved path
+///   stays within the current working directory.
+/// - Otherwise, resizes `img` to the display pixel dimensions and writes it
+///   atomically to a temporary PNG file in a per-process private temp directory.
+///
+/// Returns `None` if the resolved path would be unsafe to embed in the escape
+/// sequence, escapes the working directory, or if any I/O operation fails.
+fn pre_render_terminology(
+    img: &DynamicImage,
+    url: &str,
+    content_width: usize,
+    cell_metrics: CellMetrics,
+) -> Option<TerminologyImage> {
+    let (img_w, img_h) = img.dimensions();
+    let (cols, rows) = calc_display_cells(
+        img_w,
+        img_h,
+        content_width,
+        MAX_IMAGE_ROWS,
+        cell_metrics.aspect,
+    );
+    // Terminology hard limit: both width and height must be < 512 (from tycat.c:
+    // `if ((w >= 512) || (h >= 512)) return;`). Also ensure neither is zero.
+    let cols = (cols as u32).clamp(1, 511);
+    let rows = (rows as u32).clamp(1, 511);
+
+    // Treat http://, https://, file://, and data: URLs as remote/non-local.
+    // file:// and data: are not valid filesystem paths; canonicalize would fail
+    // for them, so they fall through to the temp-file path.
+    let is_remote = url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://")
+        || url.starts_with("data:");
+
+    // Local file path that still exists on disk — reuse directly, no I/O needed.
+    // Terminology requires an absolute path, so canonicalize before passing.
+    if !is_remote && let Ok(abs) = std::fs::canonicalize(url) {
+        // SEC: Reject if the resolved path escapes the working directory.
+        // This prevents symlinks like `./img.png -> /etc/passwd` from
+        // passing an arbitrary system path to Terminology.
+        // Canonicalize the CWD too so both paths use the same prefix form
+        // (important on Windows where canonicalize adds the `\\?\` prefix
+        // but current_dir() does not, causing starts_with to always fail).
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|d| std::fs::canonicalize(d).ok());
+        if cwd.is_some_and(|cwd| !abs.starts_with(&cwd)) {
+            return None;
+        }
+
+        // SEC: Use to_str() (not to_string_lossy()) to reject non-UTF-8 paths.
+        // to_string_lossy() would replace invalid bytes with U+FFFD, meaning
+        // the safety check runs on a modified string, not the actual bytes.
+        let path = abs.to_str()?.to_owned();
+
+        // SEC: Reject paths that would corrupt the escape sequence framing
+        // (control bytes, DEL, semicolons). See terminology_path_safe docs.
+        if !terminology_path_safe(&path) {
+            return None;
+        }
+
+        let hashes = "#".repeat(cols as usize);
+        return Some(TerminologyImage {
+            path,
+            cols,
+            rows,
+            is_temp: false,
+            hashes,
+        });
+    }
+
+    // Remote image (or local path no longer on disk): resize and write a temp file.
+    let target_w = (cols * cell_metrics.cell_w_px).max(1);
+    let target_h = (rows * cell_metrics.cell_h_px).max(1);
+    let resized = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+
+    // Create a per-process private temp directory (mode 0700 on Unix) so that
+    // other local users cannot observe, replace, or symlink-attack our temp files.
+    // This also isolates us from TMPDIR poisoning by an adversarial environment.
+    let tmp_base = std::env::temp_dir();
+    let priv_dir = tmp_base.join(format!("mdterm-{}", std::process::id()));
+    if std::fs::create_dir_all(&priv_dir).is_err() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SEC: Verify we own the directory before using it. `create_dir_all`
+        // succeeds silently if the directory already exists — even if it was
+        // pre-created by a local attacker. An ownership mismatch means we must
+        // not write temp files there (the attacker could read or replace them).
+        // Use symlink_metadata (not metadata) so a symlink planted at the path
+        // is detected as non-dir and rejected, closing a symlink-substitution vector.
+        let meta = std::fs::symlink_metadata(&priv_dir).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
+        if meta.uid() != unsafe { libc::getuid() } {
+            return None;
+        }
+        let _ = std::fs::set_permissions(&priv_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    // Build a non-predictable temp path using random entropy (SEC-3).
+    let path = priv_dir
+        .join(format!("img-{}.png", random_hex_suffix()))
+        .to_str()?
+        .to_owned();
+
+    // SEC: Reject if the generated temp path somehow contains unsafe characters
+    // (defensive — ';' in TMPDIR would break framing).
+    if !terminology_path_safe(&path) {
+        return None;
+    }
+
+    // Write PNG atomically using O_CREAT | O_EXCL so we never silently overwrite
+    // an existing file (SEC-2). If the file already exists (race), this returns
+    // None and the caller retries on the next render cycle.
+    {
+        use std::io::{BufWriter, Write as IoWrite};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT | O_EXCL — fails if path already exists
+            .open(&path)
+            .ok()?;
+        let mut writer = BufWriter::new(file);
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        resized
+            .write_to(&mut png_buf, image::ImageFormat::Png)
+            .ok()?;
+        writer.write_all(png_buf.get_ref()).ok()?;
+        writer.flush().ok()?;
+    }
+
+    let hashes = "#".repeat(cols as usize);
+    Some(TerminologyImage {
+        path,
+        cols,
+        rows,
+        is_temp: true,
+        hashes,
+    })
 }
 
 fn downscale(img: DynamicImage, max_dim: u32) -> DynamicImage {
@@ -1631,6 +2076,9 @@ fn extract_host(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shared mutex for tests that manipulate process-global env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── has_attempted / has_image ────────────────────────────────────────────
 
@@ -2324,5 +2772,304 @@ mod tests {
         let input = b"hello";
         let wrapped = tmux_wrap(input);
         assert_eq!(wrapped, b"\x1bPtmux;hello\x1b\\");
+    }
+
+    // ── Terminology protocol ────────────────────────────────────────────────
+
+    /// `detect_protocol()` must return `Terminology` when `TERMINOLOGY=1` and
+    /// `TMUX` is unset, regardless of other env vars.
+    #[test]
+    fn detect_terminology_protocol() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&[
+            "TERMINOLOGY",
+            "TMUX",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "TERM",
+            "LC_TERMINAL",
+            "MLTERM",
+            "KONSOLE_VERSION",
+            "MDTERM_IMAGE_PROTOCOL",
+        ]);
+
+        // Safety: test holds ENV_LOCK mutex, preventing concurrent env mutation.
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("KITTY_WINDOW_ID");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("TERM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("MLTERM");
+            std::env::remove_var("KONSOLE_VERSION");
+            std::env::remove_var("MDTERM_IMAGE_PROTOCOL");
+            std::env::set_var("TERMINOLOGY", "1");
+        }
+
+        let proto = detect_protocol();
+        assert_eq!(proto, ImageProtocol::Terminology);
+        // _env restores all saved vars on drop.
+    }
+
+    /// When `TERMINOLOGY=1` AND `TMUX` is also set, the `ESC }` protocol cannot
+    /// pass through tmux DCS — fall back to `HalfBlock`.
+    #[test]
+    fn detect_terminology_blocked_in_tmux() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&[
+            "TERMINOLOGY",
+            "TMUX",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "TERM",
+            "LC_TERMINAL",
+            "MLTERM",
+            "KONSOLE_VERSION",
+            "MDTERM_IMAGE_PROTOCOL",
+        ]);
+
+        // Safety: test holds ENV_LOCK mutex, preventing concurrent env mutation.
+        unsafe {
+            std::env::remove_var("KITTY_WINDOW_ID");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("TERM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("MLTERM");
+            std::env::remove_var("KONSOLE_VERSION");
+            std::env::remove_var("MDTERM_IMAGE_PROTOCOL");
+            std::env::set_var("TERMINOLOGY", "1");
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,12345,0");
+        }
+
+        let proto = detect_protocol();
+
+        // TMUX present → KittyUnicode *only* if TERM_PROGRAM is ghostty/WezTerm etc.
+        // Since we cleared those, and TMUX is set, the tmux branch runs first but
+        // none of its arms match → falls through entirely to HalfBlock.
+        assert_eq!(proto, ImageProtocol::HalfBlock);
+        // _env restores all saved vars on drop.
+    }
+
+    /// The Terminology escape sequence bytes must be well-formed:
+    /// - Header: `ESC } i c # <cols> ; <rows> ; <path> NUL`
+    /// - Each placeholder row: `ESC } i b NUL <cols × '#'> ESC } i e NUL`
+    ///   (rows do NOT end with LF — each row is positioned via MoveTo instead)
+    #[test]
+    fn terminology_escape_bytes() {
+        let mut cache = ImageCache::new();
+        let url = "test://dummy.png";
+        cache.terminology_images.insert(
+            url.to_string(),
+            Some(TerminologyImage {
+                path: "/tmp/test-img.png".to_string(),
+                cols: 3,
+                rows: 2,
+                is_temp: false,
+                hashes: "###".to_string(),
+            }),
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        cache
+            .render_terminology_block(&mut buf, url, 0, 2, 80)
+            .unwrap();
+
+        // ── Check header ──────────────────────────────────────────────────
+        let header_prefix = b"\x1b}ic#3;2;/tmp/test-img.png\0";
+        assert!(
+            buf.windows(header_prefix.len()).any(|w| w == header_prefix),
+            "header not found in output.\nGot (hex): {:?}",
+            &buf
+        );
+
+        // ── Check placeholder rows ────────────────────────────────────────
+        // Rows no longer end with LF — each row is positioned via MoveTo instead.
+        let row_begin = b"\x1b}ib\0";
+        let row_hashes = b"###";
+        let row_end = b"\x1b}ie\0";
+
+        let begin_count = buf
+            .windows(row_begin.len())
+            .filter(|w| *w == row_begin)
+            .count();
+        let end_count = buf.windows(row_end.len()).filter(|w| *w == row_end).count();
+
+        assert_eq!(
+            begin_count, 2,
+            "expected 2 row-begin markers (rows=2), got {begin_count}"
+        );
+        assert_eq!(
+            end_count, 2,
+            "expected 2 row-end+LF markers (rows=2), got {end_count}"
+        );
+
+        let mut pos = 0;
+        let mut rows_seen = 0;
+        while pos + row_begin.len() <= buf.len() {
+            if &buf[pos..pos + row_begin.len()] == row_begin {
+                let hash_start = pos + row_begin.len();
+                let hash_end = hash_start + 3; // cols=3
+                assert!(
+                    hash_end <= buf.len(),
+                    "buffer too short after row-begin at pos {pos}"
+                );
+                assert_eq!(
+                    &buf[hash_start..hash_end],
+                    row_hashes,
+                    "row body at pos {pos} is not exactly 3 '#' chars"
+                );
+                rows_seen += 1;
+                pos = hash_end;
+            } else {
+                pos += 1;
+            }
+        }
+        assert_eq!(rows_seen, 2, "expected to find 2 complete rows");
+    }
+
+    /// Local-path images (within the current working directory) must reuse the
+    /// original path (`is_temp = false`) and must NOT create a new temp file.
+    ///
+    /// The fixture is written into the current working directory (project root
+    /// during `cargo test`) so that the `canonicalize` result passes the
+    /// `starts_with(cwd)` security check.
+    #[test]
+    fn terminology_no_temp_for_local_path() {
+        // Write the fixture PNG inside cwd so it passes the cwd-confinement check.
+        let cwd = std::env::current_dir().expect("cannot get cwd");
+        let source_path = cwd.join(format!("mdterm-test-source-{}.png", std::process::id()));
+        let source_path_str = source_path.to_str().expect("cwd path is not UTF-8");
+        {
+            let img = image::DynamicImage::new_rgb8(8, 8);
+            img.save_with_format(source_path_str, image::ImageFormat::Png)
+                .expect("failed to write source fixture PNG");
+        }
+
+        let img = image::open(source_path_str).expect("failed to open fixture PNG");
+        let metrics = CellMetrics {
+            aspect: 2.0,
+            cell_w_px: 8,
+            cell_h_px: 16,
+        };
+
+        let priv_dir = std::env::temp_dir().join(format!("mdterm-{}", std::process::id()));
+        let before_count = std::fs::read_dir(&priv_dir)
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0);
+
+        let result = pre_render_terminology(&img, source_path_str, 80, metrics)
+            .expect("pre_render_terminology returned None for a local path within cwd");
+
+        let after_count = std::fs::read_dir(&priv_dir)
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0);
+
+        // canonicalize may resolve symlinks (e.g. on macOS the cwd itself may
+        // have a symlinked component). Compute canonical form for the assertion.
+        let canonical_source =
+            std::fs::canonicalize(source_path_str).unwrap_or_else(|_| source_path.clone());
+        let _ = std::fs::remove_file(source_path_str);
+
+        assert!(!result.is_temp, "local path must not set is_temp=true");
+        assert_eq!(
+            result.path,
+            canonical_source
+                .to_str()
+                .expect("canonical path is not UTF-8"),
+            "path must be the canonicalized local path"
+        );
+        assert_eq!(
+            before_count, after_count,
+            "pre_render_terminology must not create new temp files for a local path"
+        );
+    }
+
+    // ── terminology_path_safe ────────────────────────────────────────────────
+
+    /// Normal absolute paths that a real filesystem would produce must be accepted.
+    #[test]
+    fn path_safe_accepts_normal_paths() {
+        assert!(terminology_path_safe("/home/user/images/photo.png"));
+        assert!(terminology_path_safe("/tmp/mdterm-1234/img-abc123.png"));
+        assert!(terminology_path_safe("/Users/alice/Documents/my-image.jpg"));
+        // Multibyte UTF-8 is fine (e.g. non-ASCII directory names)
+        assert!(terminology_path_safe("/home/用户/图片/photo.png"));
+    }
+
+    /// NUL byte must be rejected — it terminates the Terminology escape sequence early.
+    /// Note: Rust `str` cannot contain interior NUL, so this tests the explicit check.
+    #[test]
+    fn path_safe_rejects_nul_via_control_check() {
+        // \x01 is a control byte (< 0x20) — same category as NUL; if blocked, NUL is too.
+        assert!(!terminology_path_safe("/tmp/foo\x01bar.png"));
+    }
+
+    /// ESC byte must be rejected — it could inject a second Terminology header.
+    #[test]
+    fn path_safe_rejects_esc() {
+        assert!(!terminology_path_safe("/tmp/foo\x1bbar.png"));
+        assert!(!terminology_path_safe("\x1b}ic#1;1;/etc/passwd"));
+    }
+
+    /// CR and LF must be rejected — could corrupt line-oriented terminal parsers.
+    #[test]
+    fn path_safe_rejects_cr_lf() {
+        assert!(!terminology_path_safe("/tmp/foo\rbar.png"));
+        assert!(!terminology_path_safe("/tmp/foo\nbar.png"));
+    }
+
+    /// DEL (0x7F) must be rejected.
+    #[test]
+    fn path_safe_rejects_del() {
+        assert!(!terminology_path_safe("/tmp/foo\x7fbar.png"));
+    }
+
+    /// Semicolons corrupt the `<cols>;<rows>;<path>` framing.
+    #[test]
+    fn path_safe_rejects_semicolon() {
+        assert!(!terminology_path_safe("/tmp/foo;bar.png"));
+        assert!(!terminology_path_safe(";/etc/passwd"));
+        assert!(!terminology_path_safe("/tmp/evil;0;/etc/passwd"));
+    }
+
+    /// All control bytes 0x01–0x1F must be rejected.
+    #[test]
+    fn path_safe_rejects_all_control_bytes() {
+        for b in 0x01u8..0x20 {
+            let path = format!("/tmp/foo{}bar.png", b as char);
+            assert!(
+                !terminology_path_safe(&path),
+                "control byte 0x{b:02x} should be rejected"
+            );
+        }
+    }
+
+    // ── env save/restore helpers (used by Terminology detection tests) ─────────
+
+    /// RAII guard that saves a set of environment variables on construction and
+    /// restores them on drop. Callers must hold `ENV_LOCK` for the duration.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: callers hold ENV_LOCK mutex, preventing concurrent env mutation.
+            unsafe {
+                for (key, val) in &self.saved {
+                    match val {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
     }
 }
