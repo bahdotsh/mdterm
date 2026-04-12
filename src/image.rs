@@ -62,10 +62,7 @@ fn tmux_allows_passthrough() -> bool {
 /// Parse the running tmux version string into (major, minor).
 /// Handles version strings like "tmux 3.3a", "tmux 3.4", "tmux next-3.5".
 fn tmux_version() -> Option<(u32, u32)> {
-    let out = std::process::Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()?;
+    let out = std::process::Command::new("tmux").arg("-V").output().ok()?;
     let s = String::from_utf8(out.stdout).ok()?;
     let s = s.trim();
     // Strip "tmux " prefix, then optional "next-" prefix.
