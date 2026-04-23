@@ -975,7 +975,12 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_scroll = state.help_scroll;
                 let prev_mode = state.mode;
                 match ke.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Char('H') => {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        state.mode = ViewMode::Normal;
+                    }
+                    KeyCode::Char('h') | KeyCode::Char('H')
+                        if !ke.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         state.mode = ViewMode::Normal;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -1585,7 +1590,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         }
 
         // Help
-        KeyCode::Char('h') | KeyCode::Char('H') => {
+        KeyCode::Char('h') | KeyCode::Char('H') if !mods.contains(KeyModifiers::CONTROL) => {
             reset_cursor_shape(state);
             state.help_scroll = 0;
             state.mode = ViewMode::Help;
@@ -3783,7 +3788,7 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
 
     // Footer
     let scroll_hint = if can_scroll_down { " ▼ more " } else { "" };
-    let footer = " F1 / Esc / q  close ";
+    let footer = " ? / F1 / Esc / q  close ";
     let footer_len = footer.chars().count() + scroll_hint.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
     queue!(
