@@ -2471,10 +2471,8 @@ mod tests {
         let addr = listener.local_addr().ok()?;
         let base = format!("http://127.0.0.1:{}", addr.port());
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let _ = (handler)(stream);
-                }
+            for stream in listener.incoming().flatten() {
+                (handler)(stream);
             }
         });
         Some((base, addr))
@@ -2511,9 +2509,8 @@ mod tests {
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             if req.contains("GET /redirect") {
-                let resp = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: /image.png\r\nContent-Length: 0\r\n\r\n"
-                );
+                let resp =
+                    "HTTP/1.1 302 Found\r\nLocation: /image.png\r\nContent-Length: 0\r\n\r\n";
                 let _ = stream.write_all(resp.as_bytes());
             } else {
                 let body = png.clone();

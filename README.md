@@ -106,7 +106,7 @@ mdterm README.md | less -R
 | `Y` | Copy entire document to clipboard |
 | `c` | Copy nearest code block to clipboard |
 | `Tab` / `Shift+Tab` | Switch between files |
-| `F1` | Help screen |
+| `h` / `?` / `F1` | Help screen |
 | `q` / `Ctrl+C` | Quit |
 
 ### Slide Mode (`--slides`)
