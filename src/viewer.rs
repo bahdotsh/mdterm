@@ -954,8 +954,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             if ke.code == KeyCode::Char('c') && ke.modifiers.contains(KeyModifiers::CONTROL) {
                 return true;
             }
-            // F1 opens help from any mode; Esc/F1 closes it
-            if ke.code == KeyCode::F(1) {
+            // F1 / ? open help from any mode; Esc/F1/? close it.
+            // `?` is skipped in text-input modes (Search, FuzzyHeading) where
+            // the user may legitimately type it.
+            let is_help_toggle = ke.code == KeyCode::F(1)
+                || (ke.code == KeyCode::Char('?')
+                    && !matches!(state.mode, ViewMode::Search | ViewMode::FuzzyHeading));
+            if is_help_toggle {
                 if state.mode == ViewMode::Help {
                     state.mode = ViewMode::Normal;
                 } else {
@@ -970,7 +975,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_scroll = state.help_scroll;
                 let prev_mode = state.mode;
                 match ke.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Char('H') => {
                         state.mode = ViewMode::Normal;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -1577,6 +1582,13 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             } else {
                 return true;
             }
+        }
+
+        // Help
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            reset_cursor_shape(state);
+            state.help_scroll = 0;
+            state.mode = ViewMode::Help;
         }
 
         // Theme toggle
@@ -2928,7 +2940,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     };
     let loading_len = loading_label.chars().count();
 
-    let hint = " / search · o toc · f links · t theme · F1 help ";
+    let hint = " / search · o toc · f links · t theme · ? help ";
     let hint_len = hint.chars().count();
     let needed = 4 + hint_len + loading_len + pos_len;
     let (show_hint, fill) = if width > needed {
@@ -3590,7 +3602,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
                 ("o", "Table of contents"),
                 ("f", "Link picker (open URLs)"),
                 (":", "Fuzzy heading jump"),
-                ("F1", "This help screen"),
+                ("h / ? / F1", "This help screen"),
             ],
         },
         HelpSection {
