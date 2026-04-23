@@ -226,7 +226,7 @@ impl Drop for TerminalGuard {
 
 // ── View modes ──────────────────────────────────────────────────────────────
 
-#[derive(PartialEq, Copy, Clone)]
+#[derive(PartialEq, Copy, Clone, Debug)]
 enum ViewMode {
     Normal,
     Search,
@@ -234,6 +234,48 @@ enum ViewMode {
     LinkPicker,
     FuzzyHeading,
     Help,
+}
+
+impl ViewMode {
+    /// Modes where the user is typing free-form text; single-letter bindings
+    /// like `?` or `h` must be passed through as input, not intercepted.
+    fn accepts_text_input(self) -> bool {
+        matches!(self, ViewMode::Search | ViewMode::FuzzyHeading)
+    }
+}
+
+/// Returns true when JSON navigation would consume letter keys (`h`/`H`).
+fn json_nav_active(state: &ViewerState) -> bool {
+    state
+        .json_view
+        .as_ref()
+        .is_some_and(|jv| !jv.navigable.is_empty())
+}
+
+/// Single source of truth for "does this key toggle the help overlay?".
+///
+/// - `F1` — from any mode.
+/// - `?`  — from any mode except text-input modes. Ctrl-guarded.
+/// - `h` / `H` — only from Normal (to open) or Help (to close), Ctrl-guarded,
+///   and yields to slide-mode and JSON navigation which bind `h` themselves.
+fn is_help_toggle(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    mode: ViewMode,
+    slide_mode: bool,
+    json_nav: bool,
+) -> bool {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::F(1) => true,
+        KeyCode::Char('?') if !ctrl => !mode.accepts_text_input(),
+        KeyCode::Char('h') | KeyCode::Char('H') if !ctrl => match mode {
+            ViewMode::Help => true,
+            ViewMode::Normal => !slide_mode && !json_nav,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 // ── Viewer state ────────────────────────────────────────────────────────────
@@ -954,13 +996,13 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
             if ke.code == KeyCode::Char('c') && ke.modifiers.contains(KeyModifiers::CONTROL) {
                 return true;
             }
-            // F1 / ? open help from any mode; Esc/F1/? close it.
-            // `?` is skipped in text-input modes (Search, FuzzyHeading) where
-            // the user may legitimately type it.
-            let is_help_toggle = ke.code == KeyCode::F(1)
-                || (ke.code == KeyCode::Char('?')
-                    && !matches!(state.mode, ViewMode::Search | ViewMode::FuzzyHeading));
-            if is_help_toggle {
+            if is_help_toggle(
+                ke.code,
+                ke.modifiers,
+                state.mode,
+                state.slide_mode,
+                json_nav_active(state),
+            ) {
                 if state.mode == ViewMode::Help {
                     state.mode = ViewMode::Normal;
                 } else {
@@ -976,11 +1018,6 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_mode = state.mode;
                 match ke.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        state.mode = ViewMode::Normal;
-                    }
-                    KeyCode::Char('h') | KeyCode::Char('H')
-                        if !ke.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
                         state.mode = ViewMode::Normal;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -1589,13 +1626,6 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             }
         }
 
-        // Help
-        KeyCode::Char('h') | KeyCode::Char('H') if !mods.contains(KeyModifiers::CONTROL) => {
-            reset_cursor_shape(state);
-            state.help_scroll = 0;
-            state.mode = ViewMode::Help;
-        }
-
         // Theme toggle
         KeyCode::Char('t') => {
             state.theme = state.theme.toggle();
@@ -1649,48 +1679,42 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         }
 
         // TOC
-        KeyCode::Char('o') => {
-            if !state.toc_entries.is_empty() {
-                reset_cursor_shape(state);
-                state.toc_selected = 0;
-                state.toc_scroll = 0;
-                // Try to select the heading closest to current offset
-                for (i, entry) in state.toc_entries.iter().enumerate() {
-                    if entry.line_idx <= state.offset {
-                        state.toc_selected = i;
-                    }
+        KeyCode::Char('o') if !state.toc_entries.is_empty() => {
+            reset_cursor_shape(state);
+            state.toc_selected = 0;
+            state.toc_scroll = 0;
+            // Try to select the heading closest to current offset
+            for (i, entry) in state.toc_entries.iter().enumerate() {
+                if entry.line_idx <= state.offset {
+                    state.toc_selected = i;
                 }
-                // Ensure scroll shows the selected entry
-                let viewport = state.viewport();
-                let count = state.toc_entries.len();
-                let box_h = (count + 2).min(viewport.saturating_sub(4));
-                let visible_entries = box_h.saturating_sub(2);
-                if visible_entries > 0 && state.toc_selected >= visible_entries {
-                    state.toc_scroll = state.toc_selected - visible_entries + 1;
-                }
-                state.mode = ViewMode::Toc;
             }
+            // Ensure scroll shows the selected entry
+            let viewport = state.viewport();
+            let count = state.toc_entries.len();
+            let box_h = (count + 2).min(viewport.saturating_sub(4));
+            let visible_entries = box_h.saturating_sub(2);
+            if visible_entries > 0 && state.toc_selected >= visible_entries {
+                state.toc_scroll = state.toc_selected - visible_entries + 1;
+            }
+            state.mode = ViewMode::Toc;
         }
 
         // Link picker
-        KeyCode::Char('f') => {
-            if !state.link_entries.is_empty() {
-                reset_cursor_shape(state);
-                state.link_selected = 0;
-                state.link_scroll = 0;
-                state.mode = ViewMode::LinkPicker;
-            }
+        KeyCode::Char('f') if !state.link_entries.is_empty() => {
+            reset_cursor_shape(state);
+            state.link_selected = 0;
+            state.link_scroll = 0;
+            state.mode = ViewMode::LinkPicker;
         }
 
         // Fuzzy heading search
-        KeyCode::Char(':') => {
-            if !state.toc_entries.is_empty() {
-                reset_cursor_shape(state);
-                state.fuzzy_input.clear();
-                state.fuzzy_selected = 0;
-                state.fuzzy_scroll = 0;
-                state.mode = ViewMode::FuzzyHeading;
-            }
+        KeyCode::Char(':') if !state.toc_entries.is_empty() => {
+            reset_cursor_shape(state);
+            state.fuzzy_input.clear();
+            state.fuzzy_selected = 0;
+            state.fuzzy_scroll = 0;
+            state.mode = ViewMode::FuzzyHeading;
         }
 
         // Copy full document
@@ -1726,21 +1750,17 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         }
 
         // File switching
-        KeyCode::Tab => {
-            if state.files.len() > 1 {
-                let next = (state.current_file_idx + 1) % state.files.len();
-                state.switch_file(next);
-            }
+        KeyCode::Tab if state.files.len() > 1 => {
+            let next = (state.current_file_idx + 1) % state.files.len();
+            state.switch_file(next);
         }
-        KeyCode::BackTab => {
-            if state.files.len() > 1 {
-                let prev = if state.current_file_idx == 0 {
-                    state.files.len() - 1
-                } else {
-                    state.current_file_idx - 1
-                };
-                state.switch_file(prev);
-            }
+        KeyCode::BackTab if state.files.len() > 1 => {
+            let prev = if state.current_file_idx == 0 {
+                state.files.len() - 1
+            } else {
+                state.current_file_idx - 1
+            };
+            state.switch_file(prev);
         }
         KeyCode::Backspace => {
             if let Some((file_idx, offset)) = state.nav_history.pop() {
@@ -1789,10 +1809,10 @@ fn handle_slide_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         | KeyCode::Char('l')
         | KeyCode::Char('j')
         | KeyCode::Down
-        | KeyCode::PageDown => {
-            if state.current_slide + 1 < num_slides {
-                state.current_slide += 1;
-            }
+        | KeyCode::PageDown
+            if state.current_slide + 1 < num_slides =>
+        {
+            state.current_slide += 1;
         }
         KeyCode::Left
         | KeyCode::Char('h')
@@ -1861,10 +1881,8 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
         KeyCode::Up | KeyCode::Char('k') => {
             state.toc_selected = state.toc_selected.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if state.toc_selected + 1 < count {
-                state.toc_selected += 1;
-            }
+        KeyCode::Down | KeyCode::Char('j') if state.toc_selected + 1 < count => {
+            state.toc_selected += 1;
         }
         KeyCode::PageUp => {
             state.toc_selected = state.toc_selected.saturating_sub(visible_entries);
@@ -2031,10 +2049,8 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
         KeyCode::Up | KeyCode::Char('k') => {
             state.link_selected = state.link_selected.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if state.link_selected + 1 < count {
-                state.link_selected += 1;
-            }
+        KeyCode::Down | KeyCode::Char('j') if state.link_selected + 1 < count => {
+            state.link_selected += 1;
         }
         KeyCode::PageUp => {
             state.link_selected = state.link_selected.saturating_sub(visible_entries);
@@ -3788,7 +3804,7 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
 
     // Footer
     let scroll_hint = if can_scroll_down { " ▼ more " } else { "" };
-    let footer = " ? / F1 / Esc / q  close ";
+    let footer = " h / ? / F1 / Esc / q  close ";
     let footer_len = footer.chars().count() + scroll_hint.chars().count();
     let bot_dashes = box_w.saturating_sub(3 + footer_len);
     queue!(
@@ -3988,6 +4004,152 @@ mod tests {
         }
     }
 
+    // ── is_help_toggle matrix ─────────────────────────────────────────────
+
+    const ALL_MODES: &[ViewMode] = &[
+        ViewMode::Normal,
+        ViewMode::Search,
+        ViewMode::Toc,
+        ViewMode::LinkPicker,
+        ViewMode::FuzzyHeading,
+        ViewMode::Help,
+    ];
+
+    fn toggle(code: KeyCode, mods: KeyModifiers, mode: ViewMode) -> bool {
+        is_help_toggle(code, mods, mode, false, false)
+    }
+
+    #[test]
+    fn f1_toggles_from_every_mode() {
+        for &m in ALL_MODES {
+            assert!(
+                toggle(KeyCode::F(1), KeyModifiers::NONE, m),
+                "F1 should toggle help from {:?}",
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn question_mark_toggles_except_text_input() {
+        for &m in ALL_MODES {
+            let expected = !m.accepts_text_input();
+            assert_eq!(
+                toggle(KeyCode::Char('?'), KeyModifiers::NONE, m),
+                expected,
+                "`?` toggle in {:?} should be {}",
+                m,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_question_mark_never_toggles() {
+        for &m in ALL_MODES {
+            assert!(
+                !toggle(KeyCode::Char('?'), KeyModifiers::CONTROL, m),
+                "Ctrl+? must not toggle help (mode {:?})",
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn h_opens_from_normal_and_closes_from_help_only() {
+        for &m in ALL_MODES {
+            let expected = matches!(m, ViewMode::Normal | ViewMode::Help);
+            for code in [KeyCode::Char('h'), KeyCode::Char('H')] {
+                assert_eq!(
+                    toggle(code, KeyModifiers::NONE, m),
+                    expected,
+                    "{:?} in {:?} should be {}",
+                    code,
+                    m,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_h_never_toggles() {
+        for &m in ALL_MODES {
+            for code in [KeyCode::Char('h'), KeyCode::Char('H')] {
+                assert!(
+                    !is_help_toggle(code, KeyModifiers::CONTROL, m, false, false),
+                    "Ctrl+{:?} must not toggle help (mode {:?})",
+                    code,
+                    m
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_yields_to_slide_and_json_nav_but_question_mark_and_f1_do_not() {
+        // h/H must not steal focus from slide-mode prev-slide or JSON navigation
+        for &(slide, json) in &[(true, false), (false, true), (true, true)] {
+            for code in [KeyCode::Char('h'), KeyCode::Char('H')] {
+                assert!(
+                    !is_help_toggle(code, KeyModifiers::NONE, ViewMode::Normal, slide, json),
+                    "h/H must yield when slide={} json_nav={}",
+                    slide,
+                    json
+                );
+            }
+            // But ? and F1 remain universal escape hatches.
+            assert!(is_help_toggle(
+                KeyCode::Char('?'),
+                KeyModifiers::NONE,
+                ViewMode::Normal,
+                slide,
+                json
+            ));
+            assert!(is_help_toggle(
+                KeyCode::F(1),
+                KeyModifiers::NONE,
+                ViewMode::Normal,
+                slide,
+                json
+            ));
+        }
+    }
+
+    #[test]
+    fn h_still_closes_help_even_when_slide_or_json_nav_context_remains() {
+        // Closing help from Help mode must work regardless of the backdrop state.
+        for &(slide, json) in &[(false, false), (true, false), (false, true), (true, true)] {
+            for code in [KeyCode::Char('h'), KeyCode::Char('H')] {
+                assert!(
+                    is_help_toggle(code, KeyModifiers::NONE, ViewMode::Help, slide, json),
+                    "h/H must close Help regardless of slide/json context"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_keys_never_toggle() {
+        for &m in ALL_MODES {
+            for code in [
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Char('q'),
+                KeyCode::Esc,
+                KeyCode::Enter,
+                KeyCode::F(2),
+            ] {
+                assert!(
+                    !toggle(code, KeyModifiers::NONE, m),
+                    "{:?} must not toggle help (mode {:?})",
+                    code,
+                    m
+                );
+            }
+        }
+    }
+
     #[test]
     fn help_box_dimensions_reasonable_80x24() {
         let (key_col, desc_col, box_w, box_h, visible_rows) = help_box_dimensions(80, 24);
@@ -4141,8 +4303,8 @@ mod tests {
             span("Hello ", None),
             span("click me", Some("https://example.com")),
         ])]);
-        // Click on "Hello " (no link)
-        assert_eq!(state.link_at_position(1, 2 + 0), None);
+        // Gutter is 2 cols; click on "Hello " (no link) at content cols 0 and 5.
+        assert_eq!(state.link_at_position(1, 2), None);
         assert_eq!(state.link_at_position(1, 2 + 5), None);
     }
 
@@ -4184,8 +4346,8 @@ mod tests {
             span(" ", None),
             span("bb", Some("https://b.com")),
         ])]);
-        // "aa" at cols 0..2, " " at 2..3, "bb" at 3..5
-        assert_eq!(state.link_at_position(1, 2 + 0), Some("https://a.com"));
+        // "aa" at cols 0..2, " " at 2..3, "bb" at 3..5 (offset by 2-col gutter)
+        assert_eq!(state.link_at_position(1, 2), Some("https://a.com"));
         assert_eq!(state.link_at_position(1, 2 + 1), Some("https://a.com"));
         assert_eq!(state.link_at_position(1, 2 + 2), None); // space
         assert_eq!(state.link_at_position(1, 2 + 3), Some("https://b.com"));

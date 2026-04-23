@@ -574,8 +574,8 @@ impl<'a> Renderer<'a> {
                     flex_remaining -= 1;
                     if flex_remaining == 0 {
                         *w = remaining;
-                    } else if flex_natural > 0 {
-                        let share = (*w * flex_available / flex_natural).max(3);
+                    } else if let Some(share) = (*w * flex_available).checked_div(flex_natural) {
+                        let share = share.max(3);
                         *w = share;
                         remaining = remaining.saturating_sub(share);
                     }
@@ -1733,7 +1733,7 @@ mod tests {
     fn unordered_list_has_bullets() {
         let input = "- item one\n- item two";
         let (lines, _) = render_test(input);
-        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
         let bullet_lines: Vec<_> = texts.iter().filter(|t| t.contains('•')).collect();
         assert_eq!(bullet_lines.len(), 2);
     }
@@ -1742,7 +1742,7 @@ mod tests {
     fn ordered_list_has_numbers() {
         let input = "1. first\n2. second";
         let (lines, _) = render_test(input);
-        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(texts.iter().any(|t| t.contains("1.")));
         assert!(texts.iter().any(|t| t.contains("2.")));
     }
@@ -1753,7 +1753,7 @@ mod tests {
     fn blockquote_produces_styled_output() {
         let input = "> quoted text";
         let (lines, _) = render_test(input);
-        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(texts.iter().any(|t| t.contains("quoted text")));
     }
 
