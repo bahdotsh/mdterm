@@ -26,6 +26,123 @@ pub enum ImageProtocol {
     HalfBlock,
 }
 
+/// Query whether the active tmux session has `allow-passthrough` set to `on`
+/// or `all`.  Returns `false` on any error (tmux not found, option absent, etc.).
+///
+/// DCS passthrough (`\x1bPtmux;…\x1b\\`) is the mechanism used to forward
+/// Kitty graphics sequences and iTerm2 inline-image OSC sequences through
+/// tmux to the outer terminal.  Without `allow-passthrough on` in tmux.conf,
+/// tmux silently drops every DCS sequence.
+///
+/// This is intentionally a blocking subprocess call: it runs once at startup
+/// during protocol detection and typically completes in under 5 ms.
+fn tmux_allows_passthrough() -> bool {
+    std::process::Command::new("tmux")
+        .args(["show-options", "-g", "allow-passthrough"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .is_some_and(|s| {
+            // Output format: "allow-passthrough on\n" or "allow-passthrough all\n"
+            let val = s
+                .trim()
+                .strip_prefix("allow-passthrough")
+                .unwrap_or("")
+                .trim();
+            val == "on" || val == "all"
+        })
+}
+
+/// Parse the running tmux version string into (major, minor).
+/// Handles version strings like "tmux 3.3a", "tmux 3.4", "tmux next-3.5".
+fn tmux_version() -> Option<(u32, u32)> {
+    let out = std::process::Command::new("tmux").arg("-V").output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    // Strip "tmux " prefix, then optional "next-" prefix.
+    let s = s.strip_prefix("tmux ").unwrap_or(s);
+    let s = s.strip_prefix("next-").unwrap_or(s);
+    // Strip trailing alphabetic suffix so "3.3a" → "3.3".
+    let s = s.trim_end_matches(|c: char| c.is_alphabetic());
+    let mut parts = s.splitn(2, '.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    // Minor version defaults to 0 if absent (e.g. a hypothetical "tmux 4").
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Return `true` when the running tmux version supports native Sixel rendering
+/// (≥ 3.3) **and** `allow-sixel-images` is set to `on` in the global tmux
+/// configuration.
+///
+/// tmux 3.3 introduced native Sixel support: tmux intercepts and renders Sixel
+/// data itself so no DCS passthrough to the outer terminal is required.  The
+/// outer terminal does not need to support Sixel.  Users must opt in by adding
+/// `set -g allow-sixel-images on` to their `tmux.conf`.
+fn tmux_supports_sixel() -> bool {
+    match tmux_version() {
+        Some((major, minor)) if major > 3 || (major == 3 && minor >= 3) => {}
+        _ => return false,
+    }
+    std::process::Command::new("tmux")
+        .args(["show-options", "-g", "allow-sixel-images"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .is_some_and(|s| {
+            // Output format: "allow-sixel-images on\n"
+            let val = s
+                .trim()
+                .strip_prefix("allow-sixel-images")
+                .unwrap_or("")
+                .trim();
+            val == "on"
+        })
+}
+
+/// Try to obtain terminal cell pixel dimensions from the tmux client.
+///
+/// `tmux display-message` exposes `#{client_cell_width}` and
+/// `#{client_cell_height}` since tmux 3.4.  Inside tmux, `TIOCGWINSZ` often
+/// reports `ws_xpixel = ws_ypixel = 0` because tmux itself is not a pixel-aware
+/// terminal emulator.  Querying tmux directly is the only reliable way to learn
+/// the actual cell pixel size in that environment.
+fn tmux_cell_metrics() -> Option<CellMetrics> {
+    let out = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "#{client_cell_width}x#{client_cell_height}",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    let mut parts = s.splitn(2, 'x');
+    let cell_w: u32 = parts.next()?.parse().ok()?;
+    let cell_h: u32 = parts.next()?.parse().ok()?;
+    if cell_w == 0 || cell_h == 0 {
+        return None;
+    }
+    Some(CellMetrics {
+        aspect: cell_h as f64 / cell_w as f64,
+        cell_w_px: cell_w,
+        cell_h_px: cell_h,
+    })
+}
+
 pub fn detect_protocol() -> ImageProtocol {
     // Allow users to force a specific protocol via environment variable
     if let Ok(proto) = std::env::var("MDTERM_IMAGE_PROTOCOL") {
@@ -45,26 +162,55 @@ pub fn detect_protocol() -> ImageProtocol {
     // When inside tmux, standard Kitty placement commands don't work.
     // Use Unicode placeholder method instead: upload via DCS passthrough,
     // place via U+10EEEE characters that tmux treats as normal text.
+    //
+    // IMPORTANT: DCS passthrough only reaches the outer terminal when
+    // `allow-passthrough on` (or `all`) is set in tmux.conf.  Without
+    // that option, tmux silently drops every DCS sequence while the
+    // U+10EEEE placeholder characters still pass through as plain text.
+    // The outer Kitty-compatible terminal then renders an orange
+    // "unknown image" rectangle for each placeholder cell.  We therefore
+    // query tmux at startup and only select protocols that require DCS
+    // passthrough when passthrough is confirmed to be enabled.
     let in_tmux = std::env::var("TMUX").is_ok();
     if in_tmux {
-        if let Ok(term) = std::env::var("TERM_PROGRAM") {
-            match term.as_str() {
-                "ghostty" | "WezTerm" => return ImageProtocol::KittyUnicode,
-                "iTerm.app" => return ImageProtocol::Iterm2,
-                _ => {}
+        let passthrough_ok = tmux_allows_passthrough();
+        if passthrough_ok {
+            if let Ok(term) = std::env::var("TERM_PROGRAM") {
+                match term.as_str() {
+                    "ghostty" | "WezTerm" => return ImageProtocol::KittyUnicode,
+                    "iTerm.app" => return ImageProtocol::Iterm2,
+                    _ => {}
+                }
+            }
+            // LC_TERMINAL is another way iTerm2 identifies itself.
+            if std::env::var("LC_TERMINAL").ok().as_deref() == Some("iTerm2") {
+                return ImageProtocol::Iterm2;
+            }
+            if let Ok(term) = std::env::var("TERM")
+                && (term == "xterm-ghostty" || term == "xterm-kitty")
+            {
+                return ImageProtocol::KittyUnicode;
+            }
+            if std::env::var("KITTY_WINDOW_ID").is_ok() {
+                return ImageProtocol::KittyUnicode;
+            }
+            if std::env::var("KONSOLE_VERSION").is_ok() {
+                return ImageProtocol::KittyUnicode;
             }
         }
-        if let Ok(term) = std::env::var("TERM")
-            && (term == "xterm-ghostty" || term == "xterm-kitty")
-        {
-            return ImageProtocol::KittyUnicode;
+        // Either passthrough is disabled or no recognised Kitty-Unicode /
+        // iTerm2 terminal was detected.
+        //
+        // Try native tmux Sixel next: since tmux 3.3, tmux can render Sixel
+        // graphics itself without any DCS passthrough — the outer terminal does
+        // not need to support Sixel.  Users must opt in via
+        // `set -g allow-sixel-images on` in their tmux.conf.
+        if tmux_supports_sixel() {
+            return ImageProtocol::Sixel;
         }
-        if std::env::var("KITTY_WINDOW_ID").is_ok() {
-            return ImageProtocol::KittyUnicode;
-        }
-        if std::env::var("KONSOLE_VERSION").is_ok() {
-            return ImageProtocol::KittyUnicode;
-        }
+        // Last resort: HalfBlock — uses only standard ANSI colour sequences
+        // that tmux always forwards, but gives a coarser pixel grid.
+        return ImageProtocol::HalfBlock;
     }
 
     // Kitty checks (more efficient: upload once, place per-frame)
@@ -146,6 +292,14 @@ pub fn get_cell_metrics() -> CellMetrics {
                     cell_h_px: cell_h.round() as u32,
                 };
             }
+        }
+        // TIOCGWINSZ did not return pixel dimensions (common inside tmux, where
+        // ws_xpixel and ws_ypixel are typically 0).  Try to obtain the cell
+        // pixel size directly from the tmux client (requires tmux ≥ 3.4).
+        if std::env::var("TMUX").is_ok()
+            && let Some(metrics) = tmux_cell_metrics()
+        {
+            return metrics;
         }
     }
     CellMetrics::default()
@@ -696,6 +850,9 @@ enum PreRenderedResult {
 pub struct ImageCache {
     images: HashMap<String, Option<Arc<DynamicImage>>>,
     protocol: ImageProtocol,
+    /// Whether mdterm is running inside a tmux session.
+    /// Used by the render layer to wrap escape sequences in DCS passthrough.
+    in_tmux: bool,
 
     // Kitty: image uploaded once, placed per-frame (None = encode failed)
     kitty_images: HashMap<String, Option<KittyImage>>,
@@ -740,11 +897,13 @@ pub struct ImageCache {
 impl ImageCache {
     pub fn new() -> Self {
         let protocol = detect_protocol();
+        let in_tmux = std::env::var("TMUX").is_ok();
         let (sender, receiver) = mpsc::channel();
         let (render_sender, render_receiver) = mpsc::channel();
         ImageCache {
             images: HashMap::new(),
             protocol,
+            in_tmux,
             kitty_images: HashMap::new(),
             kitty_unicode_images: HashMap::new(),
             // Starts at 0; wrapping_add(1) before first use ensures IDs begin at 1.
@@ -1394,13 +1553,26 @@ impl ImageCache {
             &ii.crop_cache.as_ref().unwrap().2
         };
 
-        // Position cursor and emit a single iTerm2 inline image
+        // Position cursor and emit a single iTerm2 inline image.
+        // The cursor-movement (CSI) goes to tmux's virtual screen directly.
+        // The image data (OSC) must be wrapped in a tmux DCS passthrough when
+        // running inside tmux so that tmux forwards it to the outer terminal
+        // instead of discarding it.
         write!(stdout, "\x1b[{};{}H", screen_y + 1, x_col + 1)?; // 1-based ANSI coords
-        write!(
-            stdout,
-            "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=0:{}\x07",
-            ii.cols, num_rows, data
-        )?;
+        if self.in_tmux {
+            // Build the OSC sequence as bytes, then wrap for tmux.
+            let osc = format!(
+                "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=0:{}\x07",
+                ii.cols, num_rows, data
+            );
+            stdout.write_all(&tmux_wrap(osc.as_bytes()))?;
+        } else {
+            write!(
+                stdout,
+                "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=0:{}\x07",
+                ii.cols, num_rows, data
+            )?;
+        }
 
         Ok(())
     }
@@ -2842,8 +3014,63 @@ mod tests {
 
         // TMUX present → KittyUnicode *only* if TERM_PROGRAM is ghostty/WezTerm etc.
         // Since we cleared those, and TMUX is set, the tmux branch runs first but
-        // none of its arms match → falls through entirely to HalfBlock.
+        // none of its DCS-passthrough arms match.  In CI there is no tmux server,
+        // so tmux_supports_sixel() also returns false → falls through to HalfBlock.
         assert_eq!(proto, ImageProtocol::HalfBlock);
+        // _env restores all saved vars on drop.
+    }
+
+    /// When a Kitty-compatible terminal (e.g. Ghostty) is detected inside tmux
+    /// but `tmux show-options` does NOT confirm `allow-passthrough on`, the
+    /// protocol must fall back to `HalfBlock`.  Without passthrough, tmux drops
+    /// every DCS sequence, and the outer terminal shows an orange "unknown image"
+    /// indicator for each U+10EEEE placeholder character.
+    ///
+    /// In the CI test environment no tmux server is running, so
+    /// `tmux show-options -g allow-passthrough` exits with an error and
+    /// `tmux_allows_passthrough()` returns `false`.  The test exploits this to
+    /// exercise the fallback path without needing a mock.
+    #[test]
+    fn detect_kittyunicode_falls_back_to_halfblock_without_passthrough() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&[
+            "TERMINOLOGY",
+            "TMUX",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "TERM",
+            "LC_TERMINAL",
+            "MLTERM",
+            "KONSOLE_VERSION",
+            "MDTERM_IMAGE_PROTOCOL",
+        ]);
+
+        // Safety: test holds ENV_LOCK mutex, preventing concurrent env mutation.
+        unsafe {
+            std::env::remove_var("TERMINOLOGY");
+            std::env::remove_var("KITTY_WINDOW_ID");
+            std::env::remove_var("TERM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("MLTERM");
+            std::env::remove_var("KONSOLE_VERSION");
+            std::env::remove_var("MDTERM_IMAGE_PROTOCOL");
+            // Simulate running inside tmux with a Ghostty outer terminal.
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,12345,0");
+            std::env::set_var("TERM_PROGRAM", "ghostty");
+        }
+
+        let proto = detect_protocol();
+
+        // In CI (no tmux server running) tmux_allows_passthrough() returns false,
+        // so detect_protocol() must choose HalfBlock rather than KittyUnicode.
+        // tmux_supports_sixel() also returns false in CI (no tmux server), so
+        // the final fallback is HalfBlock.  This guards against the regression
+        // where KittyUnicode was selected without verifying passthrough support.
+        assert_eq!(
+            proto,
+            ImageProtocol::HalfBlock,
+            "expected HalfBlock when tmux passthrough is not confirmed"
+        );
         // _env restores all saved vars on drop.
     }
 
