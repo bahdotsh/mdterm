@@ -39,5 +39,13 @@ impl Config {
 }
 
 fn config_path() -> Option<PathBuf> {
+    // Check XDG-style ~/.config first (takes precedence on all platforms),
+    // then fall back to the platform config dir (e.g. ~/Library/Preferences on macOS).
+    let xdg = dirs::home_dir().map(|h| h.join(".config").join("mdterm").join("config.toml"));
+    if let Some(ref p) = xdg {
+        if p.exists() {
+            return xdg;
+        }
+    }
     dirs::config_dir().map(|d| d.join("mdterm").join("config.toml"))
 }
