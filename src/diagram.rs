@@ -276,17 +276,21 @@ pub(crate) struct NodeLayout {
     pub(crate) width: usize,
 }
 
-fn assign_layers(graph: &Graph) -> Vec<Vec<String>> {
-    // Build adjacency and in-degree
+fn assign_layers(graph: &Graph, feedback_edges: &HashSet<usize>) -> Vec<Vec<String>> {
+    // Build a DAG view by excluding feedback edges.
+    let node_ids = graph_node_ids(graph);
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    for id in graph.nodes.keys() {
-        in_degree.entry(id.as_str()).or_insert(0);
-        adj.entry(id.as_str()).or_default();
+    for &id in &node_ids {
+        in_degree.entry(id).or_insert(0);
+        adj.entry(id).or_default();
     }
 
-    for edge in &graph.edges {
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if feedback_edges.contains(&idx) {
+            continue;
+        }
         adj.entry(edge.from.as_str())
             .or_default()
             .push(edge.to.as_str());
@@ -295,24 +299,21 @@ fn assign_layers(graph: &Graph) -> Vec<Vec<String>> {
 
     // Kahn's topological sort
     let mut queue: VecDeque<&str> = VecDeque::new();
-    let mut topo_order: Vec<String> = Vec::new();
+    let mut topo_order: Vec<&str> = Vec::new();
     let mut in_deg = in_degree.clone();
+    let mut processed: HashSet<&str> = HashSet::new();
 
-    for (&id, &deg) in &in_deg {
-        if deg == 0 {
+    for &id in &node_ids {
+        if in_deg.get(id).copied().unwrap_or(0) == 0 {
             queue.push_back(id);
         }
     }
 
-    // Cycle fallback
-    if queue.is_empty()
-        && let Some(first) = graph.node_order.first()
-    {
-        queue.push_back(first.as_str());
-    }
-
     while let Some(node) = queue.pop_front() {
-        topo_order.push(node.to_string());
+        if !processed.insert(node) {
+            continue;
+        }
+        topo_order.push(node);
         if let Some(neighbors) = adj.get(node) {
             for &next in neighbors {
                 let deg = in_deg.get_mut(next).unwrap();
@@ -325,39 +326,44 @@ fn assign_layers(graph: &Graph) -> Vec<Vec<String>> {
     }
 
     // Add any remaining nodes (from cycles)
-    for id in &graph.node_order {
-        if !topo_order.contains(id) {
-            topo_order.push(id.clone());
+    for &id in &node_ids {
+        if !processed.contains(id) {
+            topo_order.push(id);
+            processed.insert(id);
         }
     }
 
     // Longest-path layer assignment
-    let mut node_layer: HashMap<String, usize> = HashMap::new();
-    for node in &topo_order {
+    let mut node_layer: HashMap<&str, usize> = HashMap::new();
+    for &node in &topo_order {
         let mut max_parent_layer: Option<usize> = None;
-        for edge in &graph.edges {
-            if edge.to == *node
-                && let Some(&parent_layer) = node_layer.get(&edge.from)
+        for (idx, edge) in graph.edges.iter().enumerate() {
+            if feedback_edges.contains(&idx) {
+                continue;
+            }
+            if edge.to == node
+                && let Some(&parent_layer) = node_layer.get(edge.from.as_str())
             {
                 max_parent_layer =
                     Some(max_parent_layer.map_or(parent_layer, |m: usize| m.max(parent_layer)));
             }
         }
         let layer = max_parent_layer.map_or(0, |m| m + 1);
-        node_layer.insert(node.clone(), layer);
+        node_layer.insert(node, layer);
     }
 
     let max_layer = node_layer.values().copied().max().unwrap_or(0);
     let mut layers: Vec<Vec<String>> = vec![Vec::new(); max_layer + 1];
-    for node in &topo_order {
+    for &node in &topo_order {
         let layer = node_layer[node];
-        layers[layer].push(node.clone());
+        // Return owned IDs to keep the original layout helper signature.
+        layers[layer].push(node.to_string());
     }
     layers.retain(|l| !l.is_empty());
     layers
 }
 
-fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph) {
+fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph, feedback_edges: &HashSet<usize>) {
     // Barycenter heuristic to reduce edge crossings
     for _ in 0..4 {
         // Forward pass
@@ -367,7 +373,10 @@ fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph) {
 
             for node in &layers[i] {
                 let mut parent_positions: Vec<f64> = Vec::new();
-                for edge in &graph.edges {
+                for (idx, edge) in graph.edges.iter().enumerate() {
+                    if feedback_edges.contains(&idx) {
+                        continue;
+                    }
                     if edge.to == *node
                         && let Some(pos) = prev_layer.iter().position(|n| n == &edge.from)
                     {
@@ -392,7 +401,10 @@ fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph) {
 
             for node in &layers[i] {
                 let mut child_positions: Vec<f64> = Vec::new();
-                for edge in &graph.edges {
+                for (idx, edge) in graph.edges.iter().enumerate() {
+                    if feedback_edges.contains(&idx) {
+                        continue;
+                    }
                     if edge.from == *node
                         && let Some(pos) = next_layer.iter().position(|n| n == &edge.to)
                     {
@@ -410,6 +422,106 @@ fn order_within_layers(layers: &mut [Vec<String>], graph: &Graph) {
             layers[i] = positions.into_iter().map(|(n, _)| n).collect();
         }
     }
+}
+
+fn graph_node_ids(graph: &Graph) -> Vec<&str> {
+    let mut ids = Vec::with_capacity(graph.node_order.len().max(graph.nodes.len()));
+    let mut seen = HashSet::new();
+    for id in &graph.node_order {
+        if seen.insert(id.as_str()) {
+            ids.push(id.as_str());
+        }
+    }
+    for id in graph.nodes.keys() {
+        if seen.insert(id.as_str()) {
+            ids.push(id.as_str());
+        }
+    }
+    ids
+}
+
+fn classify_feedback_edges(graph: &Graph) -> HashSet<usize> {
+    #[derive(Clone, Copy)]
+    enum VisitState {
+        Visiting,
+        Visited,
+    }
+
+    fn visit<'a>(
+        node: &'a str,
+        adj: &HashMap<&'a str, Vec<(usize, &'a str)>>,
+        visit_set: &mut HashMap<&'a str, VisitState>,
+        feedback: &mut HashSet<usize>,
+    ) {
+        visit_set.insert(node, VisitState::Visiting);
+
+        for &(edge_idx, to) in adj.get(node).into_iter().flatten() {
+            if to == node {
+                // Self-loops are feedback edges and cannot participate in DAG layering.
+                feedback.insert(edge_idx);
+                continue;
+            }
+
+            match visit_set.get(to).copied() {
+                None => visit(to, adj, visit_set, feedback),
+                Some(VisitState::Visiting) => {
+                    // Edges to nodes still on the DFS stack are feedback edges.
+                    feedback.insert(edge_idx);
+                }
+                Some(VisitState::Visited) => {}
+            }
+        }
+
+        visit_set.insert(node, VisitState::Visited);
+    }
+
+    let mut adj: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+    for id in graph_node_ids(graph) {
+        adj.entry(id).or_default();
+    }
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        adj.entry(edge.from.as_str())
+            .or_default()
+            .push((idx, edge.to.as_str()));
+        adj.entry(edge.to.as_str()).or_default();
+    }
+
+    let mut visit_set: HashMap<&str, VisitState> = HashMap::new();
+    let mut feedback = HashSet::new();
+    for id in graph_node_ids(graph) {
+        if !visit_set.contains_key(id) {
+            visit(id, &adj, &mut visit_set, &mut feedback);
+        }
+    }
+
+    feedback
+}
+
+fn edge_layer_feedback_indices(
+    graph: &Graph,
+    layers: &[Vec<String>],
+    feedback_edges: &HashSet<usize>,
+) -> Vec<usize> {
+    let mut node_layer: HashMap<&str, usize> = HashMap::new();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        for id in layer {
+            node_layer.insert(id.as_str(), layer_idx);
+        }
+    }
+
+    graph
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, edge)| {
+            let is_feedback = feedback_edges.contains(&idx)
+                || node_layer
+                    .get(edge.from.as_str())
+                    .zip(node_layer.get(edge.to.as_str()))
+                    .is_some_and(|(from, to)| from >= to);
+            is_feedback.then_some(idx)
+        })
+        .collect()
 }
 
 fn node_box_width(node: &Node) -> usize {
@@ -873,6 +985,143 @@ impl Canvas {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_feedback_edge_td(
+        &mut self,
+        src_right_x: usize,
+        src_cy: usize,
+        dst_right_x: usize,
+        dst_cy: usize,
+        lane_x: usize,
+        label: Option<&str>,
+        edge_fg: Option<Color>,
+        label_fg: Option<Color>,
+    ) {
+        if lane_x >= self.width || src_cy >= self.height || dst_cy >= self.height {
+            return;
+        }
+
+        let src_start_x = src_right_x + 1;
+        let arrow_x = dst_right_x + 1;
+        if src_start_x >= self.width || arrow_x >= self.width {
+            return;
+        }
+
+        for x in src_start_x..lane_x {
+            self.add_connection(x, src_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
+        }
+
+        let (min_y, max_y) = if src_cy < dst_cy {
+            (src_cy, dst_cy)
+        } else {
+            (dst_cy, src_cy)
+        };
+        for y in (min_y + 1)..max_y {
+            self.add_connection(lane_x, y, CONN_UP | CONN_DOWN, edge_fg);
+        }
+
+        if src_cy == dst_cy {
+            self.add_connection(lane_x, src_cy, CONN_LEFT, edge_fg);
+        } else {
+            let src_turn = if dst_cy < src_cy {
+                CONN_LEFT | CONN_UP
+            } else {
+                CONN_LEFT | CONN_DOWN
+            };
+            let dst_turn = if dst_cy < src_cy {
+                CONN_LEFT | CONN_DOWN
+            } else {
+                CONN_LEFT | CONN_UP
+            };
+            self.add_connection(lane_x, src_cy, src_turn, edge_fg);
+            self.add_connection(lane_x, dst_cy, dst_turn, edge_fg);
+        }
+
+        if arrow_x + 1 < lane_x {
+            for x in (arrow_x + 1)..lane_x {
+                self.add_connection(x, dst_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
+            }
+        }
+        self.set(arrow_x, dst_cy, '◀', edge_fg);
+
+        if let Some(text) = label {
+            let label_y = min_y + (max_y - min_y) / 2;
+            for (i, ch) in text.chars().enumerate() {
+                self.set(lane_x + 2 + i, label_y, ch, label_fg);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_feedback_edge_lr(
+        &mut self,
+        src_cx: usize,
+        src_bottom_y: usize,
+        dst_cx: usize,
+        dst_bottom_y: usize,
+        lane_y: usize,
+        label: Option<&str>,
+        edge_fg: Option<Color>,
+        label_fg: Option<Color>,
+    ) {
+        if lane_y >= self.height || src_cx >= self.width || dst_cx >= self.width {
+            return;
+        }
+
+        let arrow_y = dst_bottom_y + 1;
+        if arrow_y >= self.height {
+            return;
+        }
+
+        for y in (src_bottom_y + 1)..lane_y {
+            self.add_connection(src_cx, y, CONN_UP | CONN_DOWN, edge_fg);
+        }
+
+        if src_cx == dst_cx {
+            self.add_connection(src_cx, lane_y, CONN_UP, edge_fg);
+        } else {
+            let (min_x, max_x) = if src_cx < dst_cx {
+                (src_cx, dst_cx)
+            } else {
+                (dst_cx, src_cx)
+            };
+            for x in (min_x + 1)..max_x {
+                self.add_connection(x, lane_y, CONN_LEFT | CONN_RIGHT, edge_fg);
+            }
+
+            let src_turn = if dst_cx < src_cx {
+                CONN_UP | CONN_LEFT
+            } else {
+                CONN_UP | CONN_RIGHT
+            };
+            let dst_turn = if dst_cx < src_cx {
+                CONN_UP | CONN_RIGHT
+            } else {
+                CONN_UP | CONN_LEFT
+            };
+            self.add_connection(src_cx, lane_y, src_turn, edge_fg);
+            self.add_connection(dst_cx, lane_y, dst_turn, edge_fg);
+        }
+
+        for y in (arrow_y + 1)..lane_y {
+            self.add_connection(dst_cx, y, CONN_UP | CONN_DOWN, edge_fg);
+        }
+        self.set(dst_cx, arrow_y, '▲', edge_fg);
+
+        if let Some(text) = label {
+            let (min_x, max_x) = if src_cx < dst_cx {
+                (src_cx, dst_cx)
+            } else {
+                (dst_cx, src_cx)
+            };
+            let label_x = min_x + (max_x - min_x).saturating_sub(text.chars().count()) / 2;
+            let label_y = lane_y.saturating_sub(1);
+            for (i, ch) in text.chars().enumerate() {
+                self.set(label_x + i, label_y, ch, label_fg);
+            }
+        }
+    }
+
     pub(crate) fn to_span_rows(&self, theme: &Theme) -> Vec<Vec<StyledSpan>> {
         let default_bg = Some(theme.code_bg);
         self.cells
@@ -915,8 +1164,17 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let edge_gap: usize = 4;
     let h_gap: usize = 4;
 
-    let mut layers = assign_layers(graph);
-    order_within_layers(&mut layers, graph);
+    let feedback_edges = classify_feedback_edges(graph);
+    let mut layers = assign_layers(graph, &feedback_edges);
+    order_within_layers(&mut layers, graph, &feedback_edges);
+    let routed_feedback_edges = edge_layer_feedback_indices(graph, &layers, &feedback_edges);
+    let routed_feedback_set: HashSet<usize> = routed_feedback_edges.iter().copied().collect();
+    let max_feedback_label_width = routed_feedback_edges
+        .iter()
+        .filter_map(|idx| graph.edges[*idx].label.as_ref())
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
 
     // Calculate node widths
     let mut widths: HashMap<String, usize> = HashMap::new();
@@ -935,7 +1193,13 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         max_layer_width = max_layer_width.max(w);
     }
 
-    let canvas_width = max_layer_width + 6; // margin on each side
+    let core_canvas_width = max_layer_width + 6; // margin on each side
+    let feedback_gutter_width = if routed_feedback_edges.is_empty() {
+        0
+    } else {
+        routed_feedback_edges.len() * 4 + max_feedback_label_width + 4
+    };
+    let canvas_width = core_canvas_width + feedback_gutter_width;
     let canvas_height = layers.len() * (node_height + edge_gap) - edge_gap;
 
     if canvas_height == 0 {
@@ -951,7 +1215,7 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     // First pass: calculate centers for the widest layer
     // Then align single-node layers to the canvas center
-    let canvas_center = canvas_width / 2;
+    let canvas_center = core_canvas_width / 2;
 
     for (layer_idx, layer) in layers.iter().enumerate() {
         let y = layer_idx * (node_height + edge_gap);
@@ -1000,19 +1264,35 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let edge_fg = Some(theme.code_border);
     let label_fg = Some(theme.h3); // Use a distinct color for edge labels
 
-    for edge in &graph.edges {
+    let mut feedback_lane = 0usize;
+    for (idx, edge) in graph.edges.iter().enumerate() {
         if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
-            let src_bottom = src.top_y + 2;
-            let dst_top = dst.top_y;
-            canvas.draw_edge_td(
-                src.center_x,
-                src_bottom,
-                dst.center_x,
-                dst_top,
-                edge.label.as_deref(),
-                edge_fg,
-                label_fg,
-            );
+            if routed_feedback_set.contains(&idx) {
+                let lane_x = core_canvas_width + 1 + feedback_lane * 4;
+                feedback_lane += 1;
+                canvas.draw_feedback_edge_td(
+                    src.center_x + src.width / 2,
+                    src.top_y + 1,
+                    dst.center_x + dst.width / 2,
+                    dst.top_y + 1,
+                    lane_x,
+                    edge.label.as_deref(),
+                    edge_fg,
+                    label_fg,
+                );
+            } else {
+                let src_bottom = src.top_y + 2;
+                let dst_top = dst.top_y;
+                canvas.draw_edge_td(
+                    src.center_x,
+                    src_bottom,
+                    dst.center_x,
+                    dst_top,
+                    edge.label.as_deref(),
+                    edge_fg,
+                    label_fg,
+                );
+            }
         }
     }
 
@@ -1027,8 +1307,11 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let node_h_gap: usize = 6; // horizontal gap between columns for edge routing
     let v_gap: usize = 2; // vertical gap between nodes in same column
 
-    let mut layers = assign_layers(graph);
-    order_within_layers(&mut layers, graph);
+    let feedback_edges = classify_feedback_edges(graph);
+    let mut layers = assign_layers(graph, &feedback_edges);
+    order_within_layers(&mut layers, graph, &feedback_edges);
+    let routed_feedback_edges = edge_layer_feedback_indices(graph, &layers, &feedback_edges);
+    let routed_feedback_set: HashSet<usize> = routed_feedback_edges.iter().copied().collect();
 
     // Calculate node widths
     let mut widths: HashMap<String, usize> = HashMap::new();
@@ -1052,7 +1335,13 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     let canvas_width: usize =
         col_widths.iter().sum::<usize>() + (layers.len().saturating_sub(1)) * node_h_gap + 4;
-    let canvas_height = max_nodes_in_layer * (node_height + v_gap) - v_gap + 2;
+    let core_canvas_height = max_nodes_in_layer * (node_height + v_gap) - v_gap + 2;
+    let feedback_gutter_height = if routed_feedback_edges.is_empty() {
+        0
+    } else {
+        routed_feedback_edges.len() * 2 + 2
+    };
+    let canvas_height = core_canvas_height + feedback_gutter_height;
 
     if canvas_height == 0 {
         return None;
@@ -1069,7 +1358,7 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         let col_w = col_widths[layer_idx];
 
         let total_layer_height = layer.len() * node_height + layer.len().saturating_sub(1) * v_gap;
-        let start_y = (canvas_height.saturating_sub(total_layer_height)) / 2;
+        let start_y = (core_canvas_height.saturating_sub(total_layer_height)) / 2;
 
         for (node_idx, id) in layer.iter().enumerate() {
             let w = widths.get(id).copied().unwrap_or(7);
@@ -1097,24 +1386,40 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let edge_fg = Some(theme.code_border);
     let label_fg = Some(theme.h3);
 
-    for edge in &graph.edges {
+    let mut feedback_lane = 0usize;
+    for (idx, edge) in graph.edges.iter().enumerate() {
         if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
-            let src_right_x = src.center_x + src.width / 2;
-            let src_cy = src.top_y + 1;
-            let dst_left_x = dst.center_x.saturating_sub(dst.width / 2);
-            let dst_cy = dst.top_y + 1;
+            if routed_feedback_set.contains(&idx) {
+                let lane_y = core_canvas_height + 1 + feedback_lane * 2;
+                feedback_lane += 1;
+                canvas.draw_feedback_edge_lr(
+                    src.center_x,
+                    src.top_y + 2,
+                    dst.center_x,
+                    dst.top_y + 2,
+                    lane_y,
+                    edge.label.as_deref(),
+                    edge_fg,
+                    label_fg,
+                );
+            } else {
+                let src_right_x = src.center_x + src.width / 2;
+                let src_cy = src.top_y + 1;
+                let dst_left_x = dst.center_x.saturating_sub(dst.width / 2);
+                let dst_cy = dst.top_y + 1;
 
-            canvas.draw_edge_lr(
-                src.center_x,
-                src_right_x,
-                src_cy,
-                dst_left_x,
-                dst_cy,
-                edge.label.as_deref(),
-                edge_fg,
-                label_fg,
-                None,
-            );
+                canvas.draw_edge_lr(
+                    src.center_x,
+                    src_right_x,
+                    src_cy,
+                    dst_left_x,
+                    dst_cy,
+                    edge.label.as_deref(),
+                    edge_fg,
+                    label_fg,
+                    None,
+                );
+            }
         }
     }
 
@@ -1131,5 +1436,66 @@ pub fn render_mermaid(code: &str, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>
     match graph.direction {
         Direction::TopDown => render_td(&graph, theme),
         Direction::LeftRight => render_lr(&graph, theme),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_text(code: &str) -> String {
+        let theme = Theme::dark();
+        let (rows, _) = render_mermaid(code, &theme).expect("diagram should render");
+        rows.into_iter()
+            .map(|row| row.into_iter().map(|span| span.text).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn renders_top_down_cycle_with_feedback_edge() {
+        let text = render_text(
+            r#"
+graph TB
+    Loop --> Execute
+    Execute --> Repeat
+    Repeat --> Loop
+"#,
+        );
+
+        assert!(text.contains("Loop"));
+        assert!(text.contains("Execute"));
+        assert!(text.contains("Repeat"));
+        assert!(text.contains('▼'));
+        assert!(text.contains('◀'));
+    }
+
+    #[test]
+    fn renders_self_loop_without_hanging() {
+        let text = render_text(
+            r#"
+graph TD
+    A[Self] --> A
+"#,
+        );
+
+        assert!(text.contains("Self"));
+        assert!(text.contains('◀'));
+    }
+
+    #[test]
+    fn renders_left_right_cycle_with_feedback_edge() {
+        let text = render_text(
+            r#"
+graph LR
+    A[Start] --> B[End]
+    B --> A
+"#,
+        );
+
+        assert!(text.contains("Start"));
+        assert!(text.contains("End"));
+        assert!(text.contains('▶'));
+        assert!(text.contains('▲'));
     }
 }
