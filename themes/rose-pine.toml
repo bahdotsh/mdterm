@@ -1,0 +1,70 @@
+# Rosé Pine (Dark Variant)
+bg = "191724"
+fg = "e0def4"
+
+# UI Elements
+border = "26233a"
+title = "908caa"
+position = "9ccfd8"
+help_hint = "6e6a86"
+scrollbar_track = "1f1d2e"
+scrollbar_thumb = "403d52"
+
+# Headings
+h1 = "ebbcba"
+h2 = "31748f"
+h3 = "f6c177"
+h4 = "eb6f92"
+h5 = "c4a7e7"
+h6 = "908caa"
+heading_separator = "26233a"
+
+# Code blocks & Inline code
+code_bg = "1f1d2e"
+code_border = "26233a"
+code_label = "908caa"
+inline_code_fg = "f6c177"
+inline_code_bg = "26233a"
+inline_code_tick = "403d52"
+
+# Blockquote & Links
+blockquote_bar = "c4a7e7"
+link = "31748f"
+link_url = "6e6a86"
+
+# Lists & Tables
+bullet = "c4a7e7"
+task_done = "9ccfd8"
+task_pending = "6e6a86"
+rule = "26233a"
+table_border = "26233a"
+table_header = "31748f"
+
+# Search UI & Overlays
+search_prompt = "f6c177"
+search_match_bg = "403d52"
+search_current_bg = "ebbcba"
+search_current_fg = "191724"
+search_no_match = "eb6f92"
+overlay_bg = "1f1d2e"
+overlay_border = "c4a7e7"
+overlay_selected_bg = "26233a"
+overlay_selected_fg = "e0def4"
+overlay_text = "e0def4"
+overlay_muted = "6e6a86"
+
+# Elements & Markdown syntax
+image_fg = "9ccfd8"
+slide_indicator = "f6c177"
+math_fg = "31748f"
+line_number = "403d52"
+
+# JSON Syntax Highlighting
+json_key = "ebbcba"
+json_string = "31748f"
+json_number = "c4a7e7"
+json_bool = "f6c177"
+json_null = "6e6a86"
+json_bracket = "e0def4"
+json_path = "9ccfd8"
+json_focus_bg = "26233a"

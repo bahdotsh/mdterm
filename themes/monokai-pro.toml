@@ -1,0 +1,69 @@
+bg = "2d2a2e"
+fg = "fcfcfa"
+
+# UI Elements
+border = "403e41"
+title = "939293"
+position = "727072"
+help_hint = "5b595c"
+scrollbar_track = "19181a"
+scrollbar_thumb = "5b595c"
+
+# Headings
+h1 = "ff6188"
+h2 = "fc9867"
+h3 = "ffd866"
+h4 = "a9dc76"
+h5 = "78dce8"
+h6 = "ab9df2"
+heading_separator = "403e41"
+
+# Code blocks & Inline code
+code_bg = "242225"
+code_border = "403e41"
+code_label = "727072"
+inline_code_fg = "fc9867"
+inline_code_bg = "363337"
+inline_code_tick = "403e41"
+
+# Blockquote & Links
+blockquote_bar = "ab9df2"
+link = "78dce8"
+link_url = "727072"
+
+# Lists & Tables
+bullet = "ab9df2"
+task_done = "a9dc76"
+task_pending = "5b595c"
+rule = "403e41"
+table_border = "48454A"
+table_header = "fc9867"
+
+# Search UI & Overlays
+search_prompt = "ffd866"
+search_match_bg = "403e41"
+search_current_bg = "ffd866"
+search_current_fg = "19181a"
+search_no_match = "ff6188"
+overlay_bg = "221f22"
+overlay_border = "403e41"
+overlay_selected_bg = "363337"
+overlay_selected_fg = "fcfcfa"
+overlay_text = "c1c0c0"
+overlay_muted = "727072"
+
+# Elements & Markdown syntax
+image_fg = "a9dc76"
+slide_indicator = "ffd866"
+math_fg = "78dce8"
+line_number = "5b595c"
+
+# JSON Syntax Highlighting
+json_key = "ff6188"
+json_string = "a9dc76"
+json_number = "ab9df2"
+json_bool = "fc9867"
+json_null = "727072"
+json_bracket = "c1c0c0"
+json_path = "78dce8"
+json_focus_bg = "363337"

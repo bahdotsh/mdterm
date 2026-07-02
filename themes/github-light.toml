@@ -1,0 +1,70 @@
+# GitHub Light Standard Palette
+bg = "ffffff"
+fg = "1f2328"
+
+# UI Elements
+border = "d0d7de"
+title = "57606a"
+position = "0969da"
+help_hint = "6e7781"
+scrollbar_track = "f6f8fa"
+scrollbar_thumb = "d0d7de"
+
+# Headings
+h1 = "1f2328"
+h2 = "0969da"
+h3 = "1f2328"
+h4 = "22863a"
+h5 = "e36209"
+h6 = "6e7781"
+heading_separator = "d0d7de"
+
+# Code blocks & Inline code
+code_bg = "f6f8fa"
+code_border = "d0d7de"
+code_label = "57606a"
+inline_code_fg = "1f2328"
+inline_code_bg = "afb8c1"
+inline_code_tick = "d0d7de"
+
+# Blockquote & Links
+blockquote_bar = "d0d7de"
+link = "0969da"
+link_url = "6e7781"
+
+# Lists & Tables
+bullet = "57606a"
+task_done = "1a7f37"
+task_pending = "6e7781"
+rule = "d0d7de"
+table_border = "d0d7de"
+table_header = "1f2328"
+
+# Search UI & Overlays
+search_prompt = "9a6700"
+search_match_bg = "ffe599"
+search_current_bg = "ffa23e"
+search_current_fg = "1f2328"
+search_no_match = "cf222e"
+overlay_bg = "f6f8fa"
+overlay_border = "0969da"
+overlay_selected_bg = "eaeef2"
+overlay_selected_fg = "1f2328"
+overlay_text = "1f2328"
+overlay_muted = "6e7781"
+
+# Elements & Markdown syntax
+image_fg = "1a7f37"
+slide_indicator = "9a6700"
+math_fg = "0550ae"
+line_number = "57606a"
+
+# JSON Syntax Highlighting
+json_key = "0550ae"
+json_string = "0a3069"
+json_number = "0550ae"
+json_bool = "cf222e"
+json_null = "6e7781"
+json_bracket = "24292f"
+json_path = "953800"
+json_focus_bg = "eaeef2"

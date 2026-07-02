@@ -126,7 +126,11 @@ Create `~/.config/mdterm/config.toml`:
 theme = "dark"          # "dark" or "light"
 line_numbers = false     # show line numbers in code blocks
 width = 0               # display width (0 = auto)
+theme_dark = "github-dark"   # Theme names for
+theme_light = "github-light" # each mode
 ```
+Themes are storage in `~/.config/mdterm/themes` as `<theme>.toml`
+Theme samples can be found in `code/themes`
 
 CLI flags override config file settings.
 

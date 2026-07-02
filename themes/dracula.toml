@@ -1,0 +1,70 @@
+# Dracula Theme
+bg = "282a36"
+fg = "f8f8f2"
+
+# UI Elements
+border = "44475a"
+title = "6272a4"
+position = "8be9fd"
+help_hint = "6272a4"
+scrollbar_track = "1e1f29"
+scrollbar_thumb = "44475a"
+
+# Headings
+h1 = "ff79c6"
+h2 = "bd93f9"
+h3 = "8be9fd"
+h4 = "50fa7b"
+h5 = "f1fa8c"
+h6 = "ffb86c"
+heading_separator = "44475a"
+
+# Code blocks & Inline code
+code_bg = "1e1f29"
+code_border = "44475a"
+code_label = "6272a4"
+inline_code_fg = "ffb86c"
+inline_code_bg = "44475a"
+inline_code_tick = "6272a4"
+
+# Blockquote & Links
+blockquote_bar = "bd93f9"
+link = "8be9fd"
+link_url = "6272a4"
+
+# Lists & Tables
+bullet = "bd93f9"
+task_done = "50fa7b"
+task_pending = "6272a4"
+rule = "44475a"
+table_border = "44475a"
+table_header = "ff79c6"
+
+# Search UI & Overlays
+search_prompt = "f1fa8c"
+search_match_bg = "44475a"
+search_current_bg = "ff79c6"
+search_current_fg = "282a36"
+search_no_match = "ff5555"
+overlay_bg = "1e1f29"
+overlay_border = "bd93f9"
+overlay_selected_bg = "44475a"
+overlay_selected_fg = "f8f8f2"
+overlay_text = "f8f8f2"
+overlay_muted = "6272a4"
+
+# Elements & Markdown syntax
+image_fg = "50fa7b"
+slide_indicator = "f1fa8c"
+math_fg = "8be9fd"
+line_number = "6272a4"
+
+# JSON Syntax Highlighting
+json_key = "ff79c6"
+json_string = "50fa7b"
+json_number = "bd93f9"
+json_bool = "ffb86c"
+json_null = "6272a4"
+json_bracket = "f8f8f2"
+json_path = "8be9fd"
+json_focus_bg = "44475a"

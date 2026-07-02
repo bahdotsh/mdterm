@@ -1,0 +1,71 @@
+# Ayu Dark
+bg = "0f1419"
+fg = "e6e1cf"
+
+# UI Elements
+border = "1a232c"
+title = "5c6773"
+position = "36a3d9"
+help_hint = "4c5561"
+scrollbar_track = "0b0e14"
+scrollbar_thumb = "243340"
+
+# Headings
+h1 = "ff3333"
+h2 = "ffb454"
+h3 = "f29718"
+h4 = "7fd962"
+h5 = "34bfd0"
+h6 = "f07178"
+heading_separator = "1a232c"
+
+# Code blocks & Inline code
+code_bg = "0b0e14"
+code_border = "1a232c"
+code_label = "ffb454"
+inline_code_fg = "e7c547"
+inline_code_bg = "1a232c"
+inline_code_tick = "243340"
+
+# Blockquote & Links
+blockquote_bar = "f29718"
+link = "36a3d9"
+link_url = "4c5561"
+
+# Lists & Tables
+bullet = "ffb454"
+task_done = "7fd962"
+task_pending = "4c5561"
+rule = "1a232c"
+table_border = "1a232c"
+table_header = "ffb454"
+
+# Search UI & Overlays
+search_prompt = "f29718"
+search_match_bg = "243340"
+search_current_bg = "ffb454"
+search_current_fg = "0f1419"
+search_no_match = "ff3333"
+overlay_bg = "0b0e14"
+overlay_border = "36a3d9"
+overlay_selected_bg = "1a232c"
+overlay_selected_fg = "e6e1cf"
+
+overlay_text = "e6e1cf"
+overlay_muted = "4c5561"
+
+# Elements & Markdown syntax
+image_fg = "7fd962"
+slide_indicator = "f29718"
+math_fg = "34bfd0"
+line_number = "243340"
+
+# JSON Syntax Highlighting
+json_key = "ffb454"
+json_string = "7fd962"
+json_number = "b8cc52"
+json_bool = "f29718"
+json_null = "4c5561"
+json_bracket = "e6e1cf"
+json_path = "36a3d9"
+json_focus_bg = "1a232c"

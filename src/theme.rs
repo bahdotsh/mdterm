@@ -1,4 +1,7 @@
+use crate::config::Config;
 use crossterm::style::Color;
+use std::collections::HashMap;
+use std::fs;
 
 #[derive(Clone)]
 pub struct Theme {
@@ -93,576 +96,220 @@ pub struct Theme {
     is_dark: bool,
 }
 
+fn load_theme_overrides(theme_name: Option<String>) -> HashMap<String, Color> {
+    let mut overrides = HashMap::new();
+
+    let name = match theme_name {
+        Some(n) => n,
+        None => return overrides,
+    };
+
+    let theme_path = dirs::config_dir().map(|d| {
+        d.join("mdterm")
+            .join("themes")
+            .join(format!("{}.toml", name))
+    });
+
+    let path = match theme_path {
+        Some(p) => p,
+        None => return overrides,
+    };
+
+    // Parse the target theme TOML file into a flat key-value map
+    if let Ok(contents) = fs::read_to_string(path)
+        && let Ok(theme_map) = toml::from_str::<HashMap<String, String>>(&contents)
+    {
+        for (key, val) in theme_map {
+            let hex = val.trim_start_matches('#');
+            if hex.len() == 6 {
+                let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+                let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+                let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+                overrides.insert(key, Color::Rgb { r, g, b });
+            }
+        }
+    }
+
+    overrides
+}
+
 impl Theme {
     pub fn dark() -> Self {
+        let config = Config::load();
+        let overrides = load_theme_overrides(config.theme_dark);
+
+        macro_rules! resolve_color {
+            ($key:expr, $r:expr, $g:expr, $b:expr) => {
+                overrides.get($key).copied().unwrap_or(Color::Rgb {
+                    r: $r,
+                    g: $g,
+                    b: $b,
+                })
+            };
+        }
+
         Self {
             is_dark: true,
+            bg: resolve_color!("bg", 30, 30, 46),
+            fg: resolve_color!("fg", 205, 214, 244),
 
-            bg: Color::Rgb {
-                r: 30,
-                g: 30,
-                b: 46,
-            },
-            fg: Color::Rgb {
-                r: 205,
-                g: 214,
-                b: 244,
-            },
+            border: resolve_color!("border", 68, 71, 90),
+            title: resolve_color!("title", 147, 153, 178),
+            position: resolve_color!("position", 108, 112, 134),
+            help_hint: resolve_color!("help_hint", 88, 91, 112),
+            scrollbar_track: resolve_color!("scrollbar_track", 49, 50, 68),
+            scrollbar_thumb: resolve_color!("scrollbar_thumb", 127, 132, 156),
 
-            border: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
-            title: Color::Rgb {
-                r: 147,
-                g: 153,
-                b: 178,
-            },
-            position: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
-            help_hint: Color::Rgb {
-                r: 88,
-                g: 91,
-                b: 112,
-            },
-            scrollbar_track: Color::Rgb {
-                r: 49,
-                g: 50,
-                b: 68,
-            },
-            scrollbar_thumb: Color::Rgb {
-                r: 127,
-                g: 132,
-                b: 156,
-            },
+            h1: resolve_color!("h1", 205, 214, 244),
+            h2: resolve_color!("h2", 137, 180, 250),
+            h3: resolve_color!("h3", 203, 166, 247),
+            h4: resolve_color!("h4", 166, 227, 161),
+            h5: resolve_color!("h5", 249, 226, 175),
+            h6: resolve_color!("h6", 127, 132, 156),
+            heading_separator: resolve_color!("heading_separator", 49, 50, 68),
 
-            h1: Color::Rgb {
-                r: 205,
-                g: 214,
-                b: 244,
-            },
-            h2: Color::Rgb {
-                r: 137,
-                g: 180,
-                b: 250,
-            },
-            h3: Color::Rgb {
-                r: 203,
-                g: 166,
-                b: 247,
-            },
-            h4: Color::Rgb {
-                r: 166,
-                g: 227,
-                b: 161,
-            },
-            h5: Color::Rgb {
-                r: 249,
-                g: 226,
-                b: 175,
-            },
-            h6: Color::Rgb {
-                r: 127,
-                g: 132,
-                b: 156,
-            },
-            heading_separator: Color::Rgb {
-                r: 49,
-                g: 50,
-                b: 68,
-            },
-
-            code_bg: Color::Rgb {
-                r: 30,
-                g: 32,
-                b: 42,
-            },
-            code_border: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
-            code_label: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
+            code_bg: resolve_color!("code_bg", 30, 32, 42),
+            code_border: resolve_color!("code_border", 68, 71, 90),
+            code_label: resolve_color!("code_label", 108, 112, 134),
             syntect_theme: "base16-ocean.dark",
 
-            inline_code_fg: Color::Rgb {
-                r: 242,
-                g: 205,
-                b: 147,
-            },
-            inline_code_bg: Color::Rgb {
-                r: 40,
-                g: 42,
-                b: 54,
-            },
-            inline_code_tick: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
+            inline_code_fg: resolve_color!("inline_code_fg", 242, 205, 147),
+            inline_code_bg: resolve_color!("inline_code_bg", 40, 42, 54),
+            inline_code_tick: resolve_color!("inline_code_tick", 68, 71, 90),
 
-            blockquote_bar: Color::Rgb {
-                r: 116,
-                g: 143,
-                b: 196,
-            },
+            blockquote_bar: resolve_color!("blockquote_bar", 116, 143, 196),
 
-            link: Color::Rgb {
-                r: 137,
-                g: 180,
-                b: 250,
-            },
-            link_url: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
+            link: resolve_color!("link", 137, 180, 250),
+            link_url: resolve_color!("link_url", 108, 112, 134),
 
-            bullet: Color::Rgb {
-                r: 127,
-                g: 132,
-                b: 156,
-            },
-            task_done: Color::Rgb {
-                r: 166,
-                g: 227,
-                b: 161,
-            },
-            task_pending: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
+            bullet: resolve_color!("bullet", 127, 132, 156),
+            task_done: resolve_color!("task_done", 166, 227, 161),
+            task_pending: resolve_color!("task_pending", 108, 112, 134),
 
-            rule: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
+            rule: resolve_color!("rule", 68, 71, 90),
 
-            table_border: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
-            table_header: Color::Rgb {
-                r: 137,
-                g: 180,
-                b: 250,
-            },
+            table_border: resolve_color!("table_border", 68, 71, 90),
+            table_header: resolve_color!("table_header", 137, 180, 250),
 
-            search_prompt: Color::Rgb {
-                r: 249,
-                g: 226,
-                b: 175,
-            },
-            search_match_bg: Color::Rgb {
-                r: 100,
-                g: 80,
-                b: 0,
-            },
-            search_current_bg: Color::Rgb {
-                r: 249,
-                g: 226,
-                b: 175,
-            },
-            search_current_fg: Color::Rgb {
-                r: 24,
-                g: 24,
-                b: 37,
-            },
-            search_no_match: Color::Rgb {
-                r: 243,
-                g: 139,
-                b: 168,
-            },
+            search_prompt: resolve_color!("search_prompt", 249, 226, 175),
+            search_match_bg: resolve_color!("search_match_bg", 100, 80, 0),
+            search_current_bg: resolve_color!("search_current_bg", 249, 226, 175),
+            search_current_fg: resolve_color!("search_current_fg", 24, 24, 37),
+            search_no_match: resolve_color!("search_no_match", 243, 139, 168),
 
-            overlay_bg: Color::Rgb {
-                r: 36,
-                g: 39,
-                b: 58,
-            },
-            overlay_border: Color::Rgb {
-                r: 91,
-                g: 96,
-                b: 120,
-            },
-            overlay_selected_bg: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
-            overlay_selected_fg: Color::Rgb {
-                r: 205,
-                g: 214,
-                b: 244,
-            },
-            overlay_text: Color::Rgb {
-                r: 186,
-                g: 194,
-                b: 222,
-            },
-            overlay_muted: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
+            overlay_bg: resolve_color!("overlay_bg", 36, 39, 58),
+            overlay_border: resolve_color!("overlay_border", 91, 96, 120),
+            overlay_selected_bg: resolve_color!("overlay_selected_bg", 68, 71, 90),
+            overlay_selected_fg: resolve_color!("overlay_selected_fg", 205, 214, 244),
+            overlay_text: resolve_color!("overlay_text", 186, 194, 222),
+            overlay_muted: resolve_color!("overlay_muted", 108, 112, 134),
 
-            image_fg: Color::Rgb {
-                r: 166,
-                g: 227,
-                b: 161,
-            },
-            slide_indicator: Color::Rgb {
-                r: 249,
-                g: 226,
-                b: 175,
-            },
-            math_fg: Color::Rgb {
-                r: 242,
-                g: 205,
-                b: 147,
-            },
-            line_number: Color::Rgb {
-                r: 68,
-                g: 71,
-                b: 90,
-            },
+            image_fg: resolve_color!("image_fg", 166, 227, 161),
 
-            json_key: Color::Rgb {
-                r: 137,
-                g: 180,
-                b: 250,
-            },
-            json_string: Color::Rgb {
-                r: 166,
-                g: 227,
-                b: 161,
-            },
-            json_number: Color::Rgb {
-                r: 250,
-                g: 179,
-                b: 135,
-            },
-            json_bool: Color::Rgb {
-                r: 249,
-                g: 226,
-                b: 175,
-            },
-            json_null: Color::Rgb {
-                r: 108,
-                g: 112,
-                b: 134,
-            },
-            json_bracket: Color::Rgb {
-                r: 127,
-                g: 132,
-                b: 156,
-            },
-            json_path: Color::Rgb {
-                r: 203,
-                g: 166,
-                b: 247,
-            },
-            json_focus_bg: Color::Rgb {
-                r: 40,
-                g: 42,
-                b: 54,
-            },
+            slide_indicator: resolve_color!("slide_indicator", 249, 226, 175),
+
+            math_fg: resolve_color!("math_fg", 242, 205, 147),
+
+            line_number: resolve_color!("line_number", 68, 71, 90),
+
+            json_key: resolve_color!("json_key", 137, 180, 250),
+            json_string: resolve_color!("json_string", 166, 227, 161),
+            json_number: resolve_color!("json_number", 250, 179, 135),
+            json_bool: resolve_color!("json_bool", 249, 226, 175),
+            json_null: resolve_color!("json_null", 108, 112, 134),
+            json_bracket: resolve_color!("json_bracket", 127, 132, 156),
+            json_path: resolve_color!("json_path", 203, 166, 247),
+            json_focus_bg: resolve_color!("json_focus_bg", 40, 42, 54),
         }
     }
 
     pub fn light() -> Self {
+        let config = Config::load();
+        let overrides = load_theme_overrides(config.theme_light);
+
+        macro_rules! resolve_color {
+            ($key:expr, $r:expr, $g:expr, $b:expr) => {
+                overrides.get($key).copied().unwrap_or(Color::Rgb {
+                    r: $r,
+                    g: $g,
+                    b: $b,
+                })
+            };
+        }
+
         Self {
             is_dark: false,
 
-            bg: Color::Rgb {
-                r: 239,
-                g: 241,
-                b: 245,
-            },
-            fg: Color::Rgb {
-                r: 76,
-                g: 79,
-                b: 105,
-            },
+            bg: resolve_color!("bg", 239, 241, 245),
+            fg: resolve_color!("fg", 76, 79, 105),
 
-            border: Color::Rgb {
-                r: 172,
-                g: 176,
-                b: 190,
-            },
-            title: Color::Rgb {
-                r: 92,
-                g: 95,
-                b: 119,
-            },
-            position: Color::Rgb {
-                r: 108,
-                g: 111,
-                b: 133,
-            },
-            help_hint: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
-            scrollbar_track: Color::Rgb {
-                r: 204,
-                g: 208,
-                b: 218,
-            },
-            scrollbar_thumb: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
+            border: resolve_color!("border", 172, 176, 190),
+            title: resolve_color!("title", 92, 95, 119),
+            position: resolve_color!("position", 108, 111, 133),
+            help_hint: resolve_color!("help_hint", 140, 143, 161),
+            scrollbar_track: resolve_color!("scrollbar_track", 204, 208, 218),
+            scrollbar_thumb: resolve_color!("scrollbar_thumb", 140, 143, 161),
 
-            h1: Color::Rgb {
-                r: 32,
-                g: 32,
-                b: 42,
-            },
-            h2: Color::Rgb {
-                r: 30,
-                g: 102,
-                b: 245,
-            },
-            h3: Color::Rgb {
-                r: 136,
-                g: 57,
-                b: 239,
-            },
-            h4: Color::Rgb {
-                r: 64,
-                g: 160,
-                b: 43,
-            },
-            h5: Color::Rgb {
-                r: 223,
-                g: 142,
-                b: 29,
-            },
-            h6: Color::Rgb {
-                r: 108,
-                g: 111,
-                b: 133,
-            },
-            heading_separator: Color::Rgb {
-                r: 204,
-                g: 208,
-                b: 218,
-            },
+            h1: resolve_color!("h1", 32, 32, 42),
+            h2: resolve_color!("h2", 30, 102, 245),
+            h3: resolve_color!("h3", 136, 57, 239),
+            h4: resolve_color!("h4", 64, 160, 43),
+            h5: resolve_color!("h5", 223, 142, 29),
+            h6: resolve_color!("h6", 108, 111, 133),
+            heading_separator: resolve_color!("heading_separator", 204, 208, 218),
 
-            code_bg: Color::Rgb {
-                r: 239,
-                g: 241,
-                b: 245,
-            },
-            code_border: Color::Rgb {
-                r: 188,
-                g: 192,
-                b: 204,
-            },
-            code_label: Color::Rgb {
-                r: 124,
-                g: 127,
-                b: 147,
-            },
+            code_bg: resolve_color!("code_bg", 239, 241, 245),
+            code_border: resolve_color!("code_border", 188, 192, 204),
+            code_label: resolve_color!("code_label", 124, 127, 147),
             syntect_theme: "InspiredGitHub",
 
-            inline_code_fg: Color::Rgb {
-                r: 179,
-                g: 82,
-                b: 2,
-            },
-            inline_code_bg: Color::Rgb {
-                r: 230,
-                g: 233,
-                b: 239,
-            },
-            inline_code_tick: Color::Rgb {
-                r: 172,
-                g: 176,
-                b: 190,
-            },
+            inline_code_fg: resolve_color!("inline_code_fg", 179, 82, 2),
+            inline_code_bg: resolve_color!("inline_code_bg", 230, 233, 239),
+            inline_code_tick: resolve_color!("inline_code_tick", 172, 176, 190),
 
-            blockquote_bar: Color::Rgb {
-                r: 30,
-                g: 102,
-                b: 245,
-            },
+            blockquote_bar: resolve_color!("blockquote_bar", 30, 102, 245),
 
-            link: Color::Rgb {
-                r: 30,
-                g: 102,
-                b: 245,
-            },
-            link_url: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
+            link: resolve_color!("link", 30, 102, 245),
+            link_url: resolve_color!("link_url", 140, 143, 161),
 
-            bullet: Color::Rgb {
-                r: 108,
-                g: 111,
-                b: 133,
-            },
-            task_done: Color::Rgb {
-                r: 64,
-                g: 160,
-                b: 43,
-            },
-            task_pending: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
+            bullet: resolve_color!("bullet", 108, 111, 133),
+            task_done: resolve_color!("task_done", 64, 160, 43),
+            task_pending: resolve_color!("task_pending", 140, 143, 161),
 
-            rule: Color::Rgb {
-                r: 188,
-                g: 192,
-                b: 204,
-            },
+            rule: resolve_color!("rule", 188, 192, 204),
 
-            table_border: Color::Rgb {
-                r: 188,
-                g: 192,
-                b: 204,
-            },
-            table_header: Color::Rgb {
-                r: 30,
-                g: 102,
-                b: 245,
-            },
+            table_border: resolve_color!("table_border", 188, 192, 204),
+            table_header: resolve_color!("table_header", 30, 102, 245),
 
-            search_prompt: Color::Rgb {
-                r: 223,
-                g: 142,
-                b: 29,
-            },
-            search_match_bg: Color::Rgb {
-                r: 255,
-                g: 235,
-                b: 160,
-            },
-            search_current_bg: Color::Rgb {
-                r: 253,
-                g: 205,
-                b: 54,
-            },
-            search_current_fg: Color::Rgb {
-                r: 32,
-                g: 32,
-                b: 42,
-            },
-            search_no_match: Color::Rgb {
-                r: 210,
-                g: 15,
-                b: 57,
-            },
+            search_prompt: resolve_color!("search_prompt", 223, 142, 29),
+            search_match_bg: resolve_color!("search_match_bg", 255, 235, 160),
+            search_current_bg: resolve_color!("search_current_bg", 253, 205, 54),
+            search_current_fg: resolve_color!("search_current_fg", 32, 32, 42),
+            search_no_match: resolve_color!("search_no_match", 210, 15, 57),
 
-            overlay_bg: Color::Rgb {
-                r: 230,
-                g: 233,
-                b: 239,
-            },
-            overlay_border: Color::Rgb {
-                r: 172,
-                g: 176,
-                b: 190,
-            },
-            overlay_selected_bg: Color::Rgb {
-                r: 188,
-                g: 192,
-                b: 204,
-            },
-            overlay_selected_fg: Color::Rgb {
-                r: 76,
-                g: 79,
-                b: 105,
-            },
-            overlay_text: Color::Rgb {
-                r: 76,
-                g: 79,
-                b: 105,
-            },
-            overlay_muted: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
+            overlay_bg: resolve_color!("overlay_bg", 230, 233, 239),
+            overlay_border: resolve_color!("overlay_border", 172, 176, 190),
+            overlay_selected_bg: resolve_color!("overlay_selected_bg", 188, 192, 204),
+            overlay_selected_fg: resolve_color!("overlay_selected_fg", 76, 79, 105),
+            overlay_text: resolve_color!("overlay_text", 76, 79, 105),
+            overlay_muted: resolve_color!("overlay_muted", 140, 143, 161),
 
-            image_fg: Color::Rgb {
-                r: 64,
-                g: 160,
-                b: 43,
-            },
-            slide_indicator: Color::Rgb {
-                r: 223,
-                g: 142,
-                b: 29,
-            },
-            math_fg: Color::Rgb {
-                r: 179,
-                g: 82,
-                b: 2,
-            },
-            line_number: Color::Rgb {
-                r: 172,
-                g: 176,
-                b: 190,
-            },
+            image_fg: resolve_color!("image_fg", 64, 160, 43),
 
-            json_key: Color::Rgb {
-                r: 30,
-                g: 102,
-                b: 245,
-            },
-            json_string: Color::Rgb {
-                r: 64,
-                g: 160,
-                b: 43,
-            },
-            json_number: Color::Rgb {
-                r: 254,
-                g: 100,
-                b: 11,
-            },
-            json_bool: Color::Rgb {
-                r: 223,
-                g: 142,
-                b: 29,
-            },
-            json_null: Color::Rgb {
-                r: 140,
-                g: 143,
-                b: 161,
-            },
-            json_bracket: Color::Rgb {
-                r: 108,
-                g: 111,
-                b: 133,
-            },
-            json_path: Color::Rgb {
-                r: 136,
-                g: 57,
-                b: 239,
-            },
-            json_focus_bg: Color::Rgb {
-                r: 220,
-                g: 224,
-                b: 232,
-            },
+            slide_indicator: resolve_color!("slide_indicator", 223, 142, 29),
+
+            math_fg: resolve_color!("math_fg", 179, 82, 2),
+
+            line_number: resolve_color!("line_number", 172, 176, 190),
+
+            json_key: resolve_color!("json_key", 30, 102, 245),
+            json_string: resolve_color!("json_string", 64, 160, 43),
+            json_number: resolve_color!("json_number", 254, 100, 11),
+            json_bool: resolve_color!("json_bool", 223, 142, 29),
+            json_null: resolve_color!("json_null", 140, 143, 161),
+            json_bracket: resolve_color!("json_bracket", 108, 111, 133),
+            json_path: resolve_color!("json_path", 136, 57, 239),
+            json_focus_bg: resolve_color!("json_focus_bg", 220, 224, 232),
         }
     }
 
@@ -672,10 +319,5 @@ impl Theme {
         } else {
             Self::dark()
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn name(&self) -> &'static str {
-        if self.is_dark { "dark" } else { "light" }
     }
 }
