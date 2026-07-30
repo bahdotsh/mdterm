@@ -1008,8 +1008,11 @@ impl ViewerState {
 
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
     fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
-        if term_row < 1 {
-            return None; // row 0 is the title bar
+        // `render_frame` draws content at rows 1..=viewport(); row 0 is the title
+        // bar and row viewport()+1 is the status bar. Without the upper bound the
+        // status-bar row resolves to the line just past the last visible one.
+        if term_row < 1 || term_row > self.viewport() {
+            return None;
         }
         let (start, end) = self.visible_line_window();
         let idx = start + (term_row - 1);
@@ -4738,6 +4741,17 @@ mod tests {
         let mut state = make_state_with_lines((0..10).map(|_| line(vec![])).collect());
         state.offset = 3;
         assert_eq!(state.line_idx_at_row(1), Some(3));
+    }
+
+    #[test]
+    fn line_idx_at_row_status_bar_is_none() {
+        // Content renders at rows 1..=viewport(). The status bar sits one row
+        // below that, and with a document taller than the viewport its index is
+        // still in range — so only the explicit ceiling rejects it.
+        let state = make_state_with_lines((0..40).map(|_| line(vec![])).collect());
+        let viewport = state.viewport();
+        assert_eq!(state.line_idx_at_row(viewport), Some(viewport - 1));
+        assert_eq!(state.line_idx_at_row(viewport + 1), None);
     }
 
     #[test]
