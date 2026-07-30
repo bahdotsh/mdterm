@@ -1,5 +1,5 @@
 use crossterm::style::Color;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const BLOCKQUOTE_PREFIX: &str = "  ┃ ";
 pub const BLOCKQUOTE_PREFIX_TRIMMED: &str = "  ┃";
@@ -71,6 +71,39 @@ impl Line {
             .iter()
             .map(|s| UnicodeWidthStr::width(s.text.as_str()))
             .sum()
+    }
+
+    /// Total number of characters across all spans.
+    ///
+    /// This is a character count, not a display width: wide characters (CJK,
+    /// emoji) count once here but occupy two columns on screen.
+    pub fn char_len(&self) -> usize {
+        self.spans.iter().map(|s| s.text.chars().count()).sum()
+    }
+
+    /// Maps a display column to a character offset in the line's concatenated text.
+    ///
+    /// Selection ranges are stored as character offsets (matching the units
+    /// `apply_search_highlights` works in), while mouse events arrive as display
+    /// columns, so the two need bridging. A column landing on either cell of a
+    /// wide character resolves to that character's offset. Zero-width characters
+    /// (combining marks) never match on their own; they stay attached to the
+    /// preceding base character. Columns past the end of the line return the
+    /// total character count, so dragging past end-of-line selects to end-of-line.
+    pub fn char_offset_at_col(&self, col: usize) -> usize {
+        let mut cells = 0;
+        let mut chars = 0;
+        for span in &self.spans {
+            for ch in span.text.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w > 0 && col < cells + w {
+                    return chars;
+                }
+                cells += w;
+                chars += 1;
+            }
+        }
+        chars
     }
 }
 
@@ -577,5 +610,93 @@ mod tests {
         };
         let wrapped = wrap_lines(&[line], 80);
         assert_eq!(wrapped.len(), 1);
+    }
+
+    #[test]
+    fn char_offset_at_col_ascii_is_identity() {
+        let line = plain_line("hello");
+        for col in 0..5 {
+            assert_eq!(line.char_offset_at_col(col), col);
+        }
+    }
+
+    #[test]
+    fn char_offset_at_col_past_end_returns_char_len() {
+        let line = plain_line("hello");
+        assert_eq!(line.char_offset_at_col(5), 5);
+        assert_eq!(line.char_offset_at_col(99), 5);
+    }
+
+    #[test]
+    fn char_offset_at_col_empty_line_is_zero() {
+        assert_eq!(Line::empty().char_offset_at_col(0), 0);
+        assert_eq!(Line::empty().char_offset_at_col(40), 0);
+    }
+
+    #[test]
+    fn char_offset_at_col_wide_chars() {
+        // "日本語" is 3 chars occupying 6 columns (2 each).
+        let line = plain_line("日本語");
+        assert_eq!(line.display_width(), 6);
+        assert_eq!(line.char_len(), 3);
+        // Both cells of each wide char resolve to that char's offset.
+        assert_eq!(line.char_offset_at_col(0), 0);
+        assert_eq!(line.char_offset_at_col(1), 0);
+        assert_eq!(line.char_offset_at_col(2), 1);
+        assert_eq!(line.char_offset_at_col(3), 1);
+        assert_eq!(line.char_offset_at_col(4), 2);
+        assert_eq!(line.char_offset_at_col(5), 2);
+        assert_eq!(line.char_offset_at_col(6), 3);
+    }
+
+    #[test]
+    fn char_offset_at_col_mixed_widths_within_one_span() {
+        // "a日b" — 3 chars, 4 columns: a@0, 日@1-2, b@3
+        let line = plain_line("a日b");
+        assert_eq!(line.display_width(), 4);
+        assert_eq!(line.char_offset_at_col(0), 0);
+        assert_eq!(line.char_offset_at_col(1), 1);
+        assert_eq!(line.char_offset_at_col(2), 1);
+        assert_eq!(line.char_offset_at_col(3), 2);
+    }
+
+    #[test]
+    fn char_offset_at_col_spans_multiple_spans() {
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: "ab".to_string(),
+                    style: Style::default(),
+                },
+                StyledSpan {
+                    text: "日".to_string(),
+                    style: Style::default(),
+                },
+                StyledSpan {
+                    text: "cd".to_string(),
+                    style: Style::default(),
+                },
+            ],
+            meta: LineMeta::None,
+        };
+        assert_eq!(line.char_len(), 5);
+        assert_eq!(line.display_width(), 6);
+        assert_eq!(line.char_offset_at_col(1), 1); // 'b'
+        assert_eq!(line.char_offset_at_col(2), 2); // 日, first cell
+        assert_eq!(line.char_offset_at_col(3), 2); // 日, second cell
+        assert_eq!(line.char_offset_at_col(4), 3); // 'c'
+        assert_eq!(line.char_offset_at_col(5), 4); // 'd'
+    }
+
+    #[test]
+    fn char_offset_at_col_zero_width_marks_stay_with_base_char() {
+        // "e" + combining acute accent: 2 chars, 1 column.
+        let line = plain_line("e\u{0301}x");
+        assert_eq!(line.char_len(), 3);
+        assert_eq!(line.display_width(), 2);
+        // Column 0 resolves to the base 'e', not the combining mark.
+        assert_eq!(line.char_offset_at_col(0), 0);
+        // Column 1 is 'x', which is char offset 2 (past the mark).
+        assert_eq!(line.char_offset_at_col(1), 2);
     }
 }
