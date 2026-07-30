@@ -1139,7 +1139,12 @@ impl ViewerState {
             self.offset = (self.offset + 1).min(self.max_offset());
         }
         if self.offset == prev {
-            return false; // already at the document edge
+            // Already at the document edge. Disarm, or a mouse-up we never
+            // received (button released outside the terminal, or a dropped
+            // event) would pin the event loop at the autoscroll cadence
+            // forever. A further Drag at the edge re-arms it.
+            self.drag_autoscroll = 0;
+            return false;
         }
         let row = if scrolled_up { 1 } else { self.viewport() };
         if let Some(pos) = self.selection_pos_clamped(row, self.drag_col as usize)
@@ -5253,6 +5258,13 @@ mod tests {
             "must report no movement at the end of the document"
         );
         assert_eq!(state.offset, state.max_offset());
+        // Disarming matters as much as not moving: the event loop pins its poll
+        // timeout to the autoscroll cadence while this is non-zero, so a
+        // mouse-up we never received would spin it forever.
+        assert_eq!(
+            state.drag_autoscroll, 0,
+            "must disarm once there is nothing left to scroll"
+        );
     }
 
     #[test]
