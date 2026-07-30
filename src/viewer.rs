@@ -906,12 +906,38 @@ impl ViewerState {
     }
 
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
+    /// The range of wrapped-line indices visible in the viewport: `(start, end)`.
+    ///
+    /// In slide mode the window is bounded by the current slide's boundaries so
+    /// content from the next slide never bleeds in; otherwise it starts at the
+    /// scroll offset and is unbounded above. Every row-to-line mapping must go
+    /// through here — this used to be recomputed independently in three places,
+    /// and the copy-on-click path was missing the slide-mode branch.
+    fn visible_line_window(&self) -> (usize, usize) {
+        if self.slide_mode {
+            let start = self
+                .slide_boundaries
+                .get(self.current_slide)
+                .copied()
+                .unwrap_or(0);
+            let end = self
+                .slide_boundaries
+                .get(self.current_slide + 1)
+                .copied()
+                .unwrap_or(self.wrapped.len());
+            (start, end)
+        } else {
+            (self.offset, usize::MAX)
+        }
+    }
+
     fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
         if term_row < 1 {
             return None; // row 0 is the title bar
         }
-        let idx = self.offset + (term_row - 1);
-        if idx < self.wrapped.len() {
+        let (start, end) = self.visible_line_window();
+        let idx = start + (term_row - 1);
+        if idx < self.wrapped.len() && idx < end {
             Some(idx)
         } else {
             None
@@ -937,30 +963,11 @@ impl ViewerState {
     /// Returns the link URL at the given terminal (row, col), if any.
     fn link_at_position(&self, term_row: usize, term_col: usize) -> Option<&str> {
         // Row 0 is the title bar; content starts at row 1.
-        if term_row < 1 || term_col < Self::GUTTER_COLS {
+        if term_col < Self::GUTTER_COLS {
             return None;
         }
         let content_col = term_col - Self::GUTTER_COLS;
-        let (line_idx, slide_end) = if self.slide_mode {
-            let start = self
-                .slide_boundaries
-                .get(self.current_slide)
-                .copied()
-                .unwrap_or(0);
-            let end = self
-                .slide_boundaries
-                .get(self.current_slide + 1)
-                .copied()
-                .unwrap_or(self.wrapped.len());
-            (start + (term_row - 1), end)
-        } else {
-            (self.offset + (term_row - 1), usize::MAX)
-        };
-
-        // Don't resolve links past the current slide boundary.
-        if line_idx >= slide_end {
-            return None;
-        }
+        let line_idx = self.line_idx_at_row(term_row)?;
         let line = self.wrapped.get(line_idx)?;
         let mut col = 0;
         for span in &line.spans {
@@ -2455,21 +2462,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     // document when slide mode is off).  `slide_start` replaces the per-row
     // boundary lookups, and `slide_end` gates every `wrapped.get()` so content
     // from the next slide never bleeds into the viewport.
-    let (slide_start, slide_end) = if state.slide_mode {
-        let start = state
-            .slide_boundaries
-            .get(state.current_slide)
-            .copied()
-            .unwrap_or(0);
-        let end = state
-            .slide_boundaries
-            .get(state.current_slide + 1)
-            .copied()
-            .unwrap_or(state.wrapped.len());
-        (start, end)
-    } else {
-        (state.offset, usize::MAX)
-    };
+    let (slide_start, slide_end) = state.visible_line_window();
 
     // Scrollbar
     let total = state.wrapped.len();
@@ -4352,5 +4345,72 @@ mod tests {
         assert_eq!(state.link_at_position(1, 2 + 2), None); // space
         assert_eq!(state.link_at_position(1, 2 + 3), Some("https://b.com"));
         assert_eq!(state.link_at_position(1, 2 + 4), Some("https://b.com"));
+    }
+
+    // ── Row → line mapping (slide mode) ─────────────────────────────────────
+
+    /// Builds 10 blank content lines with slide boundaries at 0, 5 and 10.
+    fn make_slide_state(current_slide: usize) -> ViewerState {
+        let mut state = make_state_with_lines((0..10).map(|_| line(vec![])).collect());
+        state.slide_mode = true;
+        state.slide_boundaries = vec![0, 5, 10];
+        state.current_slide = current_slide;
+        state
+    }
+
+    #[test]
+    fn line_idx_at_row_respects_slide_start() {
+        // Slide 1 starts at wrapped line 5, so the first content row maps there —
+        // not to `offset`, which stays 0 in slide mode.
+        let state = make_slide_state(1);
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.line_idx_at_row(1), Some(5));
+        assert_eq!(state.line_idx_at_row(2), Some(6));
+    }
+
+    #[test]
+    fn line_idx_at_row_stops_at_slide_end() {
+        // Slide 0 covers lines 0..5; rows past that must not bleed into slide 1.
+        let state = make_slide_state(0);
+        assert_eq!(state.line_idx_at_row(5), Some(4));
+        assert_eq!(state.line_idx_at_row(6), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_title_bar_is_none() {
+        let state = make_state_with_lines(vec![line(vec![])]);
+        assert_eq!(state.line_idx_at_row(0), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_past_document_end_is_none() {
+        let state = make_state_with_lines(vec![line(vec![]), line(vec![])]);
+        assert_eq!(state.line_idx_at_row(2), Some(1));
+        assert_eq!(state.line_idx_at_row(3), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_uses_scroll_offset_when_not_in_slide_mode() {
+        let mut state = make_state_with_lines((0..10).map(|_| line(vec![])).collect());
+        state.offset = 3;
+        assert_eq!(state.line_idx_at_row(1), Some(3));
+    }
+
+    #[test]
+    fn link_at_position_respects_slide_window() {
+        // A link on line 5 (start of slide 1) must resolve on slide 1's first row
+        // and must not resolve while slide 0 is showing.
+        let mut lines: Vec<Line> = (0..10).map(|_| line(vec![])).collect();
+        lines[5] = line(vec![span("link", Some("https://slide1.com"))]);
+        let mut state = make_state_with_lines(lines);
+        state.slide_mode = true;
+        state.slide_boundaries = vec![0, 5, 10];
+
+        state.current_slide = 1;
+        assert_eq!(state.link_at_position(1, 2), Some("https://slide1.com"));
+
+        // On slide 0, row 6 would have mapped to line 5 before the window clamp.
+        state.current_slide = 0;
+        assert_eq!(state.link_at_position(6, 2), None);
     }
 }
