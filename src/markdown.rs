@@ -194,6 +194,7 @@ impl<'a> Renderer<'a> {
                     text: BLOCKQUOTE_PREFIX.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
+                        decoration: true,
                         ..Default::default()
                     },
                 });
@@ -215,6 +216,7 @@ impl<'a> Renderer<'a> {
                     text: BLOCKQUOTE_PREFIX_TRIMMED.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
+                        decoration: true,
                         ..Default::default()
                     },
                 }],
@@ -302,6 +304,7 @@ impl<'a> Renderer<'a> {
             text: "  ╭─".to_string(),
             style: Style {
                 fg: Some(border_fg),
+                decoration: true,
                 ..Default::default()
             },
         }];
@@ -310,6 +313,7 @@ impl<'a> Renderer<'a> {
                 text: label,
                 style: Style {
                     fg: Some(label_fg),
+                    decoration: true,
                     ..Default::default()
                 },
             });
@@ -318,6 +322,7 @@ impl<'a> Renderer<'a> {
             text: format!("{}╮", "─".repeat(dashes_after)),
             style: Style {
                 fg: Some(border_fg),
+                decoration: true,
                 ..Default::default()
             },
         });
@@ -333,6 +338,7 @@ impl<'a> Renderer<'a> {
                     text: "  │".to_string(),
                     style: Style {
                         fg: Some(border_fg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -340,6 +346,7 @@ impl<'a> Renderer<'a> {
                     text: " ".to_string(),
                     style: Style {
                         bg: Some(code_bg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -355,6 +362,7 @@ impl<'a> Renderer<'a> {
                     style: Style {
                         fg: Some(self.theme.line_number),
                         bg: Some(code_bg),
+                        decoration: true,
                         ..Default::default()
                     },
                 });
@@ -390,6 +398,7 @@ impl<'a> Renderer<'a> {
                 text: " ".repeat(padding),
                 style: Style {
                     bg: Some(code_bg),
+                    decoration: true,
                     ..Default::default()
                 },
             });
@@ -397,6 +406,7 @@ impl<'a> Renderer<'a> {
                 text: "│".to_string(),
                 style: Style {
                     fg: Some(border_fg),
+                    decoration: true,
                     ..Default::default()
                 },
             });
@@ -413,6 +423,7 @@ impl<'a> Renderer<'a> {
                 text: format!("  ╰{}╯", "─".repeat(inner_width)),
                 style: Style {
                     fg: Some(border_fg),
+                    decoration: true,
                     ..Default::default()
                 },
             }],
@@ -443,6 +454,7 @@ impl<'a> Renderer<'a> {
                     text: "  ╭─".to_string(),
                     style: Style {
                         fg: Some(border_fg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -450,6 +462,7 @@ impl<'a> Renderer<'a> {
                     text: label.to_string(),
                     style: Style {
                         fg: Some(label_fg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -457,6 +470,7 @@ impl<'a> Renderer<'a> {
                     text: format!("{}╮", "─".repeat(dashes_after)),
                     style: Style {
                         fg: Some(border_fg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -471,6 +485,7 @@ impl<'a> Renderer<'a> {
                     text: "  │".to_string(),
                     style: Style {
                         fg: Some(border_fg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -478,6 +493,7 @@ impl<'a> Renderer<'a> {
                     text: " ".to_string(),
                     style: Style {
                         bg: Some(code_bg),
+                        decoration: true,
                         ..Default::default()
                     },
                 },
@@ -494,6 +510,7 @@ impl<'a> Renderer<'a> {
                 text: " ".repeat(padding),
                 style: Style {
                     bg: Some(code_bg),
+                    decoration: true,
                     ..Default::default()
                 },
             });
@@ -501,6 +518,7 @@ impl<'a> Renderer<'a> {
                 text: "│".to_string(),
                 style: Style {
                     fg: Some(border_fg),
+                    decoration: true,
                     ..Default::default()
                 },
             });
@@ -517,6 +535,7 @@ impl<'a> Renderer<'a> {
                 text: format!("  ╰{}╯", "─".repeat(inner_width)),
                 style: Style {
                     fg: Some(border_fg),
+                    decoration: true,
                     ..Default::default()
                 },
             }],

@@ -14,6 +14,12 @@ pub struct Style {
     pub strikethrough: bool,
     pub dim: bool,
     pub link_url: Option<String>,
+    /// Visual scaffolding rather than document content — code-block borders,
+    /// padding, line numbers, blockquote bars. Stripped from copied text so a
+    /// paste yields clean source. Lives on `Style` (next to the equally
+    /// non-visual `link_url`) because `word_wrap` clones the style onto every
+    /// segment it produces, so the flag survives wrapping for free.
+    pub decoration: bool,
 }
 
 #[derive(Clone, Debug)]

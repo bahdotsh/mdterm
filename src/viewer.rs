@@ -19,10 +19,7 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::SyntectRes;
-use crate::style::{
-    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, DocumentInfo, Line, LineMeta, Style, StyledSpan,
-    wrap_lines,
-};
+use crate::style::{DocumentInfo, Line, LineMeta, Style, StyledSpan, wrap_lines};
 use crate::theme::Theme;
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -1048,41 +1045,13 @@ impl ViewerState {
         Some((idx, line.char_offset_at_col(content_col)))
     }
 
-    /// True for spans that are visual scaffolding rather than document content.
-    ///
-    /// Two kinds get stripped from copied text so pasting yields clean source.
-    /// Blockquote bars are matched by their literal prefix. Code lines are framed
-    /// as `  │` + pad + `[line number]` + code + pad + `│`, and the frame is
-    /// identifiable by style rather than position — which matters because the
-    /// line number is not the leading span, and long code lines can wrap: every
-    /// span belonging to the code itself is painted with the block background,
-    /// the borders carry no background at all, and the line number is the one
-    /// background-painted span using the line-number foreground.
-    fn is_decoration_span(&self, line: &Line, idx: usize, span: &StyledSpan) -> bool {
-        if span.text == BLOCKQUOTE_PREFIX || span.text == BLOCKQUOTE_PREFIX_TRIMMED {
-            return true;
-        }
-        if !matches!(line.meta, LineMeta::CodeContent { .. }) {
-            return false;
-        }
-        span.style.bg.is_none()
-            || span.style.fg == Some(self.theme.line_number)
-            // The single-space pad between the left border and the code.
-            || (idx == 1 && span.text == " ")
-    }
-
-    /// True when every span on `line` is frame — a code block's top or bottom
-    /// border, which should contribute nothing rather than a blank line.
+    /// True when every span on `line` is decoration — a code block's top or
+    /// bottom border, which should contribute nothing rather than a blank line.
     ///
     /// Guards on a non-empty span list so genuinely blank document lines still
     /// produce a newline.
-    fn is_all_decoration(&self, line: &Line) -> bool {
-        !line.spans.is_empty()
-            && line
-                .spans
-                .iter()
-                .enumerate()
-                .all(|(i, s)| self.is_decoration_span(line, i, s))
+    fn is_all_decoration(line: &Line) -> bool {
+        !line.spans.is_empty() && line.spans.iter().all(|s| s.style.decoration)
     }
 
     /// Extracts `[start, end)` (in character offsets) from one line, skipping
@@ -1092,12 +1061,12 @@ impl ViewerState {
     /// they stay aligned with what `char_offset_at_col` produced from the mouse
     /// column; decoration characters are filtered during the copy rather than
     /// before it, which would shift every offset.
-    fn line_copy_text(&self, line: &Line, start: usize, end: usize) -> String {
+    fn line_copy_text(line: &Line, start: usize, end: usize) -> String {
         let mut out = String::new();
         let mut off = 0;
-        for (i, span) in line.spans.iter().enumerate() {
+        for span in &line.spans {
             let len = span.text.chars().count();
-            if !self.is_decoration_span(line, i, span) {
+            if !span.style.decoration {
                 for (j, ch) in span.text.chars().enumerate() {
                     let abs = off + j;
                     if abs >= start && abs < end {
@@ -1127,7 +1096,7 @@ impl ViewerState {
                 break;
             };
             // Image rows carry no text; code-block borders are pure frame.
-            if matches!(line.meta, LineMeta::Image { .. }) || self.is_all_decoration(line) {
+            if matches!(line.meta, LineMeta::Image { .. }) || Self::is_all_decoration(line) {
                 continue;
             }
             let len = line.char_len();
@@ -1141,12 +1110,7 @@ impl ViewerState {
             } else {
                 len
             };
-            let mut text = self.line_copy_text(line, from, to);
-            if matches!(line.meta, LineMeta::CodeContent { .. }) {
-                // Drop the padding that squares off the right edge of the box.
-                text.truncate(text.trim_end().len());
-            }
-            out.push(text);
+            out.push(Self::line_copy_text(line, from, to));
         }
         out.join("\n")
     }
@@ -1497,6 +1461,10 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     // highlight standing as confirmation of what was copied.
                     let text = state.selection_text();
                     if text.is_empty() {
+                        // Swept across image rows or code-block borders only —
+                        // drop the highlight rather than leave it implying a copy.
+                        state.selection = None;
+                        state.set_toast("Nothing to copy");
                         return false;
                     }
                     let lines = text.lines().count();
@@ -4896,87 +4864,78 @@ mod tests {
         assert_eq!(select_text(&mut state, (0, 0), (2, 5)), "before\nafter");
     }
 
+    /// Renders real markdown through the real pipeline at `width`.
+    ///
+    /// Decoration stripping depends on markdown.rs marking its frame spans, so
+    /// these fixtures must come from the renderer rather than imitate it — a
+    /// hand-built fixture cannot catch the two sides drifting apart.
+    fn make_rendered_state(md: &str, width: usize) -> ViewerState {
+        let theme = crate::theme::Theme::dark();
+        let res = SyntectRes::load();
+        let (lines, _) = crate::markdown::render_with(md, width, &theme, false, &res);
+        make_state_with_lines(wrap_lines(&lines, width))
+    }
+
+    /// Selects the whole document and returns what would be copied.
+    fn select_all(state: &mut ViewerState) -> String {
+        let last = state.wrapped.len() - 1;
+        let len = state.wrapped[last].char_len();
+        select_text(state, (0, 0), (last, len))
+    }
+
     #[test]
     fn selection_text_strips_blockquote_prefix() {
-        let mut state = make_state_with_lines(vec![line(vec![
-            span(BLOCKQUOTE_PREFIX, None),
-            span("quoted", None),
-        ])]);
-        let len = state.wrapped[0].char_len();
-        assert_eq!(select_text(&mut state, (0, 0), (0, len)), "quoted");
-    }
-
-    /// A styled span with an explicit foreground and background.
-    fn styled(text: &str, fg: Option<Color>, bg: Option<Color>) -> StyledSpan {
-        StyledSpan {
-            text: text.to_string(),
-            style: crate::style::Style {
-                fg,
-                bg,
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A code-block content line matching what markdown.rs actually emits:
-    /// `  │` + pad + optional line number + code + pad + `│`, where only the
-    /// code-side spans carry the block background.
-    fn code_line(code: &str, line_no: Option<&str>) -> Line {
-        let theme = crate::theme::Theme::dark();
-        let border = Some(theme.code_border);
-        let code_bg = Some(theme.code_bg);
-        let mut spans = vec![styled("  │", border, None), styled(" ", None, code_bg)];
-        if let Some(n) = line_no {
-            spans.push(styled(n, Some(theme.line_number), code_bg));
-        }
-        spans.push(styled(code, None, code_bg));
-        spans.push(styled("   ", None, code_bg)); // right padding
-        spans.push(styled("│", border, None));
-        Line {
-            spans,
-            meta: LineMeta::CodeContent { block_id: 0 },
-        }
-    }
-
-    /// A code-block top or bottom border line: all frame, no background.
-    fn code_border_line() -> Line {
-        let theme = crate::theme::Theme::dark();
-        Line {
-            spans: vec![
-                styled("  ╭─", Some(theme.code_border), None),
-                styled(" rust ", Some(theme.code_label), None),
-                styled("───╮", Some(theme.code_border), None),
-            ],
-            meta: LineMeta::CodeContent { block_id: 0 },
-        }
+        let mut state = make_rendered_state("> quoted\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "quoted");
     }
 
     #[test]
     fn selection_text_strips_code_block_frame() {
-        let mut state = make_state_with_lines(vec![code_line("let x = 1;", None)]);
-        let len = state.wrapped[0].char_len();
-        assert_eq!(select_text(&mut state, (0, 0), (0, len)), "let x = 1;");
+        let mut state = make_rendered_state("```rust\nlet x = 1;\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "let x = 1;");
     }
 
     #[test]
     fn selection_text_strips_code_block_line_numbers() {
-        // The line number is not the leading span — the box border is — so this
-        // pins the style-based rule rather than a positional one.
-        let mut state = make_state_with_lines(vec![code_line("let x = 1;", Some(" 1 │ "))]);
-        let len = state.wrapped[0].char_len();
-        assert_eq!(select_text(&mut state, (0, 0), (0, len)), "let x = 1;");
+        let theme = crate::theme::Theme::dark();
+        let res = SyntectRes::load();
+        // line_numbers: true — the numbers are frame, not content.
+        let (lines, _) =
+            crate::markdown::render_with("```rust\nlet x = 1;\n```\n", 80, &theme, true, &res);
+        let mut state = make_state_with_lines(wrap_lines(&lines, 80));
+        assert_eq!(select_all(&mut state).trim(), "let x = 1;");
     }
 
     #[test]
     fn selection_text_drops_code_block_border_lines() {
-        let mut state = make_state_with_lines(vec![
-            code_border_line(),
-            code_line("fn main() {}", None),
-            code_border_line(),
-        ]);
-        let len = state.wrapped[2].char_len();
-        // Borders contribute nothing at all, not blank lines.
-        assert_eq!(select_text(&mut state, (0, 0), (2, len)), "fn main() {}");
+        let mut state = make_rendered_state("```rust\nfn main() {}\n```\n", 80);
+        // Top and bottom borders contribute nothing at all, not blank lines.
+        assert_eq!(select_all(&mut state).trim(), "fn main() {}");
+    }
+
+    #[test]
+    fn selection_text_strips_frame_from_wrapped_code_block() {
+        // A code line wider than the viewport wraps, and wrap_lines propagates
+        // CodeContent only to the first wrapped line. Any rule that keys off
+        // LineMeta leaks box-drawing characters into the clipboard on the
+        // continuation lines; the per-span decoration flag survives wrapping.
+        let code = "let very_long_variable_name = \
+                    some_function_call(argument_one, argument_two, argument_three);";
+        let mut state = make_rendered_state(&format!("```rust\n{code}\n```\n"), 60);
+        assert!(
+            state.wrapped.len() > 3,
+            "fixture must actually wrap, got {} lines",
+            state.wrapped.len()
+        );
+        let copied = select_all(&mut state);
+        for frame in ['│', '─', '╭', '╮', '╰', '╯'] {
+            assert!(
+                !copied.contains(frame),
+                "copied text leaked frame char {frame:?}: {copied:?}"
+            );
+        }
+        // The code itself survives, minus the visual line breaks.
+        assert_eq!(copied.split('\n').collect::<String>().trim(), code);
     }
 
     #[test]
