@@ -20,7 +20,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::SyntectRes;
 use crate::style::{
-    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, DocumentInfo, Line, LineMeta, StyledSpan,
+    BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, DocumentInfo, Line, LineMeta, Style, StyledSpan,
     wrap_lines,
 };
 use crate::theme::Theme;
@@ -4187,30 +4187,29 @@ fn format_position(lines: &[Line], offset: usize, viewport: usize) -> String {
     }
 }
 
-/// Overlays the mouse-selection highlight on already-styled spans.
+/// Re-splits `spans` at every boundary in `bounds` and hands each resulting
+/// piece to `restyle`, which may adjust its style based on the piece's absolute
+/// character offset.
 ///
-/// Mirrors `apply_search_highlights`: cuts spans at the range boundaries (in
-/// character offsets) and restyles the covered slice. Applied *after* search
-/// highlighting — search re-splits spans but preserves total character count, so
-/// the offsets still line up — which makes an active selection visibly win over
-/// a search match underneath it.
-fn apply_selection_highlight(
+/// Total character count is preserved — only the span boundaries move — so
+/// character offsets computed against the input stay valid against the output.
+/// That is what lets selection highlighting run over already search-highlighted
+/// spans without recomputing anything.
+fn restyle_ranges(
     spans: &[StyledSpan],
-    range: (usize, usize),
-    theme: &Theme,
+    bounds: &[usize],
+    restyle: impl Fn(usize, &mut Style),
 ) -> Vec<StyledSpan> {
-    let (sel_start, sel_end) = range;
     let mut result = Vec::new();
     let mut char_offset = 0;
 
     for span in spans {
         let chars: Vec<char> = span.text.chars().collect();
-        let span_len = chars.len();
         let span_start = char_offset;
-        let span_end = char_offset + span_len;
+        let span_end = char_offset + chars.len();
 
-        let mut cuts = vec![0usize, span_len];
-        for bound in [sel_start, sel_end] {
+        let mut cuts = vec![0usize, chars.len()];
+        for &bound in bounds {
             if bound > span_start && bound < span_end {
                 cuts.push(bound - span_start);
             }
@@ -4223,14 +4222,12 @@ fn apply_selection_highlight(
             if local_start >= local_end {
                 continue;
             }
-            let text: String = chars[local_start..local_end].iter().collect();
-            let abs_pos = span_start + local_start;
             let mut style = span.style.clone();
-            if abs_pos >= sel_start && abs_pos < sel_end {
-                style.bg = Some(theme.selection_bg);
-                style.fg = Some(theme.selection_fg);
-            }
-            result.push(StyledSpan { text, style });
+            restyle(span_start + local_start, &mut style);
+            result.push(StyledSpan {
+                text: chars[local_start..local_end].iter().collect(),
+                style,
+            });
         }
 
         char_offset = span_end;
@@ -4239,67 +4236,48 @@ fn apply_selection_highlight(
     result
 }
 
+/// Overlays the mouse-selection highlight on already-styled spans.
+///
+/// Applied *after* search highlighting so an active selection visibly wins over
+/// a search match underneath it.
+fn apply_selection_highlight(
+    spans: &[StyledSpan],
+    range: (usize, usize),
+    theme: &Theme,
+) -> Vec<StyledSpan> {
+    let (sel_start, sel_end) = range;
+    restyle_ranges(spans, &[sel_start, sel_end], |pos, style| {
+        if pos >= sel_start && pos < sel_end {
+            style.bg = Some(theme.selection_bg);
+            style.fg = Some(theme.selection_fg);
+        }
+    })
+}
+
 fn apply_search_highlights(
     spans: &[StyledSpan],
     highlights: &[(usize, usize, bool)],
     theme: &Theme,
 ) -> Vec<StyledSpan> {
-    let match_bg = theme.search_match_bg;
-    let current_bg = theme.search_current_bg;
-    let current_fg = theme.search_current_fg;
-
-    let mut result = Vec::new();
-    let mut char_offset = 0;
-
-    for span in spans {
-        let chars: Vec<char> = span.text.chars().collect();
-        let span_len = chars.len();
-        let span_start = char_offset;
-        let span_end = char_offset + span_len;
-
-        let mut cuts = vec![0usize, span_len];
-        for &(hs, he, _) in highlights {
-            if hs > span_start && hs < span_end {
-                cuts.push(hs - span_start);
-            }
-            if he > span_start && he < span_end {
-                cuts.push(he - span_start);
-            }
+    let bounds: Vec<usize> = highlights
+        .iter()
+        .flat_map(|&(hs, he, _)| [hs, he])
+        .collect();
+    restyle_ranges(spans, &bounds, |pos, style| {
+        let Some(&(_, _, is_current)) = highlights
+            .iter()
+            .find(|(hs, he, _)| pos >= *hs && pos < *he)
+        else {
+            return;
+        };
+        if is_current {
+            style.bg = Some(theme.search_current_bg);
+            style.fg = Some(theme.search_current_fg);
+            style.bold = true;
+        } else {
+            style.bg = Some(theme.search_match_bg);
         }
-        cuts.sort();
-        cuts.dedup();
-
-        for pair in cuts.windows(2) {
-            let (local_start, local_end) = (pair[0], pair[1]);
-            if local_start >= local_end {
-                continue;
-            }
-
-            let text: String = chars[local_start..local_end].iter().collect();
-            let abs_pos = span_start + local_start;
-
-            let highlight = highlights
-                .iter()
-                .find(|(hs, he, _)| abs_pos >= *hs && abs_pos < *he);
-
-            let mut style = span.style.clone();
-            if let Some(&(_, _, is_current)) = highlight {
-                if is_current {
-                    style.bg = Some(current_bg);
-                    style.fg = Some(current_fg);
-                    style.bold = true;
-                } else {
-                    style.bg = Some(match_bg);
-                }
-            }
-
-            result.push(StyledSpan { text, style });
-        }
-
-        char_offset = span_end;
-    }
-
-    result
+    })
 }
 
 fn write_span(
