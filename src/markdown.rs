@@ -1918,7 +1918,8 @@ mod tests {
 
     // ── Frontmatter ─────────────────────────────────────────────────────────
 
-    const FM_NOTE: &str = "---\ncreated: 2026-07-31T09:00\ntags: daily-todo\n---\n\n# Real Heading\n\nbody\n";
+    const FM_NOTE: &str =
+        "---\ncreated: 2026-07-31T09:00\ntags: daily-todo\n---\n\n# Real Heading\n\nbody\n";
 
     #[test]
     fn hidden_frontmatter_is_removed_but_body_survives() {

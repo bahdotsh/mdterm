@@ -140,6 +140,7 @@ mod tests {
     fn hide(langs: &[&str]) -> HideConfig {
         HideConfig {
             images: false,
+            frontmatter: false,
             code_languages: langs.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -178,5 +179,45 @@ mod tests {
     #[test]
     fn empty_config_hides_nothing() {
         assert!(!HideConfig::default().hides_language("dataviewjs"));
+    }
+
+    fn picker(ignore: &[&str], hidden: bool) -> PickerConfig {
+        PickerConfig {
+            ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            hidden,
+        }
+    }
+
+    #[test]
+    fn dot_names_are_skipped_by_default() {
+        let cfg = PickerConfig::default();
+        assert!(cfg.skips(".obsidian"));
+        assert!(cfg.skips(".git"));
+        assert!(!cfg.skips("notes"));
+    }
+
+    #[test]
+    fn hidden_true_stops_skipping_dot_names() {
+        assert!(!picker(&[], true).skips(".obsidian"));
+    }
+
+    #[test]
+    fn ignore_list_matches_names_case_insensitively() {
+        let cfg = picker(&["Attachments"], false);
+        assert!(cfg.skips("attachments"));
+        assert!(cfg.skips("ATTACHMENTS"));
+        assert!(!cfg.skips("attachments-old"));
+    }
+
+    #[test]
+    fn ignore_list_matches_file_names_too() {
+        assert!(picker(&["scratch.md"], false).skips("scratch.md"));
+    }
+
+    #[test]
+    fn default_picker_skips_nothing_visible() {
+        let cfg = PickerConfig::default();
+        assert!(!cfg.skips("notes"));
+        assert!(!cfg.skips("README.md"));
     }
 }

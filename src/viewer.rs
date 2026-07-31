@@ -451,9 +451,9 @@ impl ViewerState {
             fuzzy_input: String::new(),
             fuzzy_selected: 0,
             fuzzy_scroll: 0,
-            file_picker: opts.picker_root.map(|root| {
-                crate::file_picker::FilePickerState::new(root, opts.picker.clone())
-            }),
+            file_picker: opts
+                .picker_root
+                .map(|root| crate::file_picker::FilePickerState::new(root, opts.picker.clone())),
             file_picker_can_close: !opts.start_in_picker,
             current_slide: 0,
             slide_boundaries: Vec::new(),

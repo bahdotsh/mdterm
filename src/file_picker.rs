@@ -432,7 +432,11 @@ mod tests {
             hidden: true,
         };
         let entries = discover_markdown_files(&root, &show_hidden).unwrap();
-        assert_eq!(entries.len(), 2, "hidden = true should descend into dot-dirs");
+        assert_eq!(
+            entries.len(),
+            2,
+            "hidden = true should descend into dot-dirs"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
