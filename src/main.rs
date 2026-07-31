@@ -52,6 +52,14 @@ struct Cli {
     /// Disable colors
     #[arg(long)]
     no_color: bool,
+
+    /// Skip images entirely instead of rendering them
+    #[arg(long)]
+    no_images: bool,
+
+    /// Omit fenced code blocks with this language (repeatable), e.g. dataviewjs
+    #[arg(long, value_name = "LANG")]
+    hide_code_lang: Vec<String>,
 }
 
 fn main() {
@@ -69,6 +77,13 @@ fn main() {
     };
 
     let line_numbers = cli.line_numbers || config.line_numbers;
+
+    // CLI adds to the config rather than replacing it, so `--hide-code-lang`
+    // extends the configured list instead of silently dropping it.
+    let mut hide = config.hide;
+    hide.images |= cli.no_images;
+    hide.code_languages.extend(cli.hide_code_lang);
+
     let width = if cli.width > 0 {
         cli.width
     } else if config.width > 0 {
@@ -127,7 +142,7 @@ fn main() {
         match fmt.as_str() {
             "html" => {
                 let w = if width > 0 { width } else { 80 };
-                export::to_html(&content, w, &initial_theme, &filename);
+                export::to_html(&content, w, &initial_theme, &filename, &hide);
             }
             _ => {
                 eprintln!("Unknown export format '{}'. Supported: html", fmt);
@@ -149,6 +164,7 @@ fn main() {
             width_override: if width > 0 { Some(width) } else { None },
             picker_root,
             start_in_picker,
+            hide,
         };
         if let Err(e) = viewer::run(opts) {
             eprintln!("Viewer error: {}", e);
@@ -171,7 +187,7 @@ fn main() {
                 }
             }
         } else {
-            markdown::render(&content, w, &initial_theme, line_numbers)
+            markdown::render(&content, w, &initial_theme, line_numbers, &hide)
         };
         let wrapped = style::wrap_lines(&lines, w);
         if cli.no_color {

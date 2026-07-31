@@ -19,6 +19,7 @@ use crossterm::{
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::HideConfig;
 use crate::markdown::SyntectRes;
 use crate::style::{DocumentInfo, Line, LineMeta, StyledSpan, wrap_lines};
 use crate::theme::Theme;
@@ -35,6 +36,7 @@ pub struct ViewerOptions {
     pub width_override: Option<usize>,
     pub picker_root: Option<PathBuf>,
     pub start_in_picker: bool,
+    pub hide: HideConfig,
 }
 
 pub fn run(opts: ViewerOptions) -> io::Result<()> {
@@ -309,6 +311,7 @@ struct ViewerState {
     slide_mode: bool,
     line_numbers: bool,
     width_override: Option<usize>,
+    hide: HideConfig,
 
     // Mode
     mode: ViewMode,
@@ -432,6 +435,7 @@ impl ViewerState {
             slide_mode: opts.slide_mode,
             line_numbers: opts.line_numbers,
             width_override: opts.width_override,
+            hide: opts.hide,
             search: SearchState::new(),
             toc_entries: Vec::new(),
             toc_selected: 0,
@@ -630,6 +634,7 @@ impl ViewerState {
                     &self.theme,
                     self.line_numbers,
                     &self.syntect_res,
+                    &self.hide,
                 )
             }
         } else {
@@ -640,6 +645,7 @@ impl ViewerState {
                 &self.theme,
                 self.line_numbers,
                 &self.syntect_res,
+                &self.hide,
             )
         };
         // Pre-compute list content from pre-wrap lines so that word-wrapping
@@ -4782,6 +4788,7 @@ mod tests {
             width_override: None,
             picker_root: None,
             start_in_picker: false,
+            hide: HideConfig::default(),
         };
         let mut state = ViewerState::new(opts, 80, 24);
         state.wrapped = lines;
