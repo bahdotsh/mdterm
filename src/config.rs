@@ -12,6 +12,33 @@ pub struct Config {
     pub width: usize,
     #[serde(default)]
     pub hide: HideConfig,
+    #[serde(default)]
+    pub picker: PickerConfig,
+}
+
+/// Which files the file picker will offer.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct PickerConfig {
+    /// Path component names to skip, matched against each file and directory
+    /// name, e.g. `["node_modules", "attachments"]`.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Descend into dot-directories and offer dot-files. Off by default, so
+    /// `.obsidian`, `.git` and `.trash` are skipped — the same default as `fd`.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl PickerConfig {
+    /// `name` is a single path component, not a whole path.
+    pub fn skips(&self, name: &str) -> bool {
+        if !self.hidden && name.starts_with('.') {
+            return true;
+        }
+        self.ignore
+            .iter()
+            .any(|ignored| ignored.trim().eq_ignore_ascii_case(name))
+    }
 }
 
 /// Content that is parsed but deliberately never rendered.
@@ -19,6 +46,9 @@ pub struct Config {
 pub struct HideConfig {
     #[serde(default)]
     pub images: bool,
+    /// A leading YAML metadata block delimited by `---`.
+    #[serde(default)]
+    pub frontmatter: bool,
     /// Fenced code block languages to omit entirely, e.g. `dataviewjs`.
     #[serde(default)]
     pub code_languages: Vec<String>,
@@ -49,6 +79,7 @@ impl Default for Config {
             line_numbers: false,
             width: 0,
             hide: HideConfig::default(),
+            picker: PickerConfig::default(),
         }
     }
 }
@@ -65,23 +96,28 @@ impl Config {
     }
 }
 
+/// `mdterm` is still accepted so a config written before the rename keeps working.
+const APP_DIRS: [&str; 2] = ["mdviewer", "mdterm"];
+
 fn config_path() -> Option<PathBuf> {
-    let paths: Vec<PathBuf> = config_bases()
-        .into_iter()
-        .map(|base| base.join("mdterm").join("config.toml"))
-        .collect();
+    let mut paths = Vec::new();
+    for base in config_bases() {
+        for app in APP_DIRS {
+            paths.push(base.join(app).join("config.toml"));
+        }
+    }
 
     paths
         .iter()
         .find(|p| p.is_file())
         .cloned()
-        .or_else(|| paths.last().cloned())
+        .or_else(|| paths.first().cloned())
 }
 
-/// Directories searched for `mdterm/config.toml`, in precedence order.
+/// Directories searched for `<app>/config.toml`, in precedence order.
 ///
 /// `dirs::config_dir()` alone is not enough: on macOS it resolves to
-/// `~/Library/Application Support`, so the `~/.config/mdterm/config.toml` the
+/// `~/Library/Application Support`, so the `~/.config/mdviewer/config.toml` the
 /// README documents would never be read.
 fn config_bases() -> Vec<PathBuf> {
     let mut bases = Vec::new();

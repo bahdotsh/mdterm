@@ -17,7 +17,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(
-    name = "mdterm",
+    name = "mdviewer",
     version,
     about = "Terminal Markdown viewer with style"
 )]
@@ -57,6 +57,10 @@ struct Cli {
     #[arg(long)]
     no_images: bool,
 
+    /// Skip a leading YAML frontmatter block
+    #[arg(long)]
+    no_frontmatter: bool,
+
     /// Omit fenced code blocks with this language (repeatable), e.g. dataviewjs
     #[arg(long, value_name = "LANG")]
     hide_code_lang: Vec<String>,
@@ -82,7 +86,9 @@ fn main() {
     // extends the configured list instead of silently dropping it.
     let mut hide = config.hide;
     hide.images |= cli.no_images;
+    hide.frontmatter |= cli.no_frontmatter;
     hide.code_languages.extend(cli.hide_code_lang);
+    let picker_config = config.picker;
 
     let width = if cli.width > 0 {
         cli.width
@@ -104,10 +110,10 @@ fn main() {
                 start_in_picker = true;
                 (String::new(), filename, Vec::new())
             } else {
-                eprintln!("Usage: mdterm [OPTIONS] <FILE|DIRECTORY>...");
-                eprintln!("       command | mdterm");
+                eprintln!("Usage: mdviewer [OPTIONS] <FILE|DIRECTORY>...");
+                eprintln!("       command | mdviewer");
                 eprintln!();
-                eprintln!("Try 'mdterm --help' for more information.");
+                eprintln!("Try 'mdviewer --help' for more information.");
                 process::exit(1);
             }
         } else {
@@ -165,6 +171,7 @@ fn main() {
             picker_root,
             start_in_picker,
             hide,
+            picker: picker_config,
         };
         if let Err(e) = viewer::run(opts) {
             eprintln!("Viewer error: {}", e);

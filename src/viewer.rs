@@ -19,7 +19,7 @@ use crossterm::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::HideConfig;
+use crate::config::{HideConfig, PickerConfig};
 use crate::markdown::SyntectRes;
 use crate::style::{DocumentInfo, Line, LineMeta, StyledSpan, wrap_lines};
 use crate::theme::Theme;
@@ -37,6 +37,7 @@ pub struct ViewerOptions {
     pub picker_root: Option<PathBuf>,
     pub start_in_picker: bool,
     pub hide: HideConfig,
+    pub picker: PickerConfig,
 }
 
 pub fn run(opts: ViewerOptions) -> io::Result<()> {
@@ -312,6 +313,7 @@ struct ViewerState {
     line_numbers: bool,
     width_override: Option<usize>,
     hide: HideConfig,
+    picker: PickerConfig,
 
     // Mode
     mode: ViewMode,
@@ -436,6 +438,7 @@ impl ViewerState {
             line_numbers: opts.line_numbers,
             width_override: opts.width_override,
             hide: opts.hide,
+            picker: opts.picker.clone(),
             search: SearchState::new(),
             toc_entries: Vec::new(),
             toc_selected: 0,
@@ -448,9 +451,9 @@ impl ViewerState {
             fuzzy_input: String::new(),
             fuzzy_selected: 0,
             fuzzy_scroll: 0,
-            file_picker: opts
-                .picker_root
-                .map(crate::file_picker::FilePickerState::new),
+            file_picker: opts.picker_root.map(|root| {
+                crate::file_picker::FilePickerState::new(root, opts.picker.clone())
+            }),
             file_picker_can_close: !opts.start_in_picker,
             current_slide: 0,
             slide_boundaries: Vec::new(),
@@ -515,7 +518,10 @@ impl ViewerState {
             let root = self
                 .current_file_parent()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            self.file_picker = Some(crate::file_picker::FilePickerState::new(root));
+            self.file_picker = Some(crate::file_picker::FilePickerState::new(
+                root,
+                self.picker.clone(),
+            ));
         }
 
         let visible_entries = self.file_picker_visible_entries();
@@ -2327,15 +2333,11 @@ fn handle_file_picker(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers
     }
 
     match code {
-        KeyCode::Esc | KeyCode::Char('p') => {
-            if state.file_picker_can_close {
-                state.mode = ViewMode::Normal;
-                false
-            } else {
-                true
-            }
-        }
-        KeyCode::Char('q') => {
+        // Esc alone closes. 'p' and 'q' must stay literal: the picker is a
+        // text-input mode, and consuming them here made any query containing
+        // them (pear.md, plan, requirements) close the picker — or quit
+        // outright when no file was open yet.
+        KeyCode::Esc => {
             if state.file_picker_can_close {
                 state.mode = ViewMode::Normal;
                 false
@@ -4786,6 +4788,7 @@ mod tests {
             picker_root: None,
             start_in_picker: false,
             hide: HideConfig::default(),
+            picker: PickerConfig::default(),
         };
         let mut state = ViewerState::new(opts, 80, 24);
         state.wrapped = lines;

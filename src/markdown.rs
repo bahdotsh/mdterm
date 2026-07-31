@@ -1572,6 +1572,30 @@ impl SyntectRes {
     }
 }
 
+/// Remove a leading YAML metadata block (`---` … `---`).
+///
+/// Returns `input` untouched when there is no *complete* block, so a document
+/// that merely opens with a `---` rule is never silently swallowed.
+fn strip_frontmatter(input: &str) -> &str {
+    let after_open = if let Some(rest) = input.strip_prefix("---\n") {
+        rest
+    } else if let Some(rest) = input.strip_prefix("---\r\n") {
+        rest
+    } else {
+        return input;
+    };
+
+    let mut offset = input.len() - after_open.len();
+    for line in after_open.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" || trimmed == "..." {
+            return &input[offset..];
+        }
+    }
+    input
+}
+
 pub fn render(
     input: &str,
     width: usize,
@@ -1591,6 +1615,16 @@ pub fn render_with(
     syntect_res: &SyntectRes,
     hide: &HideConfig,
 ) -> (Vec<Line>, DocumentInfo) {
+    // Stripped before parsing rather than skipped during it, so that with
+    // frontmatter hiding off the parse is byte-for-byte what it always was.
+    // `input` is also the `source` used for task-list byte offsets, so both
+    // must be the same slice.
+    let input = if hide.frontmatter {
+        strip_frontmatter(input)
+    } else {
+        input
+    };
+
     let mut renderer = Renderer::new(
         input,
         width,
@@ -1764,6 +1798,7 @@ mod tests {
     fn hide_langs(langs: &[&str]) -> HideConfig {
         HideConfig {
             images: false,
+            frontmatter: false,
             code_languages: langs.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1771,6 +1806,15 @@ mod tests {
     fn hide_images() -> HideConfig {
         HideConfig {
             images: true,
+            frontmatter: false,
+            code_languages: Vec::new(),
+        }
+    }
+
+    fn hide_frontmatter() -> HideConfig {
+        HideConfig {
+            images: false,
+            frontmatter: true,
             code_languages: Vec::new(),
         }
     }
@@ -1870,6 +1914,42 @@ mod tests {
                 .any(|l| matches!(l.meta, LineMeta::Image { .. })),
             "images should render when nothing is hidden"
         );
+    }
+
+    // ── Frontmatter ─────────────────────────────────────────────────────────
+
+    const FM_NOTE: &str = "---\ncreated: 2026-07-31T09:00\ntags: daily-todo\n---\n\n# Real Heading\n\nbody\n";
+
+    #[test]
+    fn hidden_frontmatter_is_removed_but_body_survives() {
+        let (lines, _) = render_hiding(FM_NOTE, &hide_frontmatter());
+        let text = all_text(&lines);
+
+        assert!(!text.contains("created:"), "frontmatter leaked: {text}");
+        assert!(!text.contains("daily-todo"), "frontmatter leaked: {text}");
+        assert!(text.contains("Real Heading"), "body lost: {text}");
+        assert!(text.contains("body"), "body lost: {text}");
+    }
+
+    #[test]
+    fn frontmatter_is_kept_by_default() {
+        let (lines, _) = render_hiding(FM_NOTE, &HideConfig::default());
+        assert!(all_text(&lines).contains("created:"));
+    }
+
+    #[test]
+    fn strip_frontmatter_leaves_documents_without_a_complete_block() {
+        // A lone rule at the top must not swallow the document.
+        let unterminated = "---\nstill just text\n\n# Heading\n";
+        assert_eq!(strip_frontmatter(unterminated), unterminated);
+        // No leading delimiter at all.
+        assert_eq!(strip_frontmatter("# Heading\n"), "# Heading\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_handles_dot_terminator_and_crlf() {
+        assert_eq!(strip_frontmatter("---\na: 1\n...\nbody\n"), "body\n");
+        assert_eq!(strip_frontmatter("---\r\na: 1\r\n---\r\nbody\n"), "body\n");
     }
 
     // ── Lists ───────────────────────────────────────────────────────────────

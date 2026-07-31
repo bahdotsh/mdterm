@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::PickerConfig;
+
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub path: PathBuf,
@@ -24,10 +26,11 @@ pub struct FilePickerState {
     entries: Vec<FileEntry>,
     matches: Vec<MatchEntry>,
     pub error: Option<String>,
+    picker: PickerConfig,
 }
 
 impl FilePickerState {
-    pub fn new(root: impl AsRef<Path>) -> Self {
+    pub fn new(root: impl AsRef<Path>, picker: PickerConfig) -> Self {
         let root = root.as_ref();
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let root_label = display_path(&root);
@@ -40,13 +43,14 @@ impl FilePickerState {
             entries: Vec::new(),
             matches: Vec::new(),
             error: None,
+            picker,
         };
         state.refresh();
         state
     }
 
     pub fn refresh(&mut self) {
-        match discover_markdown_files(&self.root) {
+        match discover_markdown_files(&self.root, &self.picker) {
             Ok(entries) => {
                 self.entries = entries;
                 self.error = None;
@@ -216,9 +220,12 @@ impl FilePickerState {
     }
 }
 
-pub fn discover_markdown_files(root: &Path) -> std::io::Result<Vec<FileEntry>> {
+pub fn discover_markdown_files(
+    root: &Path,
+    picker: &PickerConfig,
+) -> std::io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
-    visit_dir(root, root, &mut entries)?;
+    visit_dir(root, root, &mut entries, picker)?;
     entries.sort_by(|a, b| cmp_display(&a.display, &b.display));
     Ok(entries)
 }
@@ -250,7 +257,12 @@ pub fn fuzzy_score(text: &str, query: &str) -> Option<i64> {
     best
 }
 
-fn visit_dir(root: &Path, dir: &Path, entries: &mut Vec<FileEntry>) -> std::io::Result<()> {
+fn visit_dir(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<FileEntry>,
+    picker: &PickerConfig,
+) -> std::io::Result<()> {
     let mut children = Vec::new();
     for child in fs::read_dir(dir)? {
         let child = match child {
@@ -272,8 +284,11 @@ fn visit_dir(root: &Path, dir: &Path, entries: &mut Vec<FileEntry>) -> std::io::
             Err(_) => continue,
         };
         let path = child.path();
+        if picker.skips(&child.file_name().to_string_lossy()) {
+            continue;
+        }
         if file_type.is_dir() {
-            let _ = visit_dir(root, &path, entries);
+            let _ = visit_dir(root, &path, entries, picker);
         } else if file_type.is_file() && is_markdown_file(&path) {
             let display = path
                 .strip_prefix(root)
@@ -392,10 +407,52 @@ mod tests {
         fs::write(nested.join("b.txt"), "B").unwrap();
         fs::write(root.join("README.MD"), "# Readme").unwrap();
 
-        let entries = discover_markdown_files(&root).unwrap();
+        let entries = discover_markdown_files(&root, &PickerConfig::default()).unwrap();
         let displays: Vec<_> = entries.iter().map(|entry| entry.display.as_str()).collect();
 
         assert_eq!(displays, vec!["hello/world/a.md", "README.MD"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_skips_dot_directories_by_default() {
+        let root = temp_root("mdviewer-picker-hidden");
+        fs::create_dir_all(root.join(".obsidian").join("plugins")).unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join(".obsidian").join("plugins").join("x.md"), "# X").unwrap();
+        fs::write(root.join("notes").join("keep.md"), "# Keep").unwrap();
+
+        let entries = discover_markdown_files(&root, &PickerConfig::default()).unwrap();
+        let displays: Vec<_> = entries.iter().map(|e| e.display.as_str()).collect();
+        assert_eq!(displays, vec!["notes/keep.md"]);
+
+        let show_hidden = PickerConfig {
+            ignore: Vec::new(),
+            hidden: true,
+        };
+        let entries = discover_markdown_files(&root, &show_hidden).unwrap();
+        assert_eq!(entries.len(), 2, "hidden = true should descend into dot-dirs");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_honours_the_ignore_list() {
+        let root = temp_root("mdviewer-picker-ignore");
+        fs::create_dir_all(root.join("attachments")).unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("attachments").join("junk.md"), "# Junk").unwrap();
+        fs::write(root.join("notes").join("keep.md"), "# Keep").unwrap();
+        fs::write(root.join("skipme.md"), "# Skip").unwrap();
+
+        let cfg = PickerConfig {
+            ignore: vec!["Attachments".to_string(), "skipme.md".to_string()],
+            hidden: false,
+        };
+        let entries = discover_markdown_files(&root, &cfg).unwrap();
+        let displays: Vec<_> = entries.iter().map(|e| e.display.as_str()).collect();
+        assert_eq!(displays, vec!["notes/keep.md"]);
 
         fs::remove_dir_all(root).unwrap();
     }

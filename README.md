@@ -1,4 +1,4 @@
-# mdterm
+# mdviewer
 
 A terminal-based Markdown viewer written in Rust. Renders Markdown files with syntax highlighting, styled formatting, and interactive navigation.
 
@@ -29,12 +29,12 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Math rendering** — LaTeX to Unicode: `$\alpha + \beta$` renders as `α + β`
 - **Slide mode** — `--slides` treats `---` as slide separators for terminal presentations
 - **Auto-reload** — Automatically detects file changes and reloads (via inotify/FSEvents/kqueue)
-- **Stdin support** — Pipe markdown from any command: `curl ... | mdterm`
-- **Multiple files** — `mdterm a.md b.md`, switch with `Tab` / `Shift+Tab`
+- **Stdin support** — Pipe markdown from any command: `curl ... | mdviewer`
+- **Multiple files** — `mdviewer a.md b.md`, switch with `Tab` / `Shift+Tab`
 - **HTML export** — `--export html` outputs themed, self-contained HTML
 - **Dark/light themes** — Toggle with `t`, or set via `--theme` / config file
 - **Line numbers** — Toggle with `l` for code blocks
-- **Config file** — `~/.config/mdterm/config.toml` for persistent preferences
+- **Config file** — `~/.config/mdviewer/config.toml` for persistent preferences
 - **Word wrapping** — Responsive re-wrapping on terminal resize
 - **JSON viewer** — Render JSON files with syntax-colored keys, values, and structure
 - **Pipe-friendly** — Outputs plain styled text when stdout is piped
@@ -50,22 +50,22 @@ cargo install --path .
 ## Usage
 
 ```bash
-mdterm                              # pick a Markdown file from the current directory
-mdterm README.md                    # view a file
-mdterm docs/                        # pick a Markdown file from a directory
-mdterm a.md b.md                    # multiple files (Tab to switch)
-mdterm data.json                    # view a JSON file
-cat README.md | mdterm              # read from stdin
-mdterm --slides deck.md             # slide mode
-mdterm --export html doc.md > out.html  # export to HTML
-mdterm --theme light README.md      # light theme
-mdterm -l README.md                 # line numbers in code blocks
+mdviewer                              # pick a Markdown file from the current directory
+mdviewer README.md                    # view a file
+mdviewer docs/                        # pick a Markdown file from a directory
+mdviewer a.md b.md                    # multiple files (Tab to switch)
+mdviewer data.json                    # view a JSON file
+cat README.md | mdviewer              # read from stdin
+mdviewer --slides deck.md             # slide mode
+mdviewer --export html doc.md > out.html  # export to HTML
+mdviewer --theme light README.md      # light theme
+mdviewer -l README.md                 # line numbers in code blocks
 ```
 
-When piped, mdterm outputs styled text without the interactive viewer:
+When piped, mdviewer outputs styled text without the interactive viewer:
 
 ```bash
-mdterm README.md | less -R
+mdviewer README.md | less -R
 ```
 
 ## Controls
@@ -115,7 +115,7 @@ mdterm README.md | less -R
 
 ### File Picker
 
-When launched without file arguments, mdterm opens a file picker rooted at the current directory. Passing a directory path opens the picker at that directory. Type to search across all nested `.md` paths; the query is matched as a fuzzy subsequence, so a path like `hello/world/a.md` can be found with `hellrlda.md`.
+When launched without file arguments, mdviewer opens a file picker rooted at the current directory. Passing a directory path opens the picker at that directory. Type to search across all nested `.md` paths; the query is matched as a fuzzy subsequence, so a path like `hello/world/a.md` can be found with `hellrlda.md`.
 
 | Key | Action |
 |-----|--------|
@@ -125,7 +125,7 @@ When launched without file arguments, mdterm opens a file picker rooted at the c
 | `Home` / `End` | Jump to first / last result |
 | `Enter` | Open selected file |
 | `F5` | Refresh file list |
-| `p` / `Esc` | Close picker after a file is open |
+| `Esc` | Close picker after a file is open |
 
 ### Slide Mode (`--slides`)
 
@@ -138,41 +138,95 @@ When launched without file arguments, mdterm opens a file picker rooted at the c
 
 ## Configuration
 
-Create `~/.config/mdterm/config.toml`:
+### Where the config file goes
 
-```toml
-theme = "dark"          # "dark" or "light"
-line_numbers = false     # show line numbers in code blocks
-width = 0               # display width (0 = auto)
+Put it at **`~/.config/mdviewer/config.toml`** — on every platform, including macOS.
 
-[hide]
-images = false                        # skip images entirely instead of rendering them
-code_languages = ["dataviewjs"]       # fenced languages to omit from the render
+The lookup order is:
+
+| Order | Location |
+|-------|----------|
+| 1 | `$XDG_CONFIG_HOME/mdviewer/config.toml` (only if `XDG_CONFIG_HOME` is set) |
+| 2 | `~/.config/mdviewer/config.toml` |
+| 3 | Platform config dir — on macOS `~/Library/Application Support/mdviewer/config.toml`, on Linux `~/.config/`, on Windows `%APPDATA%` |
+
+The first file that **exists** wins; the rest are ignored. Nothing is created for you.
+
+An `mdterm/` directory is still accepted at each of those locations, so a config written
+before this fork was renamed keeps working.
+
+```bash
+mkdir -p ~/.config/mdviewer
+$EDITOR ~/.config/mdviewer/config.toml
 ```
 
-Config files are looked up in `$XDG_CONFIG_HOME/mdterm/config.toml`, then
-`~/.config/mdterm/config.toml`, then the platform config directory (on macOS,
-`~/Library/Application Support/mdterm/config.toml`). The first file that exists wins.
+### A complete example
 
-CLI flags override config file settings, except `--hide-code-lang`, which appends to the
-configured list rather than replacing it.
+Every key is optional — omit anything you don't care about.
+
+```toml
+theme = "dark"        # "dark" or "light"
+line_numbers = false  # line numbers inside code blocks
+width = 0             # display width, 0 = auto-detect
+
+# Content that is parsed but never drawn.
+[hide]
+images = true                              # skip images: no placeholder, no caption, no download
+frontmatter = true                         # skip a leading `---` YAML block
+code_languages = ["dataviewjs", "dataview"]  # fenced languages to drop entirely
+
+# Which files the file picker offers.
+[picker]
+ignore = ["attachments", "Templates"]  # skip these file/directory names
+hidden = false                         # false = skip dot-dirs (.obsidian, .git, .trash)
+```
+
+### Verifying it is being read
+
+Config only affects rendering, so compare with and without it:
+
+```bash
+mdviewer --no-color note.md | grep -c dataviewjs   # 0 once the config is in place
+```
 
 ### Hiding content
 
-`[hide]` drops content at render time — it is never drawn, and hidden images are never even
-fetched. Hidden code blocks are also excluded from `c` (copy nearest code block).
+`[hide]` drops content at render time. It is never drawn, and hidden images are never even
+fetched from the network. Hidden code blocks are also excluded from `c` (copy nearest code
+block), so they can't be copied by accident.
 
-Useful for Obsidian vaults, where notes carry ```` ```dataviewjs ```` blocks that mean
-nothing outside Obsidian:
+- `images` — drops the image placeholder rows *and* the caption line
+- `frontmatter` — drops a leading `---` … `---` block. A document that merely opens with a
+  `---` rule and never closes it is left alone
+- `code_languages` — matched against the first word of the fence info string, so
+  ```` ```dataviewjs foo=bar ```` still matches `dataviewjs`. Case-insensitive
+
+Useful for Obsidian vaults, where notes carry frontmatter and ```` ```dataviewjs ```` blocks
+that mean nothing outside Obsidian:
 
 ```bash
-mdterm --no-images --hide-code-lang dataviewjs --hide-code-lang dataview note.md
+mdviewer --no-images --no-frontmatter --hide-code-lang dataviewjs note.md
 ```
+
+### Ignoring files in the picker
+
+`[picker] ignore` entries match a **single path component** — a file or directory name, not
+a path or a glob. `"attachments"` skips that directory anywhere in the tree; `"notes.md"`
+skips any file with that name. Matching is case-insensitive.
+
+Dot-directories are skipped by default, the same as `fd`, which keeps `.obsidian/`, `.git/`
+and `.trash/` out of the picker. Set `hidden = true` to include them.
+
+### CLI vs config
+
+CLI flags override config file settings, with two exceptions that **add** to the config
+rather than replacing it: `--hide-code-lang` appends to `code_languages`, and the `--no-*`
+flags can only turn hiding on, never off.
 
 ## CLI Reference
 
 ```
-mdterm [OPTIONS] [FILES]...
+mdviewer [OPTIONS] [FILES]...
 
 Arguments:
   [FILES]...               Markdown file(s) to view, or a directory to pick from
@@ -185,6 +239,7 @@ Options:
       --export <FORMAT>    Export format (html)
       --no-color           Disable colors
       --no-images          Skip images entirely instead of rendering them
+      --no-frontmatter     Skip a leading YAML frontmatter block
       --hide-code-lang <LANG>
                            Omit fenced code blocks with this language (repeatable)
   -h, --help               Print help
