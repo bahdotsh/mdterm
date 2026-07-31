@@ -115,7 +115,7 @@ mdviewer README.md | less -R
 
 ### File Picker
 
-When launched without file arguments, mdviewer opens a file picker rooted at the current directory. Passing a directory path opens the picker at that directory. Type to search across all nested `.md` paths; the query is matched as a fuzzy subsequence, so a path like `hello/world/a.md` can be found with `hellrlda.md`.
+When launched without file arguments, mdviewer opens a file picker rooted at the current directory. Passing a directory path opens the picker at that directory. Pressing `p` while viewing a file also roots the picker at the directory mdviewer was launched from — not the open file's folder — so it searches the same place your shell would. Type to search across all nested `.md` paths; the query is matched as a fuzzy subsequence, so a path like `hello/world/a.md` can be found with `hellrlda.md`.
 
 | Key | Action |
 |-----|--------|
