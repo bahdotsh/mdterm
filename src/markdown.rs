@@ -1843,7 +1843,9 @@ mod tests {
         let text = all_text(&lines);
 
         assert!(
-            !lines.iter().any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            !lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
             "no placeholder lines should be emitted when images are hidden"
         );
         assert!(
@@ -1863,7 +1865,9 @@ mod tests {
 
         assert_eq!(info.code_blocks.len(), 1);
         assert!(
-            lines.iter().any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
             "images should render when nothing is hidden"
         );
     }
