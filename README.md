@@ -144,9 +144,30 @@ Create `~/.config/mdterm/config.toml`:
 theme = "dark"          # "dark" or "light"
 line_numbers = false     # show line numbers in code blocks
 width = 0               # display width (0 = auto)
+
+[hide]
+images = false                        # skip images entirely instead of rendering them
+code_languages = ["dataviewjs"]       # fenced languages to omit from the render
 ```
 
-CLI flags override config file settings.
+Config files are looked up in `$XDG_CONFIG_HOME/mdterm/config.toml`, then
+`~/.config/mdterm/config.toml`, then the platform config directory (on macOS,
+`~/Library/Application Support/mdterm/config.toml`). The first file that exists wins.
+
+CLI flags override config file settings, except `--hide-code-lang`, which appends to the
+configured list rather than replacing it.
+
+### Hiding content
+
+`[hide]` drops content at render time — it is never drawn, and hidden images are never even
+fetched. Hidden code blocks are also excluded from `c` (copy nearest code block).
+
+Useful for Obsidian vaults, where notes carry ```` ```dataviewjs ```` blocks that mean
+nothing outside Obsidian:
+
+```bash
+mdterm --no-images --hide-code-lang dataviewjs --hide-code-lang dataview note.md
+```
 
 ## CLI Reference
 
@@ -163,6 +184,9 @@ Options:
   -l, --line-numbers       Show line numbers in code blocks
       --export <FORMAT>    Export format (html)
       --no-color           Disable colors
+      --no-images          Skip images entirely instead of rendering them
+      --hide-code-lang <LANG>
+                           Omit fenced code blocks with this language (repeatable)
   -h, --help               Print help
   -V, --version            Print version
 ```
