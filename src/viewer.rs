@@ -3017,7 +3017,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
             .map(|picker| format!(" {}/{} ", picker.match_count(), picker.total_count()))
             .unwrap_or_else(|| " 0/0 ".to_string());
         let count_len = count_label.chars().count();
-        let hint = " type search · ↑↓ select · Enter open · p/Esc close ";
+        let hint = " type search · ↑↓ select · Enter open · Esc close ";
         let hint_len = hint.chars().count();
         let needed = 4 + hint_len + count_len;
         let (show_hint, fill) = if width > needed {
@@ -4013,9 +4013,9 @@ fn render_file_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
         (false, false) => "",
     };
     let footer_raw = if state.file_picker_can_close {
-        " type search · ↑↓ select · Enter open · F5 refresh · p/Esc close "
+        " type search · ↑↓ select · Enter open · F5 refresh · Esc close "
     } else {
-        " type search · ↑↓ select · Enter open · F5 refresh · q quit "
+        " type search · ↑↓ select · Enter open · F5 refresh · Esc quit "
     };
     let scroll_hint_len = scroll_hint.chars().count();
     let footer = truncate_end_text(footer_raw, box_w.saturating_sub(3 + scroll_hint_len));
