@@ -27,6 +27,11 @@ pub struct PickerConfig {
     /// `.obsidian`, `.git` and `.trash` are skipped — the same default as `fd`.
     #[serde(default)]
     pub hidden: bool,
+    /// Cap on how many results the list shows at once. `0` means the only
+    /// limit is terminal height. This is a display cap: every file is still
+    /// matched against the query, so anything can be found by typing.
+    #[serde(default)]
+    pub max_results: usize,
 }
 
 impl PickerConfig {
@@ -185,6 +190,7 @@ mod tests {
         PickerConfig {
             ignore: ignore.iter().map(|s| s.to_string()).collect(),
             hidden,
+            max_results: 0,
         }
     }
 

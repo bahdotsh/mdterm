@@ -430,6 +430,7 @@ mod tests {
         let show_hidden = PickerConfig {
             ignore: Vec::new(),
             hidden: true,
+            max_results: 0,
         };
         let entries = discover_markdown_files(&root, &show_hidden).unwrap();
         assert_eq!(
@@ -453,6 +454,7 @@ mod tests {
         let cfg = PickerConfig {
             ignore: vec!["Attachments".to_string(), "skipme.md".to_string()],
             hidden: false,
+            max_results: 0,
         };
         let entries = discover_markdown_files(&root, &cfg).unwrap();
         let displays: Vec<_> = entries.iter().map(|e| e.display.as_str()).collect();

@@ -504,7 +504,11 @@ impl ViewerState {
     }
 
     fn file_picker_visible_entries(&self) -> usize {
-        self.viewport().saturating_sub(7).max(1)
+        let by_height = self.viewport().saturating_sub(7).max(1);
+        match self.picker.max_results {
+            0 => by_height,
+            cap => by_height.min(cap),
+        }
     }
 
     fn has_current_file(&self) -> bool {

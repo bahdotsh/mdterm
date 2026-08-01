@@ -2,6 +2,40 @@
 
 A terminal-based Markdown viewer written in Rust. Renders Markdown files with syntax highlighting, styled formatting, and interactive navigation.
 
+## Acknowledgements
+
+**mdviewer is a fork of [bahdotsh/mdterm](https://github.com/bahdotsh/mdterm), created by
+[@bahdotsh](https://github.com/bahdotsh).** Essentially everything that makes this a good
+Markdown viewer is their work: the renderer, the TUI, syntax highlighting, image protocols,
+mermaid diagrams, math rendering, the JSON viewer, search, table of contents, slide mode,
+themes, and auto-reload. Full credit for the original goes to them, and the
+[Features](#features) list below is overwhelmingly a description of *their* work.
+
+It also incorporates the searchable file picker from
+[mdterm#60](https://github.com/bahdotsh/mdterm/pull/60) by
+[@seobaeksol](https://github.com/seobaeksol), which was still an open pull request upstream
+at the time of forking.
+
+This fork exists to scratch a specific itch — reading an [Obsidian](https://obsidian.md)
+vault in the terminal — and adds only the following on top:
+
+| Addition | What it does |
+|----------|--------------|
+| `[hide] images` / `--no-images` | Skips images entirely: no placeholder rows, no caption, and no network fetch. Useful where terminal image protocols don't work well (e.g. some tmux setups) |
+| `[hide] frontmatter` / `--no-frontmatter` | Drops a leading `---` YAML block, which otherwise renders as two rules with raw YAML between them |
+| `[hide] code_languages` / `--hide-code-lang` | Omits fenced blocks by language, e.g. Obsidian's ```` ```dataviewjs ```` blocks, which mean nothing outside Obsidian |
+| `[picker] ignore` | Skips files and directories by name in the file picker |
+| `[picker] hidden` | Dot-directories (`.obsidian`, `.git`, `.trash`) are now skipped by default, matching `fd` |
+| `[picker] max_results` | Caps how many results the picker lists at once, without limiting what can be found by typing |
+| Picker rooting | Pressing `p` roots the picker at the directory mdviewer was launched from, rather than the open file's folder |
+| Picker key fix | `p` and `q` are literal search characters in the picker; previously they closed it — or quit outright — so no query containing them could be typed |
+| Config lookup | Searches `$XDG_CONFIG_HOME`, then `~/.config`, then the platform directory, so the documented `~/.config/…/config.toml` works on macOS too (see [mdterm#66](https://github.com/bahdotsh/mdterm/issues/66)) |
+
+Nothing here is upstreamed yet. If any of it is useful to the original project, it should go
+there — the intent of this fork is personal use, not divergence.
+
+Licensed MIT, the same as the original.
+
 ## Screenshots
 
 | | |
@@ -179,6 +213,7 @@ code_languages = ["dataviewjs", "dataview"]  # fenced languages to drop entirely
 [picker]
 ignore = ["attachments", "Templates"]  # skip these file/directory names
 hidden = false                         # false = skip dot-dirs (.obsidian, .git, .trash)
+max_results = 0                        # cap the list length; 0 = limited only by terminal height
 ```
 
 ### Verifying it is being read
@@ -216,6 +251,23 @@ skips any file with that name. Matching is case-insensitive.
 
 Dot-directories are skipped by default, the same as `fd`, which keeps `.obsidian/`, `.git/`
 and `.trash/` out of the picker. Set `hidden = true` to include them.
+
+### Limiting how many results are listed
+
+`[picker] max_results` caps the length of the list, so opening the picker on a large vault
+doesn't fill the screen:
+
+```toml
+[picker]
+max_results = 5
+```
+
+This is **a display cap only**. Every file is still matched against your query, so anything
+in the tree can be found by typing — you just see at most 5 rows at a time, and can scroll
+through the rest. The counter in the box header keeps showing the true totals, so
+`237/1041` means 237 files match your query out of 1041 discovered.
+
+`0` (the default) means the list is limited only by terminal height.
 
 ### CLI vs config
 
