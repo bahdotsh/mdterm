@@ -2061,7 +2061,7 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
 
 /// Convert heading text to a GitHub-style anchor slug.
 /// Note: when duplicate headings exist, callers match the first occurrence.
-fn heading_to_slug(text: &str) -> String {
+pub(crate) fn heading_to_slug(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut prev_hyphen = false;
     for c in text.chars() {
