@@ -202,6 +202,15 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
 fn word_wrap(line: &Line, width: usize) -> Vec<Line> {
     let mut segments: Vec<StyledSpan> = Vec::new();
     for span in &line.spans {
+        if span.text.is_empty() {
+            // A zero-width span draws nothing but still carries its style, and
+            // `decoration` is part of that style. A blank line inside a code
+            // block is marked as content by exactly such a span; dropping it
+            // here would leave the row entirely frame, so a copied selection
+            // would swallow the blank line instead of preserving it.
+            segments.push(span.clone());
+            continue;
+        }
         let mut chars = span.text.chars().peekable();
         while chars.peek().is_some() {
             let is_ws = chars.peek().unwrap().is_whitespace();
@@ -329,6 +338,46 @@ mod tests {
         let wrapped = wrap_lines(&lines, 80);
         assert_eq!(wrapped.len(), 1);
         assert_eq!(line_text(&wrapped[0]), "hello");
+    }
+
+    #[test]
+    fn wrapping_preserves_zero_width_spans() {
+        // A zero-width span draws nothing but carries its style, and callers use
+        // that style to mark a row as content. Dropping it during wrapping would
+        // turn a blank code line into a row of pure frame.
+        let marker = StyledSpan {
+            text: String::new(),
+            style: Style {
+                decoration: false,
+                ..Default::default()
+            },
+        };
+        let line = Line {
+            spans: vec![
+                StyledSpan {
+                    text: "  │ ".to_string(),
+                    style: Style::frame(),
+                },
+                marker,
+                StyledSpan {
+                    text: format!("{} │", " ".repeat(40)),
+                    style: Style::frame(),
+                },
+            ],
+            meta: LineMeta::None,
+        };
+        assert!(
+            line.display_width() > 20,
+            "fixture must exceed the wrap width so word_wrap actually runs"
+        );
+        let wrapped = wrap_lines(&[line], 20);
+        assert!(
+            wrapped
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.text.is_empty() && !s.style.decoration),
+            "the zero-width content marker was dropped by wrapping"
+        );
     }
 
     #[test]

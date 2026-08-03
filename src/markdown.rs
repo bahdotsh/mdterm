@@ -360,6 +360,7 @@ impl<'a> Renderer<'a> {
                 });
             }
 
+            let mut has_content = false;
             if let Ok(ranges) = highlighter.highlight_line(line_str, self.syntax_set) {
                 for (syn_style, text) in ranges {
                     let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
@@ -371,6 +372,7 @@ impl<'a> Renderer<'a> {
                             text: trimmed.to_string(),
                             style,
                         });
+                        has_content = true;
                     }
                 }
             } else {
@@ -383,6 +385,10 @@ impl<'a> Renderer<'a> {
                         ..Default::default()
                     },
                 });
+                has_content = true;
+            }
+            if !has_content {
+                spans.push(empty_code_content(code_bg));
             }
 
             let padding = content_width.saturating_sub(char_count) + 1;
@@ -487,7 +493,11 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.text.as_str()))
                 .sum();
-            spans.extend(row_spans.iter().cloned());
+            if row_spans.is_empty() {
+                spans.push(empty_code_content(code_bg));
+            } else {
+                spans.extend(row_spans.iter().cloned());
+            }
 
             let padding = content_width.saturating_sub(row_width) + 1;
             spans.push(StyledSpan {
@@ -1294,6 +1304,23 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
     }
 
     lines
+}
+
+/// A zero-width content span for a code-block row that has no text of its own.
+///
+/// A blank line inside a fenced block produces no highlighted spans, which would
+/// leave the row built entirely from `Style::frame()` — indistinguishable from
+/// the block's top and bottom borders, so a copied selection would drop the
+/// blank line rather than preserve it. This marks the row as content without
+/// drawing anything or contributing a character to the copy.
+fn empty_code_content(code_bg: Color) -> StyledSpan {
+    StyledSpan {
+        text: String::new(),
+        style: Style {
+            bg: Some(code_bg),
+            ..Default::default()
+        },
+    }
 }
 
 fn syntect_to_style(syn: SynStyle) -> Style {

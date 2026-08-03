@@ -557,6 +557,23 @@ impl ViewerState {
         (self.rows as usize).saturating_sub(2)
     }
 
+    /// Switches view mode, cancelling any in-flight mouse selection on the way
+    /// out of Normal.
+    ///
+    /// The selection handlers are all gated on `ViewMode::Normal`, so opening an
+    /// overlay mid-drag swallows the mouse-up that would have ended the gesture.
+    /// Left alone, that strands a `dragging` selection: the hover-cursor logic
+    /// bails on it forever, and drag autoscroll keeps stepping the offset on a
+    /// 40 ms timer until it runs out of document. Every mode transition goes
+    /// through here so there is one place that can see it.
+    fn set_mode(&mut self, mode: ViewMode) {
+        if mode != ViewMode::Normal {
+            self.selection = None;
+            self.drag_autoscroll = 0;
+        }
+        self.mode = mode;
+    }
+
     fn link_picker_visible_entries(&self) -> usize {
         let count = self.link_entries.len();
         let viewport = self.viewport();
@@ -1076,6 +1093,16 @@ impl ViewerState {
         !line.spans.is_empty() && line.spans.iter().all(|s| s.style.decoration)
     }
 
+    /// True when `line` can contribute text to a copied selection.
+    ///
+    /// Image rows carry no text and pure-frame rows are scaffolding, so
+    /// `selection_text` skips both. The highlight has to agree: painting a row
+    /// as selected advertises content that a paste will not contain. This is the
+    /// single predicate all three sites share.
+    fn contributes_to_copy(line: &Line) -> bool {
+        !matches!(line.meta, LineMeta::Image { .. }) && !Self::is_all_decoration(line)
+    }
+
     /// Extracts `[start, end)` (in character offsets) from one line, skipping
     /// decoration spans.
     ///
@@ -1117,8 +1144,7 @@ impl ViewerState {
             let Some(line) = self.wrapped.get(idx) else {
                 break;
             };
-            // Image rows carry no text; code-block borders are pure frame.
-            if matches!(line.meta, LineMeta::Image { .. }) || Self::is_all_decoration(line) {
+            if !Self::contributes_to_copy(line) {
                 continue;
             }
             let len = line.char_len();
@@ -1147,13 +1173,18 @@ impl ViewerState {
         if self.drag_autoscroll == 0 {
             return false;
         }
-        if self.slide_mode || self.selection.is_none_or(|s| !s.dragging) {
+        if self.slide_mode
+            || self.mode != ViewMode::Normal
+            || self.selection.is_none_or(|s| !s.dragging)
+        {
             // The drag ended without an Up we could act on: `m` dropped mouse
             // capture mid-drag (so no further mouse events arrive at all), a
-            // relayout cleared the selection, or slide mode took over. Disarm
-            // here too, not just at the document edge — while this is non-zero
-            // the event loop pins its poll timeout to the autoscroll cadence,
-            // and nothing else would ever reset it.
+            // relayout cleared the selection, an overlay opened (mouse events
+            // only reach the selection handlers in Normal mode, so the release
+            // is swallowed), or slide mode took over. Disarm here too, not just
+            // at the document edge — while this is non-zero the event loop pins
+            // its poll timeout to the autoscroll cadence, and nothing else would
+            // ever reset it.
             self.drag_autoscroll = 0;
             return false;
         }
@@ -1183,16 +1214,24 @@ impl ViewerState {
 
     /// The selected character range within `line_idx`, for highlighting.
     ///
-    /// Returns `None` when the line falls outside the selection.
+    /// Returns `None` when the line falls outside the selection, or when it
+    /// contributes nothing to the copy.
     fn selection_range_for_line(&self, line_idx: usize) -> Option<(usize, usize)> {
         let sel = self.selection?;
         let ((start_line, start_col), (end_line, end_col)) = sel.ordered();
         if line_idx < start_line || line_idx > end_line {
             return None;
         }
-        let len = self.wrapped.get(line_idx)?.char_len();
+        let line = self.wrapped.get(line_idx)?;
+        if !Self::contributes_to_copy(line) {
+            return None;
+        }
         let from = if line_idx == start_line { start_col } else { 0 };
-        let to = if line_idx == end_line { end_col } else { len };
+        let to = if line_idx == end_line {
+            end_col
+        } else {
+            line.char_len()
+        };
         if from >= to { None } else { Some((from, to)) }
     }
 
@@ -1200,12 +1239,12 @@ impl ViewerState {
     /// the highlight should extend across the trailing fill so multi-line
     /// selections read as one contiguous block instead of a ragged right edge.
     fn selection_fills_line(&self, line_idx: usize) -> bool {
-        // A pure-frame row contributes nothing to the copy, so filling it would
-        // advertise content that a paste will not contain.
-        if self
+        // A row that contributes nothing to the copy must not be filled either:
+        // that would advertise content a paste will not contain.
+        if !self
             .wrapped
             .get(line_idx)
-            .is_some_and(Self::is_all_decoration)
+            .is_some_and(Self::contributes_to_copy)
         {
             return false;
         }
@@ -1292,11 +1331,11 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 json_nav_active(state),
             ) {
                 if state.mode == ViewMode::Help {
-                    state.mode = ViewMode::Normal;
+                    state.set_mode(ViewMode::Normal);
                 } else {
                     reset_cursor_shape(state);
                     state.help_scroll = 0;
-                    state.mode = ViewMode::Help;
+                    state.set_mode(ViewMode::Help);
                 }
                 state.dirty = true;
                 return false;
@@ -1306,7 +1345,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_mode = state.mode;
                 match ke.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        state.mode = ViewMode::Normal;
+                        state.set_mode(ViewMode::Normal);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let total = help_total_rows();
@@ -2045,7 +2084,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
         // Search
         KeyCode::Char('/') => {
             reset_cursor_shape(state);
-            state.mode = ViewMode::Search;
+            state.set_mode(ViewMode::Search);
             state.search.input_active = true;
             state.search.input_buf.clear();
         }
@@ -2077,7 +2116,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if visible_entries > 0 && state.toc_selected >= visible_entries {
                 state.toc_scroll = state.toc_selected - visible_entries + 1;
             }
-            state.mode = ViewMode::Toc;
+            state.set_mode(ViewMode::Toc);
         }
 
         // Link picker
@@ -2085,7 +2124,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             reset_cursor_shape(state);
             state.link_selected = 0;
             state.link_scroll = 0;
-            state.mode = ViewMode::LinkPicker;
+            state.set_mode(ViewMode::LinkPicker);
         }
 
         // Fuzzy heading search
@@ -2094,7 +2133,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             state.fuzzy_input.clear();
             state.fuzzy_selected = 0;
             state.fuzzy_scroll = 0;
-            state.mode = ViewMode::FuzzyHeading;
+            state.set_mode(ViewMode::FuzzyHeading);
         }
 
         // Copy full document
@@ -2222,7 +2261,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
         KeyCode::Esc => {
             state.search.input_active = false;
             state.search.input_buf.clear();
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Enter => {
             state.search.input_active = false;
@@ -2231,7 +2270,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
             let viewport = state.viewport();
             let max_offset = state.max_offset();
             scroll_to_match(&state.search, &mut state.offset, viewport, max_offset);
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Backspace => {
             state.search.input_buf.pop();
@@ -2246,7 +2285,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
 fn handle_toc(state: &mut ViewerState, code: KeyCode) {
     let count = state.toc_entries.len();
     if count == 0 {
-        state.mode = ViewMode::Normal;
+        state.set_mode(ViewMode::Normal);
         return;
     }
 
@@ -2256,7 +2295,7 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
 
     match code {
         KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => {
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.toc_selected = state.toc_selected.saturating_sub(1);
@@ -2280,7 +2319,7 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
             let target = state.toc_entries[state.toc_selected].line_idx;
             let max = state.max_offset();
             state.offset = target.min(max);
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         _ => {}
     }
@@ -2413,7 +2452,7 @@ fn reset_cursor_shape(state: &mut ViewerState) {
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
     let count = state.link_entries.len();
     if count == 0 {
-        state.mode = ViewMode::Normal;
+        state.set_mode(ViewMode::Normal);
         return;
     }
 
@@ -2424,7 +2463,7 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
 
     match code {
         KeyCode::Esc => {
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.link_selected = state.link_selected.saturating_sub(1);
@@ -2449,7 +2488,7 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
                 let url = entry.url.clone();
                 dispatch_link(state, &url);
             }
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         _ => {}
     }
@@ -2492,7 +2531,7 @@ fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
     } else {
         match code {
             KeyCode::Esc => {
-                state.mode = ViewMode::Normal;
+                state.set_mode(ViewMode::Normal);
                 return;
             }
             KeyCode::Char(c) => {
@@ -2512,7 +2551,7 @@ fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
                     let max = state.max_offset();
                     state.offset = target.min(max);
                 }
-                state.mode = ViewMode::Normal;
+                state.set_mode(ViewMode::Normal);
                 return;
             }
             _ => {}
@@ -5055,6 +5094,37 @@ mod tests {
     }
 
     #[test]
+    fn selection_text_keeps_blank_lines_inside_a_code_block() {
+        // A blank code line renders no highlighted spans of its own, so without
+        // an explicit content marker the row is built entirely from frame spans
+        // — indistinguishable from a border, and silently dropped from the copy.
+        let mut state = make_rendered_state("```rust\nlet a = 1;\n\nlet b = 2;\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "let a = 1;\n\nlet b = 2;");
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_in_a_wrapping_code_block() {
+        // Same case, but wide enough that every row goes through `word_wrap`.
+        // The zero-width content marker has to survive wrapping, which drops
+        // empty spans unless told otherwise.
+        let long = "x".repeat(100);
+        let mut state = make_rendered_state(&format!("```rust\nlet a = 1;\n\n{long}\n```\n"), 60);
+        let copied = select_all(&mut state);
+        assert!(
+            copied.starts_with("let a = 1;\n\n"),
+            "blank line lost once the block wraps: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_in_an_unhighlighted_code_block() {
+        // No language means no syntax definition, so this takes the other arm of
+        // the code-line renderer.
+        let mut state = make_rendered_state("```\nalpha\n\nbeta\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "alpha\n\nbeta");
+    }
+
+    #[test]
     fn selection_text_strips_table_frame() {
         let mut state = make_rendered_state("| a | b |\n|---|---|\n| 1 | 2 |\n", 80);
         let copied = select_all(&mut state);
@@ -5109,6 +5179,31 @@ mod tests {
             .expect("a rendered code block has at least one all-frame row");
         assert!(border < last, "fixture must have a frame row mid-selection");
         assert!(!state.selection_fills_line(border));
+    }
+
+    #[test]
+    fn selection_highlight_skips_image_rows_it_will_not_copy() {
+        // `selection_text` skips image rows, so the highlight must skip them
+        // too — otherwise the row reads as selected while a paste omits it.
+        let mut state = make_state_with_lines(vec![
+            text_line("before"),
+            Line {
+                spans: vec![span("[img placeholder]", None)],
+                meta: LineMeta::Image {
+                    url: "http://x/y.png".to_string(),
+                    alt: "alt".to_string(),
+                    row: 0,
+                    total_rows: 1,
+                },
+            },
+            text_line("after"),
+        ]);
+        state.selection = Some(finished_selection((0, 0), (2, 5)));
+        assert_eq!(state.selection_range_for_line(1), None);
+        assert!(!state.selection_fills_line(1));
+        // The surrounding text rows are still highlighted normally.
+        assert!(state.selection_range_for_line(0).is_some());
+        assert!(state.selection_fills_line(0));
     }
 
     #[test]
@@ -5585,6 +5680,71 @@ mod tests {
         assert!(!state.step_drag_autoscroll());
         assert_eq!(state.drag_autoscroll, 0);
         assert_eq!(state.offset, 0, "slide mode owns its own position");
+    }
+
+    #[test]
+    fn opening_an_overlay_mid_drag_cancels_the_selection() {
+        // Down/Drag/Up are all gated on Normal mode, so an overlay opened while
+        // the button is held swallows the release. Left alone that strands a
+        // `dragging` selection and leaves autoscroll running on its 40 ms timer
+        // until it runs out of document.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        assert_eq!(state.drag_autoscroll, 1, "edge drag arms autoscroll");
+
+        handle_normal(&mut state, KeyCode::Char('/'), KeyModifiers::empty());
+        assert_eq!(state.mode, ViewMode::Search);
+        assert!(
+            state.selection.is_none(),
+            "the drag must not outlive Normal"
+        );
+        assert_eq!(state.drag_autoscroll, 0);
+
+        // The release now falls through the mode guard entirely, so nothing
+        // downstream gets a chance to clean up after it.
+        handle_event(&mut state, release(viewport, 2));
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.offset, 0, "the document must not scroll under search");
+    }
+
+    #[test]
+    fn stale_drag_does_not_survive_a_mode_round_trip() {
+        // Returning to Normal must not restore a selection that never saw its
+        // mouse-up: `Moved` bails while `dragging` is set, so the hover cursor
+        // would stay dead until the next click.
+        let mut state = make_long_state();
+        handle_event(&mut state, press(1, 2));
+        handle_normal(&mut state, KeyCode::Char('/'), KeyModifiers::empty());
+        handle_event(&mut state, release(1, 2));
+        handle_search(&mut state, KeyCode::Esc);
+        assert_eq!(state.mode, ViewMode::Normal);
+        assert!(state.selection.is_none_or(|s| !s.dragging));
+    }
+
+    #[test]
+    fn autoscroll_step_disarms_outside_normal_mode() {
+        // The guard stands on its own, independent of `set_mode` clearing the
+        // selection — this is the timer the event loop keeps waking up for.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        state.mode = ViewMode::Toc;
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.drag_autoscroll, 0);
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn set_mode_keeps_a_finished_selection_when_returning_to_normal() {
+        // Only the way *out* of Normal cancels: a completed selection stays
+        // visible as confirmation of what was copied.
+        let mut state = make_state_with_lines(vec![text_line("hello")]);
+        state.selection = Some(finished_selection((0, 0), (0, 5)));
+        state.set_mode(ViewMode::Normal);
+        assert!(state.selection.is_some());
     }
 
     #[test]
