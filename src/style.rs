@@ -15,11 +15,27 @@ pub struct Style {
     pub dim: bool,
     pub link_url: Option<String>,
     /// Visual scaffolding rather than document content — code-block borders,
-    /// padding, line numbers, blockquote bars. Stripped from copied text so a
-    /// paste yields clean source. Lives on `Style` (next to the equally
+    /// padding, line numbers, blockquote bars, table rules. Stripped from copied
+    /// text so a paste yields clean source. Lives on `Style` (next to the equally
     /// non-visual `link_url`) because `word_wrap` clones the style onto every
     /// segment it produces, so the flag survives wrapping for free.
     pub decoration: bool,
+}
+
+impl Style {
+    /// Base style for frame spans — anything drawn as scaffolding around
+    /// content rather than as content itself.
+    ///
+    /// Build on it with struct update syntax so every frame span opts into
+    /// `decoration` by construction rather than by remembering the field:
+    /// `Style { fg: Some(border), ..Style::frame() }`. Forgetting it leaks
+    /// box-drawing characters into the user's clipboard, which is silent.
+    pub fn frame() -> Self {
+        Style {
+            decoration: true,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
