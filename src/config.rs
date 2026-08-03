@@ -39,5 +39,8 @@ impl Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("mdterm").join("config.toml"))
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)?;
+    Some(base.join("mdterm").join("config.toml"))
 }
