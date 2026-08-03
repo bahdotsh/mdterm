@@ -6,6 +6,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::HideConfig;
 use crate::diagram;
 use crate::style::{
     BLOCKQUOTE_PREFIX, BLOCKQUOTE_PREFIX_TRIMMED, CodeBlockContent, DocumentInfo, Line, LineMeta,
@@ -19,6 +20,7 @@ struct Renderer<'a> {
     current_spans: Vec<StyledSpan>,
     width: usize,
     line_numbers: bool,
+    hide: &'a HideConfig,
 
     // Inline style state
     bold: bool,
@@ -82,6 +84,7 @@ impl<'a> Renderer<'a> {
         width: usize,
         theme: &'a Theme,
         line_numbers: bool,
+        hide: &'a HideConfig,
         syntax_set: &'a SyntaxSet,
         theme_set: &'a ThemeSet,
     ) -> Self {
@@ -91,6 +94,7 @@ impl<'a> Renderer<'a> {
             current_spans: Vec::new(),
             width,
             line_numbers,
+            hide,
             bold: false,
             italic: false,
             strikethrough: false,
@@ -228,6 +232,15 @@ impl<'a> Renderer<'a> {
     fn emit_code_block(&mut self) {
         let lang = self.code_block_lang.trim().to_string();
         let code = std::mem::take(&mut self.code_block_content);
+
+        // Hidden languages leave no trace: no lines, no clipboard entry, and no
+        // block id, so `c` (copy nearest code block) never lands on one. The
+        // take above still runs, so the skipped body cannot bleed into the next
+        // block.
+        if self.hide.hides_language(&lang) {
+            return;
+        }
+
         let code_bg = self.theme.code_bg;
         let border_fg = self.theme.code_border;
         let label_fg = self.theme.code_label;
@@ -923,6 +936,17 @@ impl<'a> Renderer<'a> {
                 self.image_alt.clear();
             }
             Event::End(TagEnd::Image) => {
+                // Hidden images emit nothing at all — no placeholder rows and no
+                // caption. viewer.rs queues downloads by scanning for
+                // LineMeta::Image lines, so emitting none also means nothing is
+                // ever fetched.
+                if self.hide.images {
+                    self.image_alt.clear();
+                    self.image_url.clear();
+                    self.in_image = false;
+                    return;
+                }
+
                 let alt = if self.image_alt.is_empty() {
                     "image".to_string()
                 } else {
@@ -1548,14 +1572,39 @@ impl SyntectRes {
     }
 }
 
+/// Remove a leading YAML metadata block (`---` … `---`).
+///
+/// Returns `input` untouched when there is no *complete* block, so a document
+/// that merely opens with a `---` rule is never silently swallowed.
+fn strip_frontmatter(input: &str) -> &str {
+    let after_open = if let Some(rest) = input.strip_prefix("---\n") {
+        rest
+    } else if let Some(rest) = input.strip_prefix("---\r\n") {
+        rest
+    } else {
+        return input;
+    };
+
+    let mut offset = input.len() - after_open.len();
+    for line in after_open.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" || trimmed == "..." {
+            return &input[offset..];
+        }
+    }
+    input
+}
+
 pub fn render(
     input: &str,
     width: usize,
     theme: &Theme,
     line_numbers: bool,
+    hide: &HideConfig,
 ) -> (Vec<Line>, DocumentInfo) {
     let res = SyntectRes::load();
-    render_with(input, width, theme, line_numbers, &res)
+    render_with(input, width, theme, line_numbers, &res, hide)
 }
 
 pub fn render_with(
@@ -1564,12 +1613,24 @@ pub fn render_with(
     theme: &Theme,
     line_numbers: bool,
     syntect_res: &SyntectRes,
+    hide: &HideConfig,
 ) -> (Vec<Line>, DocumentInfo) {
+    // Stripped before parsing rather than skipped during it, so that with
+    // frontmatter hiding off the parse is byte-for-byte what it always was.
+    // `input` is also the `source` used for task-list byte offsets, so both
+    // must be the same slice.
+    let input = if hide.frontmatter {
+        strip_frontmatter(input)
+    } else {
+        input
+    };
+
     let mut renderer = Renderer::new(
         input,
         width,
         theme,
         line_numbers,
+        hide,
         &syntect_res.syntax_set,
         &syntect_res.theme_set,
     );
@@ -1603,7 +1664,12 @@ mod tests {
 
     fn render_test(input: &str) -> (Vec<Line>, DocumentInfo) {
         let theme = Theme::dark();
-        render(input, 80, &theme, false)
+        render(input, 80, &theme, false, &HideConfig::default())
+    }
+
+    fn render_hiding(input: &str, hide: &HideConfig) -> (Vec<Line>, DocumentInfo) {
+        let theme = Theme::dark();
+        render(input, 80, &theme, false, hide)
     }
 
     fn line_text(line: &Line) -> String {
@@ -1727,6 +1793,166 @@ mod tests {
         assert_eq!(alt, "image");
     }
 
+    // ── Hidden content ──────────────────────────────────────────────────────
+
+    fn hide_langs(langs: &[&str]) -> HideConfig {
+        HideConfig {
+            images: false,
+            frontmatter: false,
+            code_languages: langs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn hide_images() -> HideConfig {
+        HideConfig {
+            images: true,
+            frontmatter: false,
+            code_languages: Vec::new(),
+        }
+    }
+
+    fn hide_frontmatter() -> HideConfig {
+        HideConfig {
+            images: false,
+            frontmatter: true,
+            code_languages: Vec::new(),
+        }
+    }
+
+    fn all_text(lines: &[Line]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn hidden_code_language_emits_nothing() {
+        let input = "# Title\n\n```dataviewjs\nlet x = dv.pages();\n```\n\nafter";
+        let (lines, info) = render_hiding(input, &hide_langs(&["dataviewjs"]));
+        let text = all_text(&lines);
+
+        assert!(
+            info.code_blocks.is_empty(),
+            "hidden block should not be recorded for clipboard copy"
+        );
+        assert!(
+            !text.contains("dv.pages"),
+            "hidden block body leaked into output: {text}"
+        );
+        assert!(
+            !text.contains("dataviewjs"),
+            "hidden block language label leaked into output: {text}"
+        );
+        assert!(
+            text.contains("Title") && text.contains("after"),
+            "surrounding content should survive: {text}"
+        );
+    }
+
+    #[test]
+    fn hiding_one_language_leaves_others_alone() {
+        let input = "```dataviewjs\nvanished\n```\n\n```rust\nfn main() {}\n```";
+        let (lines, info) = render_hiding(input, &hide_langs(&["dataviewjs"]));
+        let text = all_text(&lines);
+
+        assert_eq!(info.code_blocks.len(), 1);
+        assert_eq!(info.code_blocks[0].language, "rust");
+        assert!(text.contains("fn main"), "rust block should render: {text}");
+        assert!(!text.contains("vanished"));
+    }
+
+    #[test]
+    fn hidden_block_body_does_not_bleed_into_the_next_block() {
+        let input = "```dataviewjs\nSECRET\n```\n\n```rust\nkept\n```";
+        let (_, info) = render_hiding(input, &hide_langs(&["dataviewjs"]));
+
+        assert_eq!(info.code_blocks.len(), 1);
+        assert!(
+            !info.code_blocks[0].content.contains("SECRET"),
+            "hidden body bled into the following block: {:?}",
+            info.code_blocks[0].content
+        );
+        assert!(info.code_blocks[0].content.contains("kept"));
+    }
+
+    #[test]
+    fn hidden_language_matches_info_string_with_attributes() {
+        let input = "```dataviewjs foo=bar\nvanished\n```";
+        let (_, info) = render_hiding(input, &hide_langs(&["dataviewjs"]));
+        assert!(info.code_blocks.is_empty());
+    }
+
+    #[test]
+    fn hidden_images_emit_no_lines_or_caption() {
+        let input = "before\n\n![alt text](http://example.com/img.png)\n\nafter";
+        let (lines, _) = render_hiding(input, &hide_images());
+        let text = all_text(&lines);
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "no placeholder lines should be emitted when images are hidden"
+        );
+        assert!(
+            !text.contains("alt text"),
+            "image caption leaked into output: {text}"
+        );
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "surrounding content should survive: {text}"
+        );
+    }
+
+    #[test]
+    fn default_hide_config_renders_images_and_code() {
+        let input = "```dataviewjs\nkept\n```\n\n![alt text](http://example.com/img.png)";
+        let (lines, info) = render_hiding(input, &HideConfig::default());
+
+        assert_eq!(info.code_blocks.len(), 1);
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "images should render when nothing is hidden"
+        );
+    }
+
+    // ── Frontmatter ─────────────────────────────────────────────────────────
+
+    const FM_NOTE: &str =
+        "---\ncreated: 2026-07-31T09:00\ntags: daily-todo\n---\n\n# Real Heading\n\nbody\n";
+
+    #[test]
+    fn hidden_frontmatter_is_removed_but_body_survives() {
+        let (lines, _) = render_hiding(FM_NOTE, &hide_frontmatter());
+        let text = all_text(&lines);
+
+        assert!(!text.contains("created:"), "frontmatter leaked: {text}");
+        assert!(!text.contains("daily-todo"), "frontmatter leaked: {text}");
+        assert!(text.contains("Real Heading"), "body lost: {text}");
+        assert!(text.contains("body"), "body lost: {text}");
+    }
+
+    #[test]
+    fn frontmatter_is_kept_by_default() {
+        let (lines, _) = render_hiding(FM_NOTE, &HideConfig::default());
+        assert!(all_text(&lines).contains("created:"));
+    }
+
+    #[test]
+    fn strip_frontmatter_leaves_documents_without_a_complete_block() {
+        // A lone rule at the top must not swallow the document.
+        let unterminated = "---\nstill just text\n\n# Heading\n";
+        assert_eq!(strip_frontmatter(unterminated), unterminated);
+        // No leading delimiter at all.
+        assert_eq!(strip_frontmatter("# Heading\n"), "# Heading\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_handles_dot_terminator_and_crlf() {
+        assert_eq!(strip_frontmatter("---\na: 1\n...\nbody\n"), "body\n");
+        assert_eq!(strip_frontmatter("---\r\na: 1\r\n---\r\nbody\n"), "body\n");
+    }
+
     // ── Lists ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -1778,8 +2004,8 @@ mod tests {
     fn line_numbers_enabled_adds_numbers_in_code_blocks() {
         let theme = Theme::dark();
         let input = "```\nfirst\nsecond\nthird\n```";
-        let (lines_with, _) = render(input, 80, &theme, true);
-        let (lines_without, _) = render(input, 80, &theme, false);
+        let (lines_with, _) = render(input, 80, &theme, true, &HideConfig::default());
+        let (lines_without, _) = render(input, 80, &theme, false, &HideConfig::default());
         // With line numbers, code block lines should contain "1", "2", "3"
         let code_text: String = lines_with
             .iter()

@@ -2,18 +2,19 @@ use std::io::{self, Write};
 
 use crossterm::style::Color;
 
+use crate::config::HideConfig;
 use crate::markdown;
 use crate::style::{LineMeta, wrap_lines};
 use crate::theme::Theme;
 
-pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str) {
+pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str, hide: &HideConfig) {
     let (lines, _) = if filename.ends_with(".json") {
         match crate::json::render(content, width, theme) {
             Ok(result) => result,
-            Err(_) => markdown::render(content, width, theme, false),
+            Err(_) => markdown::render(content, width, theme, false, hide),
         }
     } else {
-        markdown::render(content, width, theme, false)
+        markdown::render(content, width, theme, false, hide)
     };
     let wrapped = wrap_lines(&lines, width);
 

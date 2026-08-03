@@ -1,10 +1,10 @@
 [package]
-name = "mdterm"
-version = "2.0.0"
+name = "mdviewer"
+version = "2.1.0"
 edition = "2024"
 description = "A terminal-based Markdown viewer with syntax highlighting and interactive navigation"
 license = "MIT"
-repository = "https://github.com/bahdotsh/mdterm"
+repository = "https://github.com/splusk/mdviewer"
 keywords = ["markdown", "terminal", "viewer", "tui", "cli"]
 exclude = ["demo.gif", "demo.cast", "screenshots/", "test.md", "test_linked.md"]
 categories = ["command-line-utilities"]
