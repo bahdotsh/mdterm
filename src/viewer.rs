@@ -19,7 +19,7 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::SyntectRes;
-use crate::style::{DocumentInfo, Line, LineMeta, StyledSpan, wrap_lines};
+use crate::style::{DocumentInfo, Line, LineMeta, Style, StyledSpan, wrap_lines};
 use crate::theme::Theme;
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -103,7 +103,12 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
             continue;
         }
 
-        let timeout = if let Some((_, t)) = &state.toast {
+        let timeout = if state.drag_autoscroll != 0 {
+            // Autoscroll cadence while a selection drag rests at a viewport edge.
+            // Checked first: it is an active interaction, so it outranks the
+            // toast timer below.
+            Duration::from_millis(40)
+        } else if let Some((_, t)) = &state.toast {
             // Sleep only until the toast expires
             Duration::from_secs(1).saturating_sub(t.elapsed())
         } else if state.image_cache.has_in_flight() {
@@ -138,6 +143,13 @@ pub fn run(opts: ViewerOptions) -> io::Result<()> {
                 break;
             }
         } else {
+            // Extend the selection while the pointer sits at a viewport edge.
+            // Runs before the fast_scrolling reset so autoscroll keeps its
+            // cadence instead of being treated as an idle tick.
+            if state.step_drag_autoscroll() {
+                state.dirty = true;
+                continue;
+            }
             // No events pending — clear fast_scrolling so images render
             if state.fast_scrolling {
                 state.fast_scrolling = false;
@@ -241,6 +253,68 @@ impl ViewMode {
     /// like `?` or `h` must be passed through as input, not intercepted.
     fn accepts_text_input(self) -> bool {
         matches!(self, ViewMode::Search | ViewMode::FuzzyHeading)
+    }
+}
+
+// ── Mouse selection ─────────────────────────────────────────────────────────
+
+/// An in-progress or completed mouse text selection.
+///
+/// Positions are `(wrapped_line_index, char_offset)` — document-relative, not
+/// screen-relative, so scrolling mid-drag extends the selection instead of
+/// corrupting it. Re-wrapping invalidates the line indices, so `rebuild()` and
+/// every other layout-changing action clears the selection.
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+    /// Terminal column of the press.
+    ///
+    /// The anchor's *row* goes stale the moment the view scrolls, which is why
+    /// positions are stored document-relative — but the column never does. Keeping
+    /// it lets a deferred click dispatch at exactly the cell it was pressed at,
+    /// including the gutter rule that suppresses link hits in the left margin.
+    anchor_col: u16,
+    /// True between mouse-down and mouse-up.
+    dragging: bool,
+    /// True once the pointer has travelled far enough to count as a drag.
+    ///
+    /// Latched rather than recomputed from `anchor`/`cursor`, so a drag that
+    /// wanders off and returns to its origin stays a drag instead of decaying
+    /// back into a click that would run a click action.
+    moved: bool,
+}
+
+impl Selection {
+    fn new(pos: (usize, usize), anchor_col: u16) -> Self {
+        Selection {
+            anchor: pos,
+            cursor: pos,
+            anchor_col,
+            dragging: true,
+            moved: false,
+        }
+    }
+
+    /// Whether `pos` is far enough from the anchor to be a drag rather than a
+    /// twitchy click.
+    ///
+    /// Mouse reporting is cell-granular, so without a threshold one cell of
+    /// trackpad drift turns "click this code block to copy it" into "copy this
+    /// one character". Any row change counts immediately; within a row the
+    /// pointer has to clear a full cell. A single character is still selectable
+    /// — move out past the threshold and come back, since `moved` latches.
+    fn exceeds_drag_threshold(anchor: (usize, usize), pos: (usize, usize)) -> bool {
+        pos.0 != anchor.0 || pos.1.abs_diff(anchor.1) > 1
+    }
+
+    /// Anchor and cursor sorted into (start, end) so backwards drags work.
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
     }
 }
 
@@ -357,6 +431,18 @@ struct ViewerState {
     // Whether the cursor is currently over a clickable element (link or code block)
     cursor_on_clickable: bool,
 
+    // Active mouse text selection, if any. Persists after mouse-up so the user
+    // can see what was copied; cleared on the next click or any layout change.
+    selection: Option<Selection>,
+
+    // Direction of drag-driven autoscroll: -1 up, 0 none, 1 down. Set while a
+    // selection drag rests at a viewport edge.
+    drag_autoscroll: i32,
+
+    // Terminal column of the most recent drag event, so autoscroll ticks can
+    // recompute the selection cursor without a new mouse event.
+    drag_col: u16,
+
     // Pre-computed list content keyed by list_id (built from pre-wrap lines
     // so that word-wrapping doesn't introduce artificial line breaks).
     list_contents: std::collections::HashMap<usize, String>,
@@ -444,6 +530,9 @@ impl ViewerState {
             dirty: true,
             mouse_captured: true,
             cursor_on_clickable: false,
+            selection: None,
+            drag_autoscroll: 0,
+            drag_col: 0,
             list_contents: std::collections::HashMap::new(),
             nav_history: Vec::new(),
             json_view: None,
@@ -466,6 +555,23 @@ impl ViewerState {
 
     fn viewport(&self) -> usize {
         (self.rows as usize).saturating_sub(2)
+    }
+
+    /// Switches view mode, cancelling any in-flight mouse selection on the way
+    /// out of Normal.
+    ///
+    /// The selection handlers are all gated on `ViewMode::Normal`, so opening an
+    /// overlay mid-drag swallows the mouse-up that would have ended the gesture.
+    /// Left alone, that strands a `dragging` selection: the hover-cursor logic
+    /// bails on it forever, and drag autoscroll keeps stepping the offset on a
+    /// 40 ms timer until it runs out of document. Every mode transition goes
+    /// through here so there is one place that can see it.
+    fn set_mode(&mut self, mode: ViewMode) {
+        if mode != ViewMode::Normal {
+            self.selection = None;
+            self.drag_autoscroll = 0;
+        }
+        self.mode = mode;
     }
 
     fn link_picker_visible_entries(&self) -> usize {
@@ -742,6 +848,12 @@ impl ViewerState {
             self.search.jump_nearest(self.offset);
         }
 
+        // Any relayout invalidates the selection's line indices. This is the one
+        // choke point for that: it runs both from rebuild() (re-wrap, theme or
+        // line-number toggle, file switch, auto-reload) and from the event loop
+        // when image fetches complete and shift rows.
+        self.selection = None;
+
         let max = self.max_offset();
         self.offset = self.offset.min(max);
     }
@@ -905,17 +1017,241 @@ impl ViewerState {
         self.set_toast(label);
     }
 
+    /// The range of wrapped-line indices visible in the viewport: `(start, end)`.
+    ///
+    /// In slide mode the window is bounded by the current slide's boundaries so
+    /// content from the next slide never bleeds in; otherwise it starts at the
+    /// scroll offset and is unbounded above. Every row-to-line mapping must go
+    /// through here — this used to be recomputed independently in three places,
+    /// and the copy-on-click path was missing the slide-mode branch.
+    fn visible_line_window(&self) -> (usize, usize) {
+        if self.slide_mode {
+            let start = self
+                .slide_boundaries
+                .get(self.current_slide)
+                .copied()
+                .unwrap_or(0);
+            let end = self
+                .slide_boundaries
+                .get(self.current_slide + 1)
+                .copied()
+                .unwrap_or(self.wrapped.len());
+            (start, end)
+        } else {
+            (self.offset, usize::MAX)
+        }
+    }
+
     /// Returns the wrapped-line index for a given terminal row, if it maps to content.
     fn line_idx_at_row(&self, term_row: usize) -> Option<usize> {
-        if term_row < 1 {
-            return None; // row 0 is the title bar
+        // `render_frame` draws content at rows 1..=viewport(); row 0 is the title
+        // bar and row viewport()+1 is the status bar. Without the upper bound the
+        // status-bar row resolves to the line just past the last visible one.
+        if term_row < 1 || term_row > self.viewport() {
+            return None;
         }
-        let idx = self.offset + (term_row - 1);
-        if idx < self.wrapped.len() {
+        let (start, end) = self.visible_line_window();
+        let idx = start + (term_row - 1);
+        if idx < self.wrapped.len() && idx < end {
             Some(idx)
         } else {
             None
         }
+    }
+
+    /// Resolves a terminal (row, col) to a document-relative selection position.
+    ///
+    /// Returns `None` for rows outside the content area (title bar, status bar,
+    /// past the last line), so clicking chrome does not start a selection.
+    fn selection_pos_at(&self, term_row: usize, term_col: usize) -> Option<(usize, usize)> {
+        let line_idx = self.line_idx_at_row(term_row)?;
+        let line = self.wrapped.get(line_idx)?;
+        let content_col = term_col.saturating_sub(Self::GUTTER_COLS);
+        Some((line_idx, line.char_offset_at_col(content_col)))
+    }
+
+    /// Like `selection_pos_at`, but clamps out-of-range rows to the nearest
+    /// selectable line instead of returning `None`.
+    ///
+    /// Used while dragging so sweeping into the title bar or past the last line
+    /// extends the selection to that edge rather than freezing it.
+    fn selection_pos_clamped(&self, term_row: usize, term_col: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.visible_line_window();
+        let last = self.wrapped.len().min(end).checked_sub(1)?;
+        let idx = (start + (term_row.max(1) - 1)).min(last);
+        let line = self.wrapped.get(idx)?;
+        let content_col = term_col.saturating_sub(Self::GUTTER_COLS);
+        Some((idx, line.char_offset_at_col(content_col)))
+    }
+
+    /// True when every span on `line` is decoration — a code block's top or
+    /// bottom border, which should contribute nothing rather than a blank line.
+    ///
+    /// Guards on a non-empty span list so genuinely blank document lines still
+    /// produce a newline.
+    fn is_all_decoration(line: &Line) -> bool {
+        !line.spans.is_empty() && line.spans.iter().all(|s| s.style.decoration)
+    }
+
+    /// True when `line` can contribute text to a copied selection.
+    ///
+    /// Image rows carry no text and pure-frame rows are scaffolding, so
+    /// `selection_text` skips both. The highlight has to agree: painting a row
+    /// as selected advertises content that a paste will not contain. This is the
+    /// single predicate all three sites share.
+    fn contributes_to_copy(line: &Line) -> bool {
+        !matches!(line.meta, LineMeta::Image { .. }) && !Self::is_all_decoration(line)
+    }
+
+    /// Extracts `[start, end)` (in character offsets) from one line, skipping
+    /// decoration spans.
+    ///
+    /// Offsets are measured against the *full* span list including decoration, so
+    /// they stay aligned with what `char_offset_at_col` produced from the mouse
+    /// column; decoration characters are filtered during the copy rather than
+    /// before it, which would shift every offset.
+    fn line_copy_text(line: &Line, start: usize, end: usize) -> String {
+        let mut out = String::new();
+        let mut off = 0;
+        for span in &line.spans {
+            let len = span.text.chars().count();
+            if !span.style.decoration {
+                for (j, ch) in span.text.chars().enumerate() {
+                    let abs = off + j;
+                    if abs >= start && abs < end {
+                        out.push(ch);
+                    }
+                }
+            }
+            off += len;
+        }
+        out
+    }
+
+    /// The currently selected text, exactly as it would be copied.
+    ///
+    /// The end position is exclusive, which makes a press-and-release on one
+    /// character an empty selection — that is what distinguishes a click from a
+    /// drag. Wrapped lines keep their visual line breaks, since selection is an
+    /// inherently visual act. Image rows contribute nothing.
+    fn selection_text(&self) -> String {
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
+        let ((start_line, start_col), (end_line, end_col)) = sel.ordered();
+        let mut out: Vec<String> = Vec::new();
+        for idx in start_line..=end_line {
+            let Some(line) = self.wrapped.get(idx) else {
+                break;
+            };
+            if !Self::contributes_to_copy(line) {
+                continue;
+            }
+            let len = line.char_len();
+            let from = if idx == start_line {
+                start_col.min(len)
+            } else {
+                0
+            };
+            let to = if idx == end_line {
+                end_col.min(len)
+            } else {
+                len
+            };
+            out.push(Self::line_copy_text(line, from, to));
+        }
+        out.join("\n")
+    }
+
+    /// Advances drag autoscroll by one line and extends the selection to the new
+    /// edge position. Returns true if anything moved.
+    ///
+    /// Driven by the event loop on a timer rather than by mouse events: a pointer
+    /// held still at the viewport edge emits nothing, but the selection should
+    /// keep growing.
+    fn step_drag_autoscroll(&mut self) -> bool {
+        if self.drag_autoscroll == 0 {
+            return false;
+        }
+        if self.slide_mode
+            || self.mode != ViewMode::Normal
+            || self.selection.is_none_or(|s| !s.dragging)
+        {
+            // The drag ended without an Up we could act on: `m` dropped mouse
+            // capture mid-drag (so no further mouse events arrive at all), a
+            // relayout cleared the selection, an overlay opened (mouse events
+            // only reach the selection handlers in Normal mode, so the release
+            // is swallowed), or slide mode took over. Disarm here too, not just
+            // at the document edge — while this is non-zero the event loop pins
+            // its poll timeout to the autoscroll cadence, and nothing else would
+            // ever reset it.
+            self.drag_autoscroll = 0;
+            return false;
+        }
+        let scrolled_up = self.drag_autoscroll < 0;
+        let prev = self.offset;
+        if scrolled_up {
+            self.offset = self.offset.saturating_sub(1);
+        } else {
+            self.offset = (self.offset + 1).min(self.max_offset());
+        }
+        if self.offset == prev {
+            // Already at the document edge. Disarm, or a mouse-up we never
+            // received (button released outside the terminal, or a dropped
+            // event) would pin the event loop at the autoscroll cadence
+            // forever. A further Drag at the edge re-arms it.
+            self.drag_autoscroll = 0;
+            return false;
+        }
+        let row = if scrolled_up { 1 } else { self.viewport() };
+        if let Some(pos) = self.selection_pos_clamped(row, self.drag_col as usize)
+            && let Some(sel) = self.selection.as_mut()
+        {
+            sel.cursor = pos;
+        }
+        true
+    }
+
+    /// The selected character range within `line_idx`, for highlighting.
+    ///
+    /// Returns `None` when the line falls outside the selection, or when it
+    /// contributes nothing to the copy.
+    fn selection_range_for_line(&self, line_idx: usize) -> Option<(usize, usize)> {
+        let sel = self.selection?;
+        let ((start_line, start_col), (end_line, end_col)) = sel.ordered();
+        if line_idx < start_line || line_idx > end_line {
+            return None;
+        }
+        let line = self.wrapped.get(line_idx)?;
+        if !Self::contributes_to_copy(line) {
+            return None;
+        }
+        let from = if line_idx == start_line { start_col } else { 0 };
+        let to = if line_idx == end_line {
+            end_col
+        } else {
+            line.char_len()
+        };
+        if from >= to { None } else { Some((from, to)) }
+    }
+
+    /// True if the selection covers `line_idx` through to end-of-line, meaning
+    /// the highlight should extend across the trailing fill so multi-line
+    /// selections read as one contiguous block instead of a ragged right edge.
+    fn selection_fills_line(&self, line_idx: usize) -> bool {
+        // A row that contributes nothing to the copy must not be filled either:
+        // that would advertise content a paste will not contain.
+        if !self
+            .wrapped
+            .get(line_idx)
+            .is_some_and(Self::contributes_to_copy)
+        {
+            return false;
+        }
+        self.selection.is_some_and(|sel| {
+            let ((start_line, _), (end_line, _)) = sel.ordered();
+            line_idx >= start_line && line_idx < end_line
+        })
     }
 
     /// Returns true if the line at `line_idx` has copyable metadata.
@@ -937,30 +1273,21 @@ impl ViewerState {
     /// Returns the link URL at the given terminal (row, col), if any.
     fn link_at_position(&self, term_row: usize, term_col: usize) -> Option<&str> {
         // Row 0 is the title bar; content starts at row 1.
-        if term_row < 1 || term_col < Self::GUTTER_COLS {
+        let line_idx = self.line_idx_at_row(term_row)?;
+        self.link_at_line_col(line_idx, term_col)
+    }
+
+    /// Returns the link URL at `term_col` on an already-resolved wrapped line.
+    ///
+    /// Split out from `link_at_position` so a click deferred to mouse-up can be
+    /// dispatched against the line it was *pressed* on rather than whatever now
+    /// sits under the release row — the two differ if the view scrolled while
+    /// the button was held.
+    fn link_at_line_col(&self, line_idx: usize, term_col: usize) -> Option<&str> {
+        if term_col < Self::GUTTER_COLS {
             return None;
         }
         let content_col = term_col - Self::GUTTER_COLS;
-        let (line_idx, slide_end) = if self.slide_mode {
-            let start = self
-                .slide_boundaries
-                .get(self.current_slide)
-                .copied()
-                .unwrap_or(0);
-            let end = self
-                .slide_boundaries
-                .get(self.current_slide + 1)
-                .copied()
-                .unwrap_or(self.wrapped.len());
-            (start + (term_row - 1), end)
-        } else {
-            (self.offset + (term_row - 1), usize::MAX)
-        };
-
-        // Don't resolve links past the current slide boundary.
-        if line_idx >= slide_end {
-            return None;
-        }
         let line = self.wrapped.get(line_idx)?;
         let mut col = 0;
         for span in &line.spans {
@@ -1004,11 +1331,11 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 json_nav_active(state),
             ) {
                 if state.mode == ViewMode::Help {
-                    state.mode = ViewMode::Normal;
+                    state.set_mode(ViewMode::Normal);
                 } else {
                     reset_cursor_shape(state);
                     state.help_scroll = 0;
-                    state.mode = ViewMode::Help;
+                    state.set_mode(ViewMode::Help);
                 }
                 state.dirty = true;
                 return false;
@@ -1018,7 +1345,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_mode = state.mode;
                 match ke.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        state.mode = ViewMode::Normal;
+                        state.set_mode(ViewMode::Normal);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let total = help_total_rows();
@@ -1177,16 +1504,101 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     state.dirty = true;
                 }
             }
+            // Mouse-down starts a selection; it deliberately does *not* run the
+            // click action. That happens on release, once we know whether the
+            // gesture was a click or a drag — which matters because one of the
+            // click actions (task toggle) writes to the file on disk.
             MouseEventKind::Down(MouseButton::Left) if state.mode == ViewMode::Normal => {
                 state.dirty = true;
+                state.drag_autoscroll = 0;
+                state.selection = state
+                    .selection_pos_at(me.row as usize, me.column as usize)
+                    .map(|pos| Selection::new(pos, me.column));
+            }
+            MouseEventKind::Drag(MouseButton::Left) if state.mode == ViewMode::Normal => {
+                // Arm autoscroll while the pointer rests at a viewport edge. The
+                // event loop advances it on a timer, because a stationary pointer
+                // produces no further motion events to drive it.
+                let row = me.row as usize;
+                let viewport = state.viewport();
+                state.drag_autoscroll = if state.selection.is_none_or(|s| !s.dragging) {
+                    0
+                } else if row <= 1 {
+                    -1
+                } else if viewport > 0 && row >= viewport {
+                    1
+                } else {
+                    0
+                };
+                state.drag_col = me.column;
+
+                if let Some(pos) = state.selection_pos_clamped(row, me.column as usize)
+                    && let Some(sel) = state.selection.as_mut()
+                    && sel.dragging
+                {
+                    if !sel.moved && Selection::exceeds_drag_threshold(sel.anchor, pos) {
+                        sel.moved = true;
+                    }
+                    // Below the threshold the cursor stays pinned to the anchor,
+                    // so a jittery click neither paints a stray one-cell
+                    // highlight nor stops being a click. Past it, only repaint
+                    // when the resolved position actually changes: `?1003h`
+                    // reports every cell of motion.
+                    if sel.moved && sel.cursor != pos {
+                        sel.cursor = pos;
+                        state.dirty = true;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if state.mode == ViewMode::Normal => {
+                state.drag_autoscroll = 0;
+                let sel = state.selection.as_mut().filter(|s| s.dragging);
+                let Some(sel) = sel else { return false };
+                sel.dragging = false;
+                // Copy out before the borrow ends; the click path below needs the
+                // press position, not the release event's.
+                let (moved, anchor_line, anchor_col) = (sel.moved, sel.anchor.0, sel.anchor_col);
+                if moved {
+                    // A real drag: copy the selected text and leave the
+                    // highlight standing as confirmation of what was copied.
+                    let text = state.selection_text();
+                    if text.is_empty() {
+                        // Swept across image rows or code-block borders only, or
+                        // wandered back to the anchor — drop the highlight rather
+                        // than leave it implying a copy. Deliberately does *not*
+                        // fall through to the click action: the gesture was a
+                        // drag, and one click action writes the file to disk.
+                        state.selection = None;
+                        state.set_toast("Nothing to copy");
+                        return false;
+                    }
+                    let lines = text.lines().count();
+                    match copy_to_clipboard(&text) {
+                        Ok(()) => state.set_toast(if lines > 1 {
+                            format!("Copied {lines} lines")
+                        } else {
+                            "Copied selection".to_string()
+                        }),
+                        Err(e) => state.set_toast(format!("Copy failed: {e}")),
+                    }
+                    return false;
+                }
+                // The pointer never left the anchor cell: this was a click. Drop
+                // the selection and dispatch the action mouse-down deferred.
+                //
+                // Dispatched against the anchor, not the release event. A scroll
+                // between press and release (wheel, or a `j`/`k` keypress) moves
+                // the document under a stationary pointer, so the release row
+                // resolves to a different line than the one clicked — and one of
+                // these actions toggles a checkbox and writes the file.
+                state.selection = None;
+                state.dirty = true;
                 if let Some(url) = state
-                    .link_at_position(me.row as usize, me.column as usize)
+                    .link_at_line_col(anchor_line, anchor_col as usize)
                     .map(String::from)
                 {
                     dispatch_link(state, &url);
-                } else if let Some(line_idx) = state.line_idx_at_row(me.row as usize)
-                    && let Some(line) = state.wrapped.get(line_idx)
-                {
+                } else if let Some(line) = state.wrapped.get(anchor_line) {
                     match line.meta {
                         LineMeta::CodeContent { block_id } => {
                             if let Some(block) = state.doc_info.code_blocks.get(block_id)
@@ -1196,7 +1608,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                             }
                         }
                         LineMeta::Heading { .. } => {
-                            if let Some(entry) = state.toc_entry_for_line(line_idx) {
+                            if let Some(entry) = state.toc_entry_for_line(anchor_line) {
                                 let text = entry.content.clone();
                                 let label = if entry.text.chars().count() > 30 {
                                     let truncated: String = entry.text.chars().take(27).collect();
@@ -1227,6 +1639,11 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 }
             }
             MouseEventKind::Moved if state.mode == ViewMode::Normal => {
+                // Some terminals emit Moved alongside Drag; don't let the
+                // hand-cursor logic fight an in-progress selection.
+                if state.selection.is_some_and(|s| s.dragging) {
+                    return false;
+                }
                 let on_link = state
                     .link_at_position(me.row as usize, me.column as usize)
                     .is_some();
@@ -1654,18 +2071,20 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
                     let _ = stdout.flush();
                     state.cursor_on_clickable = false;
                 }
-                state.set_toast("Mouse capture OFF — select text freely");
+                // App-level selection needs mouse events; drop any active one.
+                state.selection = None;
+                state.set_toast("Mouse capture OFF — native terminal select");
             } else {
                 let _ = execute!(stdout, EnableMouseCapture);
                 state.mouse_captured = true;
-                state.set_toast("Mouse capture ON — scroll with mouse");
+                state.set_toast("Mouse capture ON — drag to select");
             }
         }
 
         // Search
         KeyCode::Char('/') => {
             reset_cursor_shape(state);
-            state.mode = ViewMode::Search;
+            state.set_mode(ViewMode::Search);
             state.search.input_active = true;
             state.search.input_buf.clear();
         }
@@ -1697,7 +2116,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             if visible_entries > 0 && state.toc_selected >= visible_entries {
                 state.toc_scroll = state.toc_selected - visible_entries + 1;
             }
-            state.mode = ViewMode::Toc;
+            state.set_mode(ViewMode::Toc);
         }
 
         // Link picker
@@ -1705,7 +2124,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             reset_cursor_shape(state);
             state.link_selected = 0;
             state.link_scroll = 0;
-            state.mode = ViewMode::LinkPicker;
+            state.set_mode(ViewMode::LinkPicker);
         }
 
         // Fuzzy heading search
@@ -1714,7 +2133,7 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             state.fuzzy_input.clear();
             state.fuzzy_selected = 0;
             state.fuzzy_scroll = 0;
-            state.mode = ViewMode::FuzzyHeading;
+            state.set_mode(ViewMode::FuzzyHeading);
         }
 
         // Copy full document
@@ -1842,7 +2261,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
         KeyCode::Esc => {
             state.search.input_active = false;
             state.search.input_buf.clear();
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Enter => {
             state.search.input_active = false;
@@ -1851,7 +2270,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
             let viewport = state.viewport();
             let max_offset = state.max_offset();
             scroll_to_match(&state.search, &mut state.offset, viewport, max_offset);
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Backspace => {
             state.search.input_buf.pop();
@@ -1866,7 +2285,7 @@ fn handle_search(state: &mut ViewerState, code: KeyCode) {
 fn handle_toc(state: &mut ViewerState, code: KeyCode) {
     let count = state.toc_entries.len();
     if count == 0 {
-        state.mode = ViewMode::Normal;
+        state.set_mode(ViewMode::Normal);
         return;
     }
 
@@ -1876,7 +2295,7 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
 
     match code {
         KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => {
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.toc_selected = state.toc_selected.saturating_sub(1);
@@ -1900,7 +2319,7 @@ fn handle_toc(state: &mut ViewerState, code: KeyCode) {
             let target = state.toc_entries[state.toc_selected].line_idx;
             let max = state.max_offset();
             state.offset = target.min(max);
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         _ => {}
     }
@@ -2033,7 +2452,7 @@ fn reset_cursor_shape(state: &mut ViewerState) {
 fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
     let count = state.link_entries.len();
     if count == 0 {
-        state.mode = ViewMode::Normal;
+        state.set_mode(ViewMode::Normal);
         return;
     }
 
@@ -2044,7 +2463,7 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
 
     match code {
         KeyCode::Esc => {
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.link_selected = state.link_selected.saturating_sub(1);
@@ -2069,7 +2488,7 @@ fn handle_link_picker(state: &mut ViewerState, code: KeyCode) {
                 let url = entry.url.clone();
                 dispatch_link(state, &url);
             }
-            state.mode = ViewMode::Normal;
+            state.set_mode(ViewMode::Normal);
         }
         _ => {}
     }
@@ -2112,7 +2531,7 @@ fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
     } else {
         match code {
             KeyCode::Esc => {
-                state.mode = ViewMode::Normal;
+                state.set_mode(ViewMode::Normal);
                 return;
             }
             KeyCode::Char(c) => {
@@ -2132,7 +2551,7 @@ fn handle_fuzzy(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) {
                     let max = state.max_offset();
                     state.offset = target.min(max);
                 }
-                state.mode = ViewMode::Normal;
+                state.set_mode(ViewMode::Normal);
                 return;
             }
             _ => {}
@@ -2362,6 +2781,10 @@ fn setup_file_watcher(
 
 // ── Clipboard ───────────────────────────────────────────────────────────────
 
+// Unreachable under `cfg(test)`, where `copy_to_clipboard` diverts to
+// `TEST_CLIPBOARD`. Kept compiled rather than `cfg`'d out so it stays
+// type-checked by `cargo test`.
+#[cfg_attr(test, allow(dead_code))]
 fn run_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
     let mut child = std::process::Command::new(cmd)
         .args(args)
@@ -2399,12 +2822,29 @@ fn run_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Records what the last `copy_to_clipboard` call would have copied.
+    ///
+    /// Under `cfg(test)` the clipboard is a thread-local instead of the system
+    /// pasteboard, so tests can assert on copy behaviour without shelling out to
+    /// `pbcopy`/`xclip` — and without clobbering the pasteboard of whoever is
+    /// running `cargo test`.
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
+    {
+        TEST_CLIPBOARD.with(|c| *c.borrow_mut() = Some(text.to_string()));
+        Ok(())
+    }
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         run_clipboard_cmd("pbcopy", &[], text)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(test)))]
     {
         if run_clipboard_cmd("xclip", &["-selection", "clipboard"], text).is_ok() {
             return Ok(());
@@ -2455,21 +2895,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
     // document when slide mode is off).  `slide_start` replaces the per-row
     // boundary lookups, and `slide_end` gates every `wrapped.get()` so content
     // from the next slide never bleeds into the viewport.
-    let (slide_start, slide_end) = if state.slide_mode {
-        let start = state
-            .slide_boundaries
-            .get(state.current_slide)
-            .copied()
-            .unwrap_or(0);
-        let end = state
-            .slide_boundaries
-            .get(state.current_slide + 1)
-            .copied()
-            .unwrap_or(state.wrapped.len());
-        (start, end)
-    } else {
-        (state.offset, usize::MAX)
-    };
+    let (slide_start, slide_end) = state.visible_line_window();
 
     // Scrollbar
     let total = state.wrapped.len();
@@ -2622,13 +3048,18 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                 } else {
                     vec![]
                 };
-                let highlighted;
-                let spans: &[StyledSpan] = if highlights.is_empty() {
-                    &line.spans
+                let mut styled: Option<Vec<StyledSpan>> = if highlights.is_empty() {
+                    None
                 } else {
-                    highlighted = apply_search_highlights(&line.spans, &highlights, theme);
-                    &highlighted
+                    Some(apply_search_highlights(&line.spans, &highlights, theme))
                 };
+                // Selection paints over search highlighting, not under it.
+                if let Some(range) = state.selection_range_for_line(line_idx) {
+                    let base = styled.take();
+                    let base_spans = base.as_deref().unwrap_or(&line.spans);
+                    styled = Some(apply_selection_highlight(base_spans, range, theme));
+                }
+                let spans: &[StyledSpan] = styled.as_deref().unwrap_or(&line.spans);
 
                 let mut col = 0;
                 for span in spans {
@@ -2636,16 +3067,18 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     col += UnicodeWidthStr::width(span.text.as_str());
                 }
                 if col < content_width {
-                    let fill_bg = if is_json_cursor {
+                    let fill_bg = if state.selection_fills_line(line_idx) {
+                        // Selection continues onto a later line, so carry the
+                        // highlight to the right edge rather than leaving a
+                        // ragged boundary mid-block.
+                        Some(theme.selection_bg)
+                    } else if is_json_cursor {
                         Some(line_bg)
                     } else {
-                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                                Some(bg)
-                            } else {
-                                None
-                            }
-                        })
+                        line.spans
+                            .first()
+                            .and_then(|s| s.style.bg)
+                            .filter(|&bg| line.spans.iter().all(|s| s.style.bg == Some(bg)))
                     };
                     if let Some(bg) = fill_bg {
                         queue!(
@@ -3629,12 +4062,13 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
         HelpSection {
             title: "Actions",
             entries: &[
+                ("drag", "Select text and copy it"),
                 ("click", "Copy heading section, list, or code block"),
                 ("Y", "Copy full document to clipboard"),
                 ("c", "Copy nearest code block"),
                 ("t", "Toggle dark / light theme"),
                 ("l", "Toggle line numbers"),
-                ("m", "Toggle mouse capture (for text select)"),
+                ("m", "Toggle mouse capture (native select)"),
             ],
         },
         HelpSection {
@@ -3848,31 +4282,31 @@ fn format_position(lines: &[Line], offset: usize, viewport: usize) -> String {
     }
 }
 
-fn apply_search_highlights(
+/// Re-splits `spans` at every boundary in `bounds` and hands each resulting
+/// piece to `restyle`, which may adjust its style based on the piece's absolute
+/// character offset.
+///
+/// Total character count is preserved — only the span boundaries move — so
+/// character offsets computed against the input stay valid against the output.
+/// That is what lets selection highlighting run over already search-highlighted
+/// spans without recomputing anything.
+fn restyle_ranges(
     spans: &[StyledSpan],
-    highlights: &[(usize, usize, bool)],
-    theme: &Theme,
+    bounds: &[usize],
+    restyle: impl Fn(usize, &mut Style),
 ) -> Vec<StyledSpan> {
-    let match_bg = theme.search_match_bg;
-    let current_bg = theme.search_current_bg;
-    let current_fg = theme.search_current_fg;
-
     let mut result = Vec::new();
     let mut char_offset = 0;
 
     for span in spans {
         let chars: Vec<char> = span.text.chars().collect();
-        let span_len = chars.len();
         let span_start = char_offset;
-        let span_end = char_offset + span_len;
+        let span_end = char_offset + chars.len();
 
-        let mut cuts = vec![0usize, span_len];
-        for &(hs, he, _) in highlights {
-            if hs > span_start && hs < span_end {
-                cuts.push(hs - span_start);
-            }
-            if he > span_start && he < span_end {
-                cuts.push(he - span_start);
+        let mut cuts = vec![0usize, chars.len()];
+        for &bound in bounds {
+            if bound > span_start && bound < span_end {
+                cuts.push(bound - span_start);
             }
         }
         cuts.sort();
@@ -3883,32 +4317,62 @@ fn apply_search_highlights(
             if local_start >= local_end {
                 continue;
             }
-
-            let text: String = chars[local_start..local_end].iter().collect();
-            let abs_pos = span_start + local_start;
-
-            let highlight = highlights
-                .iter()
-                .find(|(hs, he, _)| abs_pos >= *hs && abs_pos < *he);
-
             let mut style = span.style.clone();
-            if let Some(&(_, _, is_current)) = highlight {
-                if is_current {
-                    style.bg = Some(current_bg);
-                    style.fg = Some(current_fg);
-                    style.bold = true;
-                } else {
-                    style.bg = Some(match_bg);
-                }
-            }
-
-            result.push(StyledSpan { text, style });
+            restyle(span_start + local_start, &mut style);
+            result.push(StyledSpan {
+                text: chars[local_start..local_end].iter().collect(),
+                style,
+            });
         }
 
         char_offset = span_end;
     }
 
     result
+}
+
+/// Overlays the mouse-selection highlight on already-styled spans.
+///
+/// Applied *after* search highlighting so an active selection visibly wins over
+/// a search match underneath it.
+fn apply_selection_highlight(
+    spans: &[StyledSpan],
+    range: (usize, usize),
+    theme: &Theme,
+) -> Vec<StyledSpan> {
+    let (sel_start, sel_end) = range;
+    restyle_ranges(spans, &[sel_start, sel_end], |pos, style| {
+        if pos >= sel_start && pos < sel_end {
+            style.bg = Some(theme.selection_bg);
+            style.fg = Some(theme.selection_fg);
+        }
+    })
+}
+
+fn apply_search_highlights(
+    spans: &[StyledSpan],
+    highlights: &[(usize, usize, bool)],
+    theme: &Theme,
+) -> Vec<StyledSpan> {
+    let bounds: Vec<usize> = highlights
+        .iter()
+        .flat_map(|&(hs, he, _)| [hs, he])
+        .collect();
+    restyle_ranges(spans, &bounds, |pos, style| {
+        let Some(&(_, _, is_current)) = highlights
+            .iter()
+            .find(|(hs, he, _)| pos >= *hs && pos < *he)
+        else {
+            return;
+        };
+        if is_current {
+            style.bg = Some(theme.search_current_bg);
+            style.fg = Some(theme.search_current_fg);
+            style.bold = true;
+        } else {
+            style.bg = Some(theme.search_match_bg);
+        }
+    })
 }
 
 fn write_span(
@@ -4352,5 +4816,954 @@ mod tests {
         assert_eq!(state.link_at_position(1, 2 + 2), None); // space
         assert_eq!(state.link_at_position(1, 2 + 3), Some("https://b.com"));
         assert_eq!(state.link_at_position(1, 2 + 4), Some("https://b.com"));
+    }
+
+    // ── Row → line mapping (slide mode) ─────────────────────────────────────
+
+    /// Builds 10 blank content lines with slide boundaries at 0, 5 and 10.
+    fn make_slide_state(current_slide: usize) -> ViewerState {
+        let mut state = make_state_with_lines((0..10).map(|_| line(vec![])).collect());
+        state.slide_mode = true;
+        state.slide_boundaries = vec![0, 5, 10];
+        state.current_slide = current_slide;
+        state
+    }
+
+    #[test]
+    fn line_idx_at_row_respects_slide_start() {
+        // Slide 1 starts at wrapped line 5, so the first content row maps there —
+        // not to `offset`, which stays 0 in slide mode.
+        let state = make_slide_state(1);
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.line_idx_at_row(1), Some(5));
+        assert_eq!(state.line_idx_at_row(2), Some(6));
+    }
+
+    #[test]
+    fn line_idx_at_row_stops_at_slide_end() {
+        // Slide 0 covers lines 0..5; rows past that must not bleed into slide 1.
+        let state = make_slide_state(0);
+        assert_eq!(state.line_idx_at_row(5), Some(4));
+        assert_eq!(state.line_idx_at_row(6), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_title_bar_is_none() {
+        let state = make_state_with_lines(vec![line(vec![])]);
+        assert_eq!(state.line_idx_at_row(0), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_past_document_end_is_none() {
+        let state = make_state_with_lines(vec![line(vec![]), line(vec![])]);
+        assert_eq!(state.line_idx_at_row(2), Some(1));
+        assert_eq!(state.line_idx_at_row(3), None);
+    }
+
+    #[test]
+    fn line_idx_at_row_uses_scroll_offset_when_not_in_slide_mode() {
+        let mut state = make_state_with_lines((0..10).map(|_| line(vec![])).collect());
+        state.offset = 3;
+        assert_eq!(state.line_idx_at_row(1), Some(3));
+    }
+
+    #[test]
+    fn line_idx_at_row_status_bar_is_none() {
+        // Content renders at rows 1..=viewport(). The status bar sits one row
+        // below that, and with a document taller than the viewport its index is
+        // still in range — so only the explicit ceiling rejects it.
+        let state = make_state_with_lines((0..40).map(|_| line(vec![])).collect());
+        let viewport = state.viewport();
+        assert_eq!(state.line_idx_at_row(viewport), Some(viewport - 1));
+        assert_eq!(state.line_idx_at_row(viewport + 1), None);
+    }
+
+    #[test]
+    fn link_at_position_respects_slide_window() {
+        // A link on line 5 (start of slide 1) must resolve on slide 1's first row
+        // and must not resolve while slide 0 is showing.
+        let mut lines: Vec<Line> = (0..10).map(|_| line(vec![])).collect();
+        lines[5] = line(vec![span("link", Some("https://slide1.com"))]);
+        let mut state = make_state_with_lines(lines);
+        state.slide_mode = true;
+        state.slide_boundaries = vec![0, 5, 10];
+
+        state.current_slide = 1;
+        assert_eq!(state.link_at_position(1, 2), Some("https://slide1.com"));
+
+        // On slide 0, row 6 would have mapped to line 5 before the window clamp.
+        state.current_slide = 0;
+        assert_eq!(state.link_at_position(6, 2), None);
+    }
+
+    // ── Mouse selection ─────────────────────────────────────────────────────
+
+    fn text_line(text: &str) -> Line {
+        line(vec![span(text, None)])
+    }
+
+    /// A completed (mouse-up) selection spanning `anchor`..`cursor`.
+    ///
+    /// `anchor_col` is reconstructed as if the press had landed on the anchor
+    /// character, which is what the click-dispatch path reads.
+    fn finished_selection(anchor: (usize, usize), cursor: (usize, usize)) -> Selection {
+        Selection {
+            anchor,
+            cursor,
+            anchor_col: (ViewerState::GUTTER_COLS + anchor.1) as u16,
+            dragging: false,
+            moved: anchor != cursor,
+        }
+    }
+
+    /// Drains the test clipboard, returning what `copy_to_clipboard` last stored.
+    fn last_copied() -> Option<String> {
+        TEST_CLIPBOARD.with(|c| c.borrow_mut().take())
+    }
+
+    /// Selects from (start_line, start_col) to (end_line, end_col) and returns
+    /// the text that would be copied.
+    fn select_text(state: &mut ViewerState, from: (usize, usize), to: (usize, usize)) -> String {
+        state.selection = Some(finished_selection(from, to));
+        state.selection_text()
+    }
+
+    #[test]
+    fn selection_starts_collapsed_and_unmoved() {
+        let sel = Selection::new((2, 5), 7);
+        assert_eq!(sel.anchor, sel.cursor);
+        assert!(sel.dragging);
+        assert!(!sel.moved, "a press alone is not yet a drag");
+    }
+
+    #[test]
+    fn drag_threshold_ignores_a_single_cell_but_not_a_row_change() {
+        let anchor = (2, 5);
+        assert!(!Selection::exceeds_drag_threshold(anchor, (2, 5)));
+        assert!(!Selection::exceeds_drag_threshold(anchor, (2, 6)));
+        assert!(!Selection::exceeds_drag_threshold(anchor, (2, 4)));
+        assert!(Selection::exceeds_drag_threshold(anchor, (2, 7)));
+        assert!(Selection::exceeds_drag_threshold(anchor, (2, 3)));
+        // A row change counts immediately, however small the column move.
+        assert!(Selection::exceeds_drag_threshold(anchor, (3, 5)));
+    }
+
+    #[test]
+    fn selection_ordered_normalizes_backwards_drag() {
+        let sel = finished_selection((5, 2), (1, 8));
+        assert_eq!(sel.ordered(), ((1, 8), (5, 2)));
+    }
+
+    #[test]
+    fn selection_text_within_one_line() {
+        let mut state = make_state_with_lines(vec![text_line("hello world")]);
+        // End offset is exclusive: 0..5 is "hello".
+        assert_eq!(select_text(&mut state, (0, 0), (0, 5)), "hello");
+        assert_eq!(select_text(&mut state, (0, 6), (0, 11)), "world");
+    }
+
+    #[test]
+    fn selection_text_backwards_drag_matches_forwards() {
+        let mut state = make_state_with_lines(vec![text_line("hello world")]);
+        let forwards = select_text(&mut state, (0, 0), (0, 5));
+        let backwards = select_text(&mut state, (0, 5), (0, 0));
+        assert_eq!(forwards, backwards);
+    }
+
+    #[test]
+    fn selection_text_spans_multiple_lines() {
+        let mut state = make_state_with_lines(vec![
+            text_line("first"),
+            text_line("second"),
+            text_line("third"),
+        ]);
+        // Partial first line, whole middle line, partial last line.
+        assert_eq!(select_text(&mut state, (0, 2), (2, 3)), "rst\nsecond\nthi");
+    }
+
+    #[test]
+    fn selection_text_clamps_offsets_past_end_of_line() {
+        let mut state = make_state_with_lines(vec![text_line("ab"), text_line("cd")]);
+        // Dragging past end-of-line must not panic or over-slice.
+        assert_eq!(select_text(&mut state, (0, 0), (1, 99)), "ab\ncd");
+    }
+
+    #[test]
+    fn selection_text_empty_when_no_selection() {
+        let state = make_state_with_lines(vec![text_line("hello")]);
+        assert_eq!(state.selection_text(), "");
+    }
+
+    #[test]
+    fn selection_text_wide_chars_slice_by_char_not_byte() {
+        let mut state = make_state_with_lines(vec![text_line("日本語です")]);
+        // Byte-indexing here would panic or produce mojibake.
+        assert_eq!(select_text(&mut state, (0, 1), (0, 3)), "本語");
+    }
+
+    #[test]
+    fn selection_text_skips_image_rows() {
+        let mut state = make_state_with_lines(vec![
+            text_line("before"),
+            Line {
+                spans: vec![span("[img placeholder]", None)],
+                meta: LineMeta::Image {
+                    url: "http://x/y.png".to_string(),
+                    alt: "alt".to_string(),
+                    row: 0,
+                    total_rows: 1,
+                },
+            },
+            text_line("after"),
+        ]);
+        assert_eq!(select_text(&mut state, (0, 0), (2, 5)), "before\nafter");
+    }
+
+    /// Renders real markdown through the real pipeline at `width`.
+    ///
+    /// Decoration stripping depends on markdown.rs marking its frame spans, so
+    /// these fixtures must come from the renderer rather than imitate it — a
+    /// hand-built fixture cannot catch the two sides drifting apart.
+    fn make_rendered_state(md: &str, width: usize) -> ViewerState {
+        let theme = crate::theme::Theme::dark();
+        let res = SyntectRes::load();
+        let (lines, _) = crate::markdown::render_with(md, width, &theme, false, &res);
+        make_state_with_lines(wrap_lines(&lines, width))
+    }
+
+    /// Selects the whole document and returns what would be copied.
+    fn select_all(state: &mut ViewerState) -> String {
+        let last = state.wrapped.len() - 1;
+        let len = state.wrapped[last].char_len();
+        select_text(state, (0, 0), (last, len))
+    }
+
+    #[test]
+    fn selection_text_strips_blockquote_prefix() {
+        let mut state = make_rendered_state("> quoted\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "quoted");
+    }
+
+    #[test]
+    fn selection_text_strips_code_block_frame() {
+        let mut state = make_rendered_state("```rust\nlet x = 1;\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "let x = 1;");
+    }
+
+    #[test]
+    fn selection_text_strips_code_block_line_numbers() {
+        let theme = crate::theme::Theme::dark();
+        let res = SyntectRes::load();
+        // line_numbers: true — the numbers are frame, not content.
+        let (lines, _) =
+            crate::markdown::render_with("```rust\nlet x = 1;\n```\n", 80, &theme, true, &res);
+        let mut state = make_state_with_lines(wrap_lines(&lines, 80));
+        assert_eq!(select_all(&mut state).trim(), "let x = 1;");
+    }
+
+    #[test]
+    fn selection_text_drops_code_block_border_lines() {
+        let mut state = make_rendered_state("```rust\nfn main() {}\n```\n", 80);
+        // Top and bottom borders contribute nothing at all, not blank lines.
+        assert_eq!(select_all(&mut state).trim(), "fn main() {}");
+    }
+
+    #[test]
+    fn selection_text_strips_frame_from_wrapped_code_block() {
+        // A code line wider than the viewport wraps, and wrap_lines propagates
+        // CodeContent only to the first wrapped line. Any rule that keys off
+        // LineMeta leaks box-drawing characters into the clipboard on the
+        // continuation lines; the per-span decoration flag survives wrapping.
+        let code = "let very_long_variable_name = \
+                    some_function_call(argument_one, argument_two, argument_three);";
+        let mut state = make_rendered_state(&format!("```rust\n{code}\n```\n"), 60);
+        assert!(
+            state.wrapped.len() > 3,
+            "fixture must actually wrap, got {} lines",
+            state.wrapped.len()
+        );
+        let copied = select_all(&mut state);
+        for frame in ['│', '─', '╭', '╮', '╰', '╯'] {
+            assert!(
+                !copied.contains(frame),
+                "copied text leaked frame char {frame:?}: {copied:?}"
+            );
+        }
+        // The code itself survives, minus the visual line breaks.
+        assert_eq!(copied.split('\n').collect::<String>().trim(), code);
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_inside_a_code_block() {
+        // A blank code line renders no highlighted spans of its own, so without
+        // an explicit content marker the row is built entirely from frame spans
+        // — indistinguishable from a border, and silently dropped from the copy.
+        let mut state = make_rendered_state("```rust\nlet a = 1;\n\nlet b = 2;\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "let a = 1;\n\nlet b = 2;");
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_in_a_wrapping_code_block() {
+        // Same case, but wide enough that every row goes through `word_wrap`.
+        // The zero-width content marker has to survive wrapping, which drops
+        // empty spans unless told otherwise.
+        let long = "x".repeat(100);
+        let mut state = make_rendered_state(&format!("```rust\nlet a = 1;\n\n{long}\n```\n"), 60);
+        let copied = select_all(&mut state);
+        assert!(
+            copied.starts_with("let a = 1;\n\n"),
+            "blank line lost once the block wraps: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_in_an_unhighlighted_code_block() {
+        // No language means no syntax definition, so this takes the other arm of
+        // the code-line renderer.
+        let mut state = make_rendered_state("```\nalpha\n\nbeta\n```\n", 80);
+        assert_eq!(select_all(&mut state).trim(), "alpha\n\nbeta");
+    }
+
+    #[test]
+    fn selection_text_strips_table_frame() {
+        let mut state = make_rendered_state("| a | b |\n|---|---|\n| 1 | 2 |\n", 80);
+        let copied = select_all(&mut state);
+        for frame in ['│', '─', '╭', '╮', '╰', '╯', '┬', '┴', '├', '┤', '┼'] {
+            assert!(
+                !copied.contains(frame),
+                "copied table leaked frame char {frame:?}: {copied:?}"
+            );
+        }
+        // Cell padding is content, not frame: the columns stay aligned rather
+        // than collapsing into "ab".
+        let rows: Vec<&str> = copied
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim_end())
+            .collect();
+        assert_eq!(rows, vec![" a    b", " 1    2"]);
+    }
+
+    #[test]
+    fn selection_text_strips_invented_heading_separator() {
+        // The rule drawn above an H1 has no counterpart in the source.
+        let mut state = make_rendered_state("# Title\n\nbody\n", 80);
+        let copied = select_all(&mut state);
+        assert!(
+            !copied.contains('─'),
+            "heading separator leaked into the copy: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn selection_text_keeps_a_real_horizontal_rule() {
+        // `---` in the source *is* content, unlike the separator above.
+        let mut state = make_rendered_state("a\n\n---\n\nb\n", 80);
+        assert!(
+            select_all(&mut state).contains('─'),
+            "an explicit rule is document content and must survive the copy"
+        );
+    }
+
+    #[test]
+    fn selection_fills_line_skips_pure_frame_rows() {
+        // A code block's border row contributes nothing to the copy, so its
+        // trailing fill must not be painted as if it did.
+        let mut state = make_rendered_state("```rust\nlet x = 1;\n```\n", 80);
+        let last = state.wrapped.len() - 1;
+        state.selection = Some(finished_selection((0, 0), (last, 0)));
+        let border = state
+            .wrapped
+            .iter()
+            .position(ViewerState::is_all_decoration)
+            .expect("a rendered code block has at least one all-frame row");
+        assert!(border < last, "fixture must have a frame row mid-selection");
+        assert!(!state.selection_fills_line(border));
+    }
+
+    #[test]
+    fn selection_highlight_skips_image_rows_it_will_not_copy() {
+        // `selection_text` skips image rows, so the highlight must skip them
+        // too — otherwise the row reads as selected while a paste omits it.
+        let mut state = make_state_with_lines(vec![
+            text_line("before"),
+            Line {
+                spans: vec![span("[img placeholder]", None)],
+                meta: LineMeta::Image {
+                    url: "http://x/y.png".to_string(),
+                    alt: "alt".to_string(),
+                    row: 0,
+                    total_rows: 1,
+                },
+            },
+            text_line("after"),
+        ]);
+        state.selection = Some(finished_selection((0, 0), (2, 5)));
+        assert_eq!(state.selection_range_for_line(1), None);
+        assert!(!state.selection_fills_line(1));
+        // The surrounding text rows are still highlighted normally.
+        assert!(state.selection_range_for_line(0).is_some());
+        assert!(state.selection_fills_line(0));
+    }
+
+    #[test]
+    fn selection_text_keeps_blank_lines_between_paragraphs() {
+        // An empty document line must still produce a newline; only all-frame
+        // lines are dropped.
+        let mut state =
+            make_state_with_lines(vec![text_line("one"), line(vec![]), text_line("two")]);
+        assert_eq!(select_text(&mut state, (0, 0), (2, 3)), "one\n\ntwo");
+    }
+
+    #[test]
+    fn selection_range_for_line_covers_middle_lines_fully() {
+        let mut state = make_state_with_lines(vec![
+            text_line("aaaa"),
+            text_line("bbbb"),
+            text_line("cccc"),
+        ]);
+        state.selection = Some(finished_selection((0, 2), (2, 1)));
+        assert_eq!(state.selection_range_for_line(0), Some((2, 4)));
+        assert_eq!(state.selection_range_for_line(1), Some((0, 4)));
+        assert_eq!(state.selection_range_for_line(2), Some((0, 1)));
+    }
+
+    #[test]
+    fn selection_range_for_line_none_outside_selection() {
+        let mut state = make_state_with_lines(vec![text_line("aaaa"), text_line("bbbb")]);
+        state.selection = Some(finished_selection((1, 0), (1, 2)));
+        assert_eq!(state.selection_range_for_line(0), None);
+        assert_eq!(state.selection_range_for_line(1), Some((0, 2)));
+    }
+
+    #[test]
+    fn selection_fills_line_only_for_non_final_lines() {
+        let mut state = make_state_with_lines(vec![
+            text_line("aaaa"),
+            text_line("bbbb"),
+            text_line("cccc"),
+        ]);
+        state.selection = Some(finished_selection((0, 1), (2, 2)));
+        assert!(state.selection_fills_line(0));
+        assert!(state.selection_fills_line(1));
+        // The last line ends mid-way, so its fill must not be highlighted.
+        assert!(!state.selection_fills_line(2));
+    }
+
+    #[test]
+    fn selection_pos_at_maps_column_past_gutter() {
+        let state = make_state_with_lines(vec![text_line("hello")]);
+        assert_eq!(state.selection_pos_at(1, 2), Some((0, 0)));
+        assert_eq!(state.selection_pos_at(1, 2 + 3), Some((0, 3)));
+        // Chrome rows start no selection.
+        assert_eq!(state.selection_pos_at(0, 2), None);
+        assert_eq!(state.selection_pos_at(9, 2), None);
+    }
+
+    #[test]
+    fn selection_pos_clamped_pins_to_last_line() {
+        let state = make_state_with_lines(vec![text_line("ab"), text_line("cd")]);
+        // Row 9 is past the document; dragging there clamps to the last line.
+        assert_eq!(state.selection_pos_clamped(9, 2), Some((1, 0)));
+        // Row 0 is the title bar; dragging up clamps to the first visible line.
+        assert_eq!(state.selection_pos_clamped(0, 2), Some((0, 0)));
+    }
+
+    #[test]
+    fn selection_pos_clamped_none_for_empty_document() {
+        let state = make_state_with_lines(vec![]);
+        assert_eq!(state.selection_pos_clamped(1, 2), None);
+    }
+
+    #[test]
+    fn apply_selection_highlight_restyles_only_selected_range() {
+        let theme = crate::theme::Theme::dark();
+        let spans = vec![span("hello world", None)];
+        let out = apply_selection_highlight(&spans, (0, 5), &theme);
+        let rendered: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(rendered, "hello world");
+        // "hello" is highlighted, " world" is not.
+        assert_eq!(out[0].text, "hello");
+        assert_eq!(out[0].style.bg, Some(theme.selection_bg));
+        assert_eq!(out[1].text, " world");
+        assert_eq!(out[1].style.bg, None);
+    }
+
+    #[test]
+    fn apply_selection_highlight_preserves_text_across_span_boundaries() {
+        let theme = crate::theme::Theme::dark();
+        let spans = vec![span("abc", None), span("def", None)];
+        let out = apply_selection_highlight(&spans, (2, 4), &theme);
+        let rendered: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(rendered, "abcdef");
+        // Exactly chars 2 and 3 ("c" and "d") are highlighted.
+        let highlighted: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(theme.selection_bg))
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(highlighted, "cd");
+    }
+
+    // ── Mouse event wiring (click vs. drag) ─────────────────────────────────
+
+    fn mouse(kind: MouseEventKind, row: u16, column: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    fn press(row: u16, column: u16) -> Event {
+        mouse(MouseEventKind::Down(MouseButton::Left), row, column)
+    }
+
+    fn drag_to(row: u16, column: u16) -> Event {
+        mouse(MouseEventKind::Drag(MouseButton::Left), row, column)
+    }
+
+    fn release(row: u16, column: u16) -> Event {
+        mouse(MouseEventKind::Up(MouseButton::Left), row, column)
+    }
+
+    /// State holding one task-item line whose `[ ]` sits at byte offset 2 of
+    /// `content`, with an empty file path so toggling mutates `content` only.
+    fn make_task_state() -> ViewerState {
+        let mut state = make_state_with_lines(vec![Line {
+            spans: vec![span("☐ do the thing", None)],
+            meta: LineMeta::TaskItem {
+                list_id: 0,
+                checked: false,
+                bracket_offset: 2,
+            },
+        }]);
+        state.content = "- [ ] do the thing".to_string();
+        state.files = vec![String::new()];
+        state
+    }
+
+    #[test]
+    fn mouse_down_starts_an_empty_selection() {
+        let mut state = make_state_with_lines(vec![text_line("hello world")]);
+        handle_event(&mut state, press(1, 2));
+        let sel = state
+            .selection
+            .expect("mouse-down should start a selection");
+        assert_eq!(sel.anchor, (0, 0));
+        assert_eq!(sel.cursor, sel.anchor, "a press alone selects nothing");
+        assert_eq!(
+            sel.anchor_col, 2,
+            "the press column is kept for click replay"
+        );
+        assert!(sel.dragging);
+        assert!(!sel.moved);
+    }
+
+    #[test]
+    fn mouse_down_on_chrome_starts_no_selection() {
+        let mut state = make_state_with_lines(vec![text_line("hello")]);
+        handle_event(&mut state, press(0, 2)); // row 0 is the title bar
+        assert!(state.selection.is_none());
+    }
+
+    #[test]
+    fn mouse_drag_extends_the_selection() {
+        let mut state = make_state_with_lines(vec![text_line("hello world")]);
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(1, 2 + 5));
+        let sel = state.selection.expect("selection should survive the drag");
+        assert_eq!(sel.anchor, (0, 0));
+        assert_eq!(sel.cursor, (0, 5));
+        assert!(sel.moved);
+        assert_eq!(state.selection_text(), "hello");
+    }
+
+    #[test]
+    fn click_leaves_no_selection_behind() {
+        // A plain line has no copyable metadata, so the click path is a no-op —
+        // which keeps this test free of clipboard side effects.
+        let mut state = make_state_with_lines(vec![text_line("hello world")]);
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, release(1, 2));
+        assert!(state.selection.is_none());
+    }
+
+    #[test]
+    fn click_on_task_item_still_toggles_it() {
+        // Guards the press-to-release move: the click action must survive it.
+        let mut state = make_task_state();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, release(1, 2));
+        assert_eq!(state.content, "- [x] do the thing");
+    }
+
+    #[test]
+    fn press_and_release_on_different_rows_is_a_drag_not_a_click() {
+        // The task line is row 1; releasing on row 2 means a drag happened, so
+        // the checkbox must not toggle.
+        let mut state = make_task_state();
+        state.wrapped.push(text_line("second line"));
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(2, 2 + 3));
+        let sel = state.selection.expect("drag should hold a selection");
+        assert!(
+            sel.moved,
+            "a cross-row drag must latch `moved` so the release handler copies \
+             instead of toggling"
+        );
+        assert_eq!(state.content, "- [ ] do the thing", "drag must not toggle");
+    }
+
+    #[test]
+    fn drag_over_task_item_copies_and_does_not_toggle() {
+        let mut state = make_task_state();
+        state.wrapped.push(text_line("second line"));
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(2, 2 + 3));
+        handle_event(&mut state, release(2, 2 + 3));
+        assert_eq!(
+            state.content, "- [ ] do the thing",
+            "dragging across a task item must never toggle its checkbox"
+        );
+        assert!(
+            state.selection.is_some(),
+            "selection stays visible after copy as confirmation"
+        );
+        assert_eq!(
+            last_copied().as_deref(),
+            Some("☐ do the thing\nsec"),
+            "the drag copies the swept range"
+        );
+    }
+
+    // ── Click vs. drag: threshold and staleness ─────────────────────────────
+
+    #[test]
+    fn one_cell_of_jitter_is_still_a_click() {
+        // Mouse reporting is cell-granular, so a shaky click on a code block
+        // used to copy a single character instead of running the click action.
+        let mut state = make_task_state();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(1, 3));
+        let sel = state
+            .selection
+            .expect("selection survives sub-threshold drag");
+        assert!(!sel.moved, "one cell must not count as a drag");
+        assert_eq!(
+            sel.cursor, sel.anchor,
+            "the cursor stays pinned, so no stray one-cell highlight is painted"
+        );
+        handle_event(&mut state, release(1, 3));
+        assert_eq!(
+            state.content, "- [x] do the thing",
+            "a jittery click must still toggle"
+        );
+    }
+
+    #[test]
+    fn two_cells_of_travel_is_a_drag() {
+        let mut state = make_task_state();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(1, 4));
+        let sel = state.selection.expect("selection should exist");
+        assert!(sel.moved, "clearing a full cell counts as a drag");
+        assert_eq!(sel.cursor, (0, 2));
+    }
+
+    #[test]
+    fn drag_returning_to_the_anchor_does_not_dispatch_a_click() {
+        // `moved` latches, so a wandering drag cannot decay back into a click
+        // that would toggle the checkbox and write the file.
+        let mut state = make_task_state();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(1, 2 + 6));
+        handle_event(&mut state, drag_to(1, 2));
+        handle_event(&mut state, release(1, 2));
+        assert_eq!(
+            state.content, "- [ ] do the thing",
+            "a drag that ends where it started is still a drag"
+        );
+        assert!(
+            state.selection.is_none(),
+            "an empty drag drops the highlight rather than implying a copy"
+        );
+    }
+
+    #[test]
+    fn click_dispatches_against_the_press_line_not_the_release_row() {
+        // Wheel-scrolling between press and release moves the document under a
+        // stationary pointer. Dispatching from the release row would toggle a
+        // checkbox on a line the user never clicked — and write it to disk.
+        let mut state = make_task_state();
+        for i in 0..40 {
+            state.wrapped.push(text_line(&format!("filler {i}")));
+        }
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, mouse(MouseEventKind::ScrollDown, 1, 2));
+        assert_eq!(state.offset, 3, "the wheel scrolled the document");
+        assert_eq!(
+            state.line_idx_at_row(1),
+            Some(3),
+            "row 1 now resolves to a different line than the press did"
+        );
+        handle_event(&mut state, release(1, 2));
+        assert_eq!(
+            state.content, "- [x] do the thing",
+            "the click lands on the pressed line, not whatever scrolled under it"
+        );
+    }
+
+    #[test]
+    fn click_in_the_gutter_does_not_open_a_link() {
+        // The gutter rule is part of the click dispatch, so it has to survive
+        // being replayed from the anchor rather than the release event.
+        let state = make_state_with_lines(vec![line(vec![span("go", Some("https://x.com"))])]);
+        assert_eq!(state.link_at_line_col(0, 2), Some("https://x.com"));
+        assert_eq!(state.link_at_line_col(0, 1), None);
+        assert_eq!(state.link_at_line_col(0, 0), None);
+    }
+
+    // ── Drag autoscroll ─────────────────────────────────────────────────────
+
+    fn make_long_state() -> ViewerState {
+        // rows = 24 in the test helper, so viewport() == 22.
+        make_state_with_lines((0..40).map(|i| text_line(&format!("line {i}"))).collect())
+    }
+
+    #[test]
+    fn drag_at_bottom_edge_arms_downward_autoscroll() {
+        let mut state = make_long_state();
+        let viewport = state.viewport();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport as u16, 2));
+        assert_eq!(state.drag_autoscroll, 1);
+    }
+
+    #[test]
+    fn drag_in_middle_disarms_autoscroll() {
+        let mut state = make_long_state();
+        let viewport = state.viewport();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport as u16, 2));
+        handle_event(&mut state, drag_to(5, 2));
+        assert_eq!(state.drag_autoscroll, 0);
+    }
+
+    #[test]
+    fn release_disarms_autoscroll() {
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        // Press and release on the same cell so the gesture stays a click: that
+        // keeps this test off the clipboard path while still arming autoscroll,
+        // which the drag handler does from the row alone.
+        handle_event(&mut state, press(viewport, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        assert_eq!(state.drag_autoscroll, 1, "edge drag arms autoscroll");
+        handle_event(&mut state, release(viewport, 2));
+        assert_eq!(state.drag_autoscroll, 0);
+    }
+
+    #[test]
+    fn autoscroll_step_advances_offset_and_extends_selection() {
+        let mut state = make_long_state();
+        let viewport = state.viewport();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport as u16, 2));
+        let before = state.selection.unwrap().cursor;
+        assert!(state.step_drag_autoscroll());
+        assert_eq!(state.offset, 1);
+        let after = state.selection.unwrap().cursor;
+        assert!(after > before, "autoscroll should extend the selection");
+    }
+
+    #[test]
+    fn autoscroll_step_stops_at_document_end() {
+        let mut state = make_long_state();
+        let viewport = state.viewport();
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport as u16, 2));
+        state.offset = state.max_offset();
+        assert!(
+            !state.step_drag_autoscroll(),
+            "must report no movement at the end of the document"
+        );
+        assert_eq!(state.offset, state.max_offset());
+        // Disarming matters as much as not moving: the event loop pins its poll
+        // timeout to the autoscroll cadence while this is non-zero, so a
+        // mouse-up we never received would spin it forever.
+        assert_eq!(
+            state.drag_autoscroll, 0,
+            "must disarm once there is nothing left to scroll"
+        );
+    }
+
+    #[test]
+    fn autoscroll_step_is_inert_without_an_active_drag() {
+        let mut state = make_long_state();
+        state.drag_autoscroll = 1;
+        // No selection at all.
+        assert!(!state.step_drag_autoscroll());
+        // A selection whose drag already ended.
+        state.selection = Some(finished_selection((0, 0), (1, 0)));
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn drag_at_top_edge_arms_upward_autoscroll() {
+        let mut state = make_long_state();
+        state.offset = 10;
+        handle_event(&mut state, press(5, 2));
+        handle_event(&mut state, drag_to(1, 2));
+        assert_eq!(state.drag_autoscroll, -1);
+        assert!(state.step_drag_autoscroll());
+        assert_eq!(state.offset, 9);
+    }
+
+    #[test]
+    fn autoscroll_step_stops_at_document_start() {
+        let mut state = make_long_state();
+        state.offset = 1;
+        handle_event(&mut state, press(5, 2));
+        handle_event(&mut state, drag_to(1, 2));
+        assert!(state.step_drag_autoscroll());
+        assert_eq!(state.offset, 0);
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(
+            state.drag_autoscroll, 0,
+            "must disarm at the top as well as the bottom"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_toggle_disarms_autoscroll() {
+        // `m` drops mouse capture, so the Up that would normally disarm
+        // autoscroll never arrives. Left armed, the event loop would poll at the
+        // 40 ms autoscroll cadence for the rest of the session.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        assert_eq!(state.drag_autoscroll, 1);
+
+        handle_normal(&mut state, KeyCode::Char('m'), KeyModifiers::empty());
+        assert!(state.selection.is_none());
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(
+            state.drag_autoscroll, 0,
+            "the step that finds no live drag must disarm, not just decline to scroll"
+        );
+    }
+
+    #[test]
+    fn relayout_during_a_drag_disarms_autoscroll() {
+        // Same invariant, reached the other way: an image landing mid-drag
+        // clears the selection out from under the autoscroll timer.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        state.finalize_layout();
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.drag_autoscroll, 0);
+    }
+
+    #[test]
+    fn slide_mode_disarms_autoscroll() {
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        state.slide_mode = true;
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.drag_autoscroll, 0);
+        assert_eq!(state.offset, 0, "slide mode owns its own position");
+    }
+
+    #[test]
+    fn opening_an_overlay_mid_drag_cancels_the_selection() {
+        // Down/Drag/Up are all gated on Normal mode, so an overlay opened while
+        // the button is held swallows the release. Left alone that strands a
+        // `dragging` selection and leaves autoscroll running on its 40 ms timer
+        // until it runs out of document.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        assert_eq!(state.drag_autoscroll, 1, "edge drag arms autoscroll");
+
+        handle_normal(&mut state, KeyCode::Char('/'), KeyModifiers::empty());
+        assert_eq!(state.mode, ViewMode::Search);
+        assert!(
+            state.selection.is_none(),
+            "the drag must not outlive Normal"
+        );
+        assert_eq!(state.drag_autoscroll, 0);
+
+        // The release now falls through the mode guard entirely, so nothing
+        // downstream gets a chance to clean up after it.
+        handle_event(&mut state, release(viewport, 2));
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.offset, 0, "the document must not scroll under search");
+    }
+
+    #[test]
+    fn stale_drag_does_not_survive_a_mode_round_trip() {
+        // Returning to Normal must not restore a selection that never saw its
+        // mouse-up: `Moved` bails while `dragging` is set, so the hover cursor
+        // would stay dead until the next click.
+        let mut state = make_long_state();
+        handle_event(&mut state, press(1, 2));
+        handle_normal(&mut state, KeyCode::Char('/'), KeyModifiers::empty());
+        handle_event(&mut state, release(1, 2));
+        handle_search(&mut state, KeyCode::Esc);
+        assert_eq!(state.mode, ViewMode::Normal);
+        assert!(state.selection.is_none_or(|s| !s.dragging));
+    }
+
+    #[test]
+    fn autoscroll_step_disarms_outside_normal_mode() {
+        // The guard stands on its own, independent of `set_mode` clearing the
+        // selection — this is the timer the event loop keeps waking up for.
+        let mut state = make_long_state();
+        let viewport = state.viewport() as u16;
+        handle_event(&mut state, press(1, 2));
+        handle_event(&mut state, drag_to(viewport, 2));
+        state.mode = ViewMode::Toc;
+        assert!(!state.step_drag_autoscroll());
+        assert_eq!(state.drag_autoscroll, 0);
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn set_mode_keeps_a_finished_selection_when_returning_to_normal() {
+        // Only the way *out* of Normal cancels: a completed selection stays
+        // visible as confirmation of what was copied.
+        let mut state = make_state_with_lines(vec![text_line("hello")]);
+        state.selection = Some(finished_selection((0, 0), (0, 5)));
+        state.set_mode(ViewMode::Normal);
+        assert!(state.selection.is_some());
+    }
+
+    #[test]
+    fn selection_pos_clamped_respects_the_slide_window() {
+        // Slide 0 covers lines 0..5, so a drag past its end pins to line 4
+        // rather than running on into the next slide.
+        let state = make_slide_state(0);
+        assert_eq!(state.selection_pos_clamped(1, 2), Some((0, 0)));
+        assert_eq!(state.selection_pos_clamped(9, 2), Some((4, 0)));
+    }
+
+    #[test]
+    fn selection_cleared_by_relayout() {
+        let mut state = make_state_with_lines(vec![text_line("hello")]);
+        state.selection = Some(Selection::new((0, 0), 2));
+        state.finalize_layout();
+        assert!(
+            state.selection.is_none(),
+            "relayout must drop stale line indices"
+        );
     }
 }

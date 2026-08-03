@@ -100,11 +100,13 @@ mdterm README.md | less -R
 | `f` | Link picker (open URLs / follow local links) |
 | `t` | Toggle dark/light theme |
 | `l` | Toggle line numbers in code blocks |
+| Drag | Select text; copies to clipboard on release |
 | Click heading | Copy heading section to clipboard |
 | Click list | Copy entire list to clipboard |
 | Click code block | Copy code block to clipboard |
 | `Y` | Copy entire document to clipboard |
 | `c` | Copy nearest code block to clipboard |
+| `m` | Toggle mouse capture (hand the mouse back to the terminal) |
 | `Tab` / `Shift+Tab` | Switch between files |
 | `h` / `?` / `F1` | Help screen |
 | `q` / `Ctrl+C` | Quit |

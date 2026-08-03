@@ -60,6 +60,11 @@ pub struct Theme {
     pub search_current_fg: Color,
     pub search_no_match: Color,
 
+    // Mouse selection (blue-family, so a search hit inside a selection stays legible
+    // against the amber search colors above)
+    pub selection_bg: Color,
+    pub selection_fg: Color,
+
     // Overlays (TOC, link picker, fuzzy search)
     pub overlay_bg: Color,
     pub overlay_border: Color,
@@ -283,6 +288,17 @@ impl Theme {
                 r: 243,
                 g: 139,
                 b: 168,
+            },
+
+            selection_bg: Color::Rgb {
+                r: 54,
+                g: 78,
+                b: 126,
+            },
+            selection_fg: Color::Rgb {
+                r: 205,
+                g: 214,
+                b: 244,
             },
 
             overlay_bg: Color::Rgb {
@@ -569,6 +585,17 @@ impl Theme {
                 r: 210,
                 g: 15,
                 b: 57,
+            },
+
+            selection_bg: Color::Rgb {
+                r: 179,
+                g: 202,
+                b: 245,
+            },
+            selection_fg: Color::Rgb {
+                r: 76,
+                g: 79,
+                b: 105,
             },
 
             overlay_bg: Color::Rgb {

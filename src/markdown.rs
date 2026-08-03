@@ -194,7 +194,7 @@ impl<'a> Renderer<'a> {
                     text: BLOCKQUOTE_PREFIX.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 });
             }
@@ -215,7 +215,7 @@ impl<'a> Renderer<'a> {
                     text: BLOCKQUOTE_PREFIX_TRIMMED.to_string(),
                     style: Style {
                         fg: Some(self.theme.blockquote_bar),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 }],
                 meta: LineMeta::None,
@@ -302,7 +302,7 @@ impl<'a> Renderer<'a> {
             text: "  ╭─".to_string(),
             style: Style {
                 fg: Some(border_fg),
-                ..Default::default()
+                ..Style::frame()
             },
         }];
         if !label.is_empty() {
@@ -310,7 +310,7 @@ impl<'a> Renderer<'a> {
                 text: label,
                 style: Style {
                     fg: Some(label_fg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             });
         }
@@ -318,7 +318,7 @@ impl<'a> Renderer<'a> {
             text: format!("{}╮", "─".repeat(dashes_after)),
             style: Style {
                 fg: Some(border_fg),
-                ..Default::default()
+                ..Style::frame()
             },
         });
         self.lines.push(Line {
@@ -333,14 +333,14 @@ impl<'a> Renderer<'a> {
                     text: "  │".to_string(),
                     style: Style {
                         fg: Some(border_fg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
                 StyledSpan {
                     text: " ".to_string(),
                     style: Style {
                         bg: Some(code_bg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
             ];
@@ -355,11 +355,12 @@ impl<'a> Renderer<'a> {
                     style: Style {
                         fg: Some(self.theme.line_number),
                         bg: Some(code_bg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 });
             }
 
+            let mut has_content = false;
             if let Ok(ranges) = highlighter.highlight_line(line_str, self.syntax_set) {
                 for (syn_style, text) in ranges {
                     let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
@@ -371,6 +372,7 @@ impl<'a> Renderer<'a> {
                             text: trimmed.to_string(),
                             style,
                         });
+                        has_content = true;
                     }
                 }
             } else {
@@ -383,6 +385,10 @@ impl<'a> Renderer<'a> {
                         ..Default::default()
                     },
                 });
+                has_content = true;
+            }
+            if !has_content {
+                spans.push(empty_code_content(code_bg));
             }
 
             let padding = content_width.saturating_sub(char_count) + 1;
@@ -390,14 +396,14 @@ impl<'a> Renderer<'a> {
                 text: " ".repeat(padding),
                 style: Style {
                     bg: Some(code_bg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             });
             spans.push(StyledSpan {
                 text: "│".to_string(),
                 style: Style {
                     fg: Some(border_fg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             });
 
@@ -413,7 +419,7 @@ impl<'a> Renderer<'a> {
                 text: format!("  ╰{}╯", "─".repeat(inner_width)),
                 style: Style {
                     fg: Some(border_fg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             }],
             meta: LineMeta::CodeContent { block_id },
@@ -443,21 +449,21 @@ impl<'a> Renderer<'a> {
                     text: "  ╭─".to_string(),
                     style: Style {
                         fg: Some(border_fg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
                 StyledSpan {
                     text: label.to_string(),
                     style: Style {
                         fg: Some(label_fg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
                 StyledSpan {
                     text: format!("{}╮", "─".repeat(dashes_after)),
                     style: Style {
                         fg: Some(border_fg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
             ],
@@ -471,14 +477,14 @@ impl<'a> Renderer<'a> {
                     text: "  │".to_string(),
                     style: Style {
                         fg: Some(border_fg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
                 StyledSpan {
                     text: " ".to_string(),
                     style: Style {
                         bg: Some(code_bg),
-                        ..Default::default()
+                        ..Style::frame()
                     },
                 },
             ];
@@ -487,21 +493,25 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.text.as_str()))
                 .sum();
-            spans.extend(row_spans.iter().cloned());
+            if row_spans.is_empty() {
+                spans.push(empty_code_content(code_bg));
+            } else {
+                spans.extend(row_spans.iter().cloned());
+            }
 
             let padding = content_width.saturating_sub(row_width) + 1;
             spans.push(StyledSpan {
                 text: " ".repeat(padding),
                 style: Style {
                     bg: Some(code_bg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             });
             spans.push(StyledSpan {
                 text: "│".to_string(),
                 style: Style {
                     fg: Some(border_fg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             });
 
@@ -517,7 +527,7 @@ impl<'a> Renderer<'a> {
                 text: format!("  ╰{}╯", "─".repeat(inner_width)),
                 style: Style {
                     fg: Some(border_fg),
-                    ..Default::default()
+                    ..Style::frame()
                 },
             }],
             meta: LineMeta::CodeContent { block_id },
@@ -587,9 +597,12 @@ impl<'a> Renderer<'a> {
             *w = (*w).max(3);
         }
 
+        // Frame, not content: the rules and column separators are stripped from
+        // copied text. Cell padding deliberately stays content so a pasted table
+        // keeps its column alignment instead of collapsing to "ab".
         let border_style = Style {
             fg: Some(border_fg),
-            ..Default::default()
+            ..Style::frame()
         };
 
         let make_rule = |left: &str, mid: &str, right: &str, widths: &[usize]| -> Line {
@@ -717,10 +730,14 @@ impl<'a> Renderer<'a> {
                         self.lines.push(Line {
                             spans: vec![StyledSpan {
                                 text: "─".repeat(self.width.min(60)),
+                                // Invented by the renderer — there is no rule in
+                                // the source, so it must not reach the clipboard.
+                                // `Event::Rule` below is the opposite case: that
+                                // one is a real `---` and stays content.
                                 style: Style {
                                     fg: Some(self.theme.heading_separator),
                                     dim: true,
-                                    ..Default::default()
+                                    ..Style::frame()
                                 },
                             }],
                             meta: LineMeta::None,
@@ -1287,6 +1304,23 @@ fn wrap_cell(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
     }
 
     lines
+}
+
+/// A zero-width content span for a code-block row that has no text of its own.
+///
+/// A blank line inside a fenced block produces no highlighted spans, which would
+/// leave the row built entirely from `Style::frame()` — indistinguishable from
+/// the block's top and bottom borders, so a copied selection would drop the
+/// blank line rather than preserve it. This marks the row as content without
+/// drawing anything or contributing a character to the copy.
+fn empty_code_content(code_bg: Color) -> StyledSpan {
+    StyledSpan {
+        text: String::new(),
+        style: Style {
+            bg: Some(code_bg),
+            ..Default::default()
+        },
+    }
 }
 
 fn syntect_to_style(syn: SynStyle) -> Style {
