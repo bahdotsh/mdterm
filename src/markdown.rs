@@ -943,8 +943,11 @@ impl<'a> Renderer<'a> {
                 // Hidden images emit nothing at all — no placeholder rows and no
                 // caption. viewer.rs queues downloads by scanning for
                 // LineMeta::Image lines, so emitting none also means nothing is
-                // ever fetched.
-                if self.hide.images {
+                // ever fetched. Also suppressed: an image nested inside a link's
+                // label when `images_in_links` is set — e.g. a decorative icon
+                // prefixing a link, which would otherwise break the link's line
+                // into a text line + an image block + a caption line.
+                if self.hide.images || (self.hide.images_in_links && self.in_link) {
                     self.image_alt.clear();
                     self.image_url.clear();
                     self.in_image = false;
@@ -1838,6 +1841,7 @@ mod tests {
             images: false,
             frontmatter: false,
             code_languages: langs.iter().map(|s| s.to_string()).collect(),
+            images_in_links: false,
         }
     }
 
@@ -1846,6 +1850,7 @@ mod tests {
             images: true,
             frontmatter: false,
             code_languages: Vec::new(),
+            images_in_links: false,
         }
     }
 
@@ -1854,6 +1859,7 @@ mod tests {
             images: false,
             frontmatter: true,
             code_languages: Vec::new(),
+            images_in_links: false,
         }
     }
 
@@ -1938,6 +1944,74 @@ mod tests {
             text.contains("before") && text.contains("after"),
             "surrounding content should survive: {text}"
         );
+    }
+
+    fn hide_images_in_links() -> HideConfig {
+        HideConfig {
+            images: false,
+            frontmatter: false,
+            code_languages: Vec::new(),
+            images_in_links: true,
+        }
+    }
+
+    #[test]
+    fn image_nested_in_link_is_suppressed_when_flag_set() {
+        let input = "[Label ![icon](attachments/icon.png)](https://example.com)";
+        let (lines, _) = render_hiding(input, &hide_images_in_links());
+        let text = all_text(&lines);
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "no placeholder lines should be emitted for an image nested in a link"
+        );
+        assert!(
+            text.contains("Label"),
+            "the link's surrounding text should still render: {text}"
+        );
+    }
+
+    #[test]
+    fn image_nested_in_link_renders_normally_when_flag_unset() {
+        let input = "[Label ![icon](attachments/icon.png)](https://example.com)";
+        let (lines, _) = render_test(input);
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "with the flag off (default), the nested image should render as a block"
+        );
+    }
+
+    #[test]
+    fn standalone_image_is_not_suppressed_by_images_in_links_flag() {
+        let input = "before\n\n![alt text](http://example.com/img.png)\n\nafter";
+        let (lines, _) = render_hiding(input, &hide_images_in_links());
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "a standalone (non-link-nested) image must not be suppressed by images_in_links"
+        );
+    }
+
+    #[test]
+    fn wikilink_embed_nested_in_link_is_also_suppressed_when_flag_set() {
+        let input = "[Label ![[icon.png]]](https://example.com)";
+        let (lines, _) = render_hiding(input, &hide_images_in_links());
+        let text = all_text(&lines);
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "a wikilink embed nested in a link should be suppressed the same as a plain image"
+        );
+        assert!(text.contains("Label"));
     }
 
     #[test]

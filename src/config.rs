@@ -63,6 +63,13 @@ pub struct HideConfig {
     /// Fenced code block languages to omit entirely, e.g. `dataviewjs`.
     #[serde(default)]
     pub code_languages: Vec<String>,
+    /// Images nested inside a link's label (e.g. an icon prefixing a link,
+    /// `[Label ![icon](path)](url)`) render as a block that breaks the
+    /// link's line. Off by default — existing vaults that intentionally
+    /// embed a real image inside a link (e.g. a clickable thumbnail) keep
+    /// today's behavior unless they opt in.
+    #[serde(default)]
+    pub images_in_links: bool,
 }
 
 impl HideConfig {
@@ -158,6 +165,7 @@ mod tests {
             images: false,
             frontmatter: false,
             code_languages: langs.iter().map(|s| s.to_string()).collect(),
+            images_in_links: false,
         }
     }
 
