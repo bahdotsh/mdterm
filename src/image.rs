@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -2106,6 +2107,52 @@ fn downscale(img: DynamicImage, max_dim: u32) -> DynamicImage {
     img.resize(new_w, new_h, FilterType::Lanczos3)
 }
 
+/// Resolve a locally-declared image reference to a file that exists on
+/// disk, relative to `base_dir` — the directory of the markdown file that
+/// declared it, not the process's working directory.
+///
+/// `target` must already have any `mdembed:` prefix stripped by the
+/// caller; `is_embed` records whether it came from a wikilink `![[embed]]`
+/// (as opposed to a plain CommonMark `![](path)`), since only embeds fall
+/// back to the `attachments_dir` folder for a bare filename with no
+/// subpath — mirroring Obsidian's own default-attachment-folder behavior.
+///
+/// Returns `None` if `target` is an absolute path or contains a `..`
+/// component (both rejected to prevent a markdown file from reading
+/// arbitrary local files), or if the file doesn't exist at either
+/// candidate location.
+fn resolve_local_image_path(
+    target: &str,
+    base_dir: &Path,
+    attachments_dir: &str,
+    is_embed: bool,
+) -> Option<PathBuf> {
+    let path = Path::new(target);
+    if path.is_absolute() {
+        return None;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+
+    let direct = base_dir.join(path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    if is_embed && path.components().count() == 1 {
+        let via_attachments = base_dir.join(attachments_dir).join(path);
+        if via_attachments.is_file() {
+            return Some(via_attachments);
+        }
+    }
+
+    None
+}
+
 fn fetch_image(url: &str) -> Option<DynamicImage> {
     if url.starts_with("http://") || url.starts_with("https://") {
         fetch_image_http(url)
@@ -3266,6 +3313,116 @@ mod tests {
                 "control byte 0x{b:02x} should be rejected"
             );
         }
+    }
+
+    // ── resolve_local_image_path ────────────────────────────────────────
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn resolve_local_image_path_finds_file_relative_to_base_dir() {
+        let root = temp_root("mdterm-image-basedir");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("photo.png"), b"fake").unwrap();
+
+        let resolved = resolve_local_image_path("photo.png", &root, "attachments", false);
+        assert_eq!(resolved, Some(root.join("photo.png")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_embed_falls_back_to_attachments_dir() {
+        let root = temp_root("mdterm-image-attachfallback");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        std::fs::write(root.join("attachments").join("photo.png"), b"fake").unwrap();
+
+        let resolved = resolve_local_image_path("photo.png", &root, "attachments", true);
+        assert_eq!(resolved, Some(root.join("attachments").join("photo.png")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_plain_image_does_not_use_attachments_fallback() {
+        let root = temp_root("mdterm-image-noattachfallback");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        std::fs::write(root.join("attachments").join("photo.png"), b"fake").unwrap();
+
+        // is_embed = false: a bare filename must NOT fall back to attachments/.
+        let resolved = resolve_local_image_path("photo.png", &root, "attachments", false);
+        assert_eq!(resolved, None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_explicit_subpath_does_not_need_fallback() {
+        let root = temp_root("mdterm-image-subpath");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        std::fs::write(root.join("attachments").join("photo.png"), b"fake").unwrap();
+
+        let resolved =
+            resolve_local_image_path("attachments/photo.png", &root, "attachments", true);
+        assert_eq!(resolved, Some(root.join("attachments").join("photo.png")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_rejects_absolute_target() {
+        let root = temp_root("mdterm-image-rejectabs");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        let abs = "/etc/passwd";
+        #[cfg(windows)]
+        let abs = "C:\\Windows\\win.ini";
+        assert_eq!(
+            resolve_local_image_path(abs, &root, "attachments", true),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_rejects_parent_dir_traversal() {
+        let root = temp_root("mdterm-image-rejectdotdot");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            resolve_local_image_path("../secret.png", &root, "attachments", true),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_local_image_path_missing_file_returns_none() {
+        let root = temp_root("mdterm-image-missing");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            resolve_local_image_path("nope.png", &root, "attachments", true),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_local_image_path_treats_backslash_subpath_as_not_bare() {
+        let root = temp_root("mdterm-image-winsep");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        // A target with an explicit subpath (using the platform separator)
+        // must NOT be treated as a bare filename, so no attachments-folder
+        // fallback is attempted for it.
+        let resolved = resolve_local_image_path("sub\\photo.png", &root, "attachments", true);
+        assert_eq!(resolved, None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // ── env save/restore helpers (used by Terminology detection tests) ─────────
