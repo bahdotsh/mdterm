@@ -14,6 +14,12 @@ pub struct Config {
     pub hide: HideConfig,
     #[serde(default)]
     pub picker: PickerConfig,
+    /// Fallback folder (relative to the current file's own directory) checked
+    /// for a bare-filename wikilink embed (`![[photo.png]]`) that isn't found
+    /// directly next to the file — mirrors Obsidian's own default attachment
+    /// folder. Plain CommonMark images never use this fallback.
+    #[serde(default = "default_attachments_dir")]
+    pub attachments_dir: String,
 }
 
 /// Which files the file picker will offer.
@@ -77,6 +83,10 @@ fn default_theme() -> String {
     "dark".to_string()
 }
 
+fn default_attachments_dir() -> String {
+    "attachments".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -85,6 +95,7 @@ impl Default for Config {
             width: 0,
             hide: HideConfig::default(),
             picker: PickerConfig::default(),
+            attachments_dir: default_attachments_dir(),
         }
     }
 }
@@ -225,5 +236,16 @@ mod tests {
         let cfg = PickerConfig::default();
         assert!(!cfg.skips("notes"));
         assert!(!cfg.skips("README.md"));
+    }
+
+    #[test]
+    fn default_attachments_dir_is_attachments() {
+        assert_eq!(Config::default().attachments_dir, "attachments");
+    }
+
+    #[test]
+    fn attachments_dir_deserializes_from_toml() {
+        let cfg: Config = toml::from_str("attachments_dir = \"assets\"").unwrap();
+        assert_eq!(cfg.attachments_dir, "assets");
     }
 }
