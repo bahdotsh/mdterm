@@ -942,7 +942,19 @@ impl ImageCache {
     /// references are resolved relative to this directory. Call on every
     /// rebuild so switching files takes effect.
     pub fn set_base_dir(&mut self, dir: PathBuf) {
+        if dir == self.base_dir {
+            return;
+        }
         self.base_dir = dir;
+        self.images.clear();
+        self.cancel_in_flight();
+        self.kitty_images.clear();
+        self.kitty_unicode_images.clear();
+        self.iterm2_images.clear();
+        self.sixel_images.clear();
+        self.halfblock_images.clear();
+        self.delete_temp_files();
+        self.terminology_images.clear();
     }
 
     /// Set the configured "default attachment folder" name (relative to
@@ -1057,6 +1069,12 @@ impl ImageCache {
     #[cfg(test)]
     fn insert(&mut self, url: &str, img: Option<image::DynamicImage>) {
         self.images.insert(url.to_string(), img.map(Arc::new));
+    }
+
+    /// Current base directory (used in tests).
+    #[cfg(test)]
+    pub(crate) fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 
     pub fn image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
@@ -2469,6 +2487,63 @@ mod tests {
         cache.fetch_if_missing("photo.png"); // no mdembed: prefix
 
         assert!(!cache.has_image("photo.png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_base_dir_change_invalidates_cache_for_shared_filename() {
+        // Two files in different directories both reference "photo.png".
+        // Switching base_dir must not let the second file render the
+        // first file's cached image under the same cache key.
+        let root_a = temp_root("mdterm-cache-basedir-switch-a");
+        let root_b = temp_root("mdterm-cache-basedir-switch-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        image::DynamicImage::new_rgb8(4, 4)
+            .save_with_format(root_a.join("photo.png"), image::ImageFormat::Png)
+            .unwrap();
+        image::DynamicImage::new_rgb8(8, 8)
+            .save_with_format(root_b.join("photo.png"), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(root_a.clone());
+        cache.fetch_if_missing("photo.png");
+        assert_eq!(cache.image_dimensions("photo.png"), Some((4, 4)));
+
+        cache.set_base_dir(root_b.clone());
+        cache.fetch_if_missing("photo.png");
+        assert_eq!(
+            cache.image_dimensions("photo.png"),
+            Some((8, 8)),
+            "switching base_dir must invalidate the cache instead of reusing the other file's image"
+        );
+
+        std::fs::remove_dir_all(root_a).unwrap();
+        std::fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn set_base_dir_same_dir_does_not_clear_cache() {
+        // Called on every rebuild (resizes, edits to the same file) — must
+        // not defeat the cache when the directory hasn't actually changed.
+        let root = temp_root("mdterm-cache-basedir-nochange");
+        std::fs::create_dir_all(&root).unwrap();
+        image::DynamicImage::new_rgb8(4, 4)
+            .save_with_format(root.join("photo.png"), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(root.clone());
+        cache.fetch_if_missing("photo.png");
+        assert!(cache.has_image("photo.png"));
+
+        cache.set_base_dir(root.clone());
+        assert!(
+            cache.has_image("photo.png"),
+            "re-setting the same base_dir must not clear the cache"
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

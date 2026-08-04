@@ -142,18 +142,19 @@ matches Obsidian's own per-folder default when "Default location for new
 attachments" isn't pinned to one fixed vault-wide folder — the common case
 this feature is scoped to.
 
-## Known limitation (not addressed here)
+## Known limitation (fixed)
 
 The image cache (`ImageCache.images` and friends) is keyed by the raw
 declared URL string, not by a resolved absolute path. Two different open
 files that both reference the same relative string (e.g. both have an
-`attachments/photo.png`) will collide in the shared cache during a
-multi-file session. This is a pre-existing condition: today, with
-CWD-based resolution, the *same* collision opportunity already exists
-(CWD is fixed for the whole process, so two files referencing the same
-relative string already resolve to the same target). This fix does not
-make the collision worse in the general case, and namespacing the cache by
-resolved path is left out of scope.
+`attachments/photo.png`) still share a cache entry under that string. Under
+CWD-based resolution this was harmless (CWD was fixed for the whole
+process, so the same relative string always resolved to the same target),
+but under `base_dir`-based resolution it would otherwise show the wrong
+file's image after switching. `ImageCache::set_base_dir` now clears the
+fetch and render caches whenever the directory actually changes, so
+switching between files resolves each one's images fresh instead of
+reusing a stale entry.
 
 ## Testing plan
 
