@@ -124,7 +124,7 @@ fn rewrite_prose(segment: &str) -> String {
             .map(|m| m.as_str().trim())
             .filter(|s| !s.is_empty());
         let alt = label.unwrap_or(target);
-        format!("![{}](<{}>)", escape_label(alt), escape_dest(target))
+        format!("![{}](<mdembed:{}>)", escape_label(alt), escape_dest(target))
     });
 
     LINK_RE
@@ -248,13 +248,13 @@ mod tests {
     #[test]
     fn preprocess_rewrites_image_embed() {
         let out = preprocess("![[photo.png]]");
-        assert_eq!(out, "![photo.png](<photo.png>)");
+        assert_eq!(out, "![photo.png](<mdembed:photo.png>)");
     }
 
     #[test]
     fn preprocess_rewrites_image_embed_with_alt() {
         let out = preprocess("![[photo.png|A nice photo]]");
-        assert_eq!(out, "![A nice photo](<photo.png>)");
+        assert_eq!(out, "![A nice photo](<mdembed:photo.png>)");
     }
 
     #[test]
