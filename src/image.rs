@@ -1912,7 +1912,15 @@ fn pre_render_image(
         ImageProtocol::Terminology => {
             let ctx = terminology
                 .expect("pre_render_image: Terminology protocol requires a TerminologyCtx");
-            pre_render_terminology(img, ctx.url, content_width, cell_metrics, base_dir, attachments_dir).map(|ti| {
+            pre_render_terminology(
+                img,
+                ctx.url,
+                content_width,
+                cell_metrics,
+                base_dir,
+                attachments_dir,
+            )
+            .map(|ti| {
                 if ti.is_temp {
                     // Register the temp path in the shared registry *before* wrapping
                     // the result, so it is cleaned up even if the render channel is
@@ -2028,7 +2036,8 @@ fn pre_render_terminology(
     // Local file path that still exists on disk — reuse directly, no I/O needed.
     // Terminology requires an absolute path, so canonicalize before passing.
     if !is_remote
-        && let Some(resolved) = resolve_local_image_path(target, base_dir, attachments_dir, is_embed)
+        && let Some(resolved) =
+            resolve_local_image_path(target, base_dir, attachments_dir, is_embed)
         && let Ok(abs) = std::fs::canonicalize(&resolved)
     {
         // SEC: Reject if the resolved path escapes base_dir. This prevents
