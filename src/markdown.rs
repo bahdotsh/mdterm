@@ -43,6 +43,7 @@ struct Renderer<'a> {
 
     // Task list state
     source: &'a str,
+    original_source: &'a str,
     current_task_checked: Option<bool>,
     current_task_bracket_pos: Option<usize>,
 
@@ -79,8 +80,10 @@ enum ListKind {
 }
 
 impl<'a> Renderer<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source: &'a str,
+        original_source: &'a str,
         width: usize,
         theme: &'a Theme,
         line_numbers: bool,
@@ -109,6 +112,7 @@ impl<'a> Renderer<'a> {
             item_has_nested_list: false,
             list_id: 0,
             source,
+            original_source,
             current_task_checked: None,
             current_task_bracket_pos: None,
             in_table: false,
@@ -1131,9 +1135,13 @@ impl<'a> Renderer<'a> {
 
                 // Record the byte offset of `[` in the source so toggle_task
                 // can modify the file at the exact position without re-parsing.
-                let bracket_pos = self.source[source_range.clone()]
-                    .find('[')
-                    .map(|p| source_range.start + p);
+                let bracket_pos = self.source[source_range.clone()].find('[').map(|p| {
+                    map_to_original_offset(
+                        self.original_source,
+                        self.source,
+                        source_range.start + p,
+                    )
+                });
                 self.current_task_bracket_pos = bracket_pos;
                 self.current_task_checked = Some(checked);
 
@@ -1596,6 +1604,32 @@ fn strip_frontmatter(input: &str) -> &str {
     input
 }
 
+/// Maps a byte offset within the wikilink-preprocessed source back to the
+/// corresponding offset in the original (pre-preprocess) source. Wikilink
+/// rewriting changes text within a line but never merges or splits lines,
+/// so line N of `original` and line N of `preprocessed` start at the same
+/// relative position up until the first rewritten span on that line — and
+/// a task-list checkbox is always the first inline content on its line
+/// (`- [ ]` must immediately follow the bullet), so it is always to the
+/// left of anything wikilink rewriting could have touched. Mapping by
+/// (line index, intra-line offset) is therefore exact for checkbox offsets.
+fn map_to_original_offset(original: &str, preprocessed: &str, pos: usize) -> usize {
+    let mut orig_lines = original.split_inclusive('\n');
+    let mut prep_start = 0usize;
+    let mut orig_start = 0usize;
+    for prep_line in preprocessed.split_inclusive('\n') {
+        let prep_end = prep_start + prep_line.len();
+        let orig_line = orig_lines.next().unwrap_or("");
+        if pos < prep_end {
+            let intra = pos - prep_start;
+            return orig_start + intra.min(orig_line.len());
+        }
+        prep_start = prep_end;
+        orig_start += orig_line.len();
+    }
+    orig_start
+}
+
 pub fn render(
     input: &str,
     width: usize,
@@ -1624,9 +1658,13 @@ pub fn render_with(
     } else {
         input
     };
+    let original_input = input;
+    let preprocessed = crate::wikilink::preprocess(input);
+    let input: &str = preprocessed.as_ref();
 
     let mut renderer = Renderer::new(
         input,
+        original_input,
         width,
         theme,
         line_numbers,
@@ -2030,5 +2068,74 @@ mod tests {
             spans_with > spans_without,
             "line numbers should add extra spans"
         );
+    }
+
+    // ── Wikilinks ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn wikilink_produces_link_span_with_wikilink_prefix() {
+        let (lines, _) = render_test("[[getting-started|Getting Started]]");
+        let span = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| {
+                s.style
+                    .link_url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("wikilink:"))
+            })
+            .expect("expected a span with a wikilink: link_url");
+        assert_eq!(
+            span.style.link_url.as_deref(),
+            Some("wikilink:getting-started")
+        );
+        assert_eq!(span.text, "Getting Started");
+    }
+
+    #[test]
+    fn wikilink_embed_produces_image_meta() {
+        let (lines, _) = render_test("![[photo.png]]");
+        let has_image = lines
+            .iter()
+            .any(|l| matches!(l.meta, LineMeta::Image { ref url, .. } if url == "photo.png"));
+        assert!(has_image, "expected an Image line for the embedded photo");
+    }
+
+    #[test]
+    fn task_bracket_offsets_index_the_original_source_when_a_wikilink_precedes_them() {
+        // Wikilink rewriting lengthens the text ("[[note]]" → 23 bytes), so a
+        // bracket offset taken in preprocessed space would land on the *next*
+        // checkbox here and toggle the wrong line on disk.
+        let original = "[[note]]\n\n- [ ] Buy milk\n- [ ] Call bank\n";
+        let (lines, _) = render_test(original);
+
+        let offsets: Vec<usize> = lines
+            .iter()
+            .filter_map(|l| match l.meta {
+                LineMeta::TaskItem { bracket_offset, .. } => Some(bracket_offset),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            offsets.len(),
+            2,
+            "expected two task items, got {:?}",
+            offsets
+        );
+        assert_ne!(
+            offsets[0], offsets[1],
+            "the two checkboxes must map to distinct offsets"
+        );
+        for offset in &offsets {
+            assert_eq!(
+                &original[*offset..*offset + 3],
+                "[ ]",
+                "offset {} does not point at a checkbox in the original source",
+                offset
+            );
+        }
+        assert_eq!(offsets[0], original.find("[ ]").unwrap());
+        assert_eq!(offsets[1], original.rfind("[ ]").unwrap());
     }
 }

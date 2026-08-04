@@ -8,6 +8,7 @@ mod markdown;
 mod style;
 mod theme;
 mod viewer;
+mod wikilink;
 
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
