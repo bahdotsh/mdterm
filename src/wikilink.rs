@@ -1,3 +1,7 @@
+// TODO(Task 2): remove once `preprocess` gets a real caller in markdown.rs —
+// until then `cargo clippy -D warnings` flags this whole module as dead code.
+#![allow(dead_code)]
+
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
