@@ -561,6 +561,20 @@ impl ViewerState {
             .and_then(|path| path.parent().map(Path::to_path_buf))
     }
 
+    /// The root to search when resolving something by name against the
+    /// vault: the live file picker's root if one is already open (so `p`
+    /// and wikilink resolution never disagree about where the vault is),
+    /// otherwise the same cwd → current file's parent → "." fallback
+    /// chain `open_file_picker` uses to build one.
+    fn picker_search_root(&self) -> PathBuf {
+        self.file_picker
+            .as_ref()
+            .map(|p| p.root.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| self.current_file_parent())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     fn open_path_from_picker(&mut self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let target_idx = self.files.iter().position(|file| {
@@ -826,7 +840,7 @@ impl ViewerState {
                         continue;
                     }
                     self.link_entries.push(LinkEntry {
-                        url: display_link_url(url).to_string(),
+                        url: url.clone(),
                         text,
                     });
                     prev_url = Some(url.clone());
@@ -2135,7 +2149,7 @@ fn navigate_to_resolved(state: &mut ViewerState, resolved: (String, Option<Strin
             navigate_to_anchor(state, &anchor);
         }
     } else {
-        state.set_toast(format!("Failed to open: {}", url));
+        state.set_toast(format!("Failed to open: {}", display_link_url(url)));
     }
 }
 
@@ -2156,10 +2170,7 @@ fn resolve_wikilink(state: &ViewerState, target: &str) -> Option<(String, Option
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let search_root = std::env::current_dir()
-        .ok()
-        .or_else(|| state.current_file_parent())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let search_root = state.picker_search_root();
 
     let resolved =
         crate::wikilink::resolve_target(file_part, &current_dir, &search_root, &state.picker)?;
@@ -3594,20 +3605,20 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
             let marker = if is_selected { " ▸ " } else { "   " };
             let marker_len = 3;
             let available = box_w.saturating_sub(2 + marker_len);
-            let has_text = !entry.text.is_empty() && entry.text != entry.url;
+            let entry_url = display_link_url(&entry.url);
+            let has_text = !entry.text.is_empty() && entry.text != entry_url;
 
             let (text_part, url_part) = if has_text {
                 let sep = " → ";
                 let sep_len = sep.chars().count();
                 let text_len = entry.text.chars().count();
-                let url_len = entry.url.chars().count();
+                let url_len = entry_url.chars().count();
 
                 if text_len + sep_len + url_len <= available {
-                    (format!("{}{}", entry.text, sep), entry.url.clone())
+                    (format!("{}{}", entry.text, sep), entry_url.to_string())
                 } else if text_len + sep_len + 3 <= available {
                     let url_budget = available - text_len - sep_len;
-                    let truncated_url: String = entry
-                        .url
+                    let truncated_url: String = entry_url
                         .chars()
                         .take(url_budget.saturating_sub(1))
                         .collect::<String>()
@@ -3623,15 +3634,14 @@ fn render_link_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> i
                     (truncated, String::new())
                 }
             } else {
-                let url_display: String = if entry.url.chars().count() > available {
-                    entry
-                        .url
+                let url_display: String = if entry_url.chars().count() > available {
+                    entry_url
                         .chars()
                         .take(available.saturating_sub(1))
                         .collect::<String>()
                         + "…"
                 } else {
-                    entry.url.clone()
+                    entry_url.to_string()
                 };
                 (String::new(), url_display)
             };
@@ -4987,6 +4997,39 @@ mod tests {
 
         let expected = target.canonicalize().unwrap();
         assert_eq!(PathBuf::from(&state.filename), expected);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn link_picker_enter_navigates_wikilink() {
+        // The picker's Enter arm dispatches `entry.url`, so the entry must keep
+        // the internal `wikilink:` prefix — stripping it at build time made
+        // Enter fall through to "unsupported URL scheme".
+        let root = wikilink_temp_root("mdterm-viewer-wikilink-picker");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = root.join("index.md");
+        let target = root.join("getting-started.md");
+        std::fs::write(&current, "[[getting-started]]").unwrap();
+        std::fs::write(&target, "# Getting Started\n\nWelcome.").unwrap();
+
+        let mut state = wikilink_test_state(&current);
+        state.rebuild();
+
+        let urls: Vec<&str> = state.link_entries.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls, vec!["wikilink:getting-started"]);
+
+        state.mode = ViewMode::LinkPicker;
+        state.link_selected = 0;
+        handle_link_picker(&mut state, KeyCode::Enter);
+
+        let expected = target.canonicalize().unwrap();
+        assert_eq!(
+            PathBuf::from(&state.filename),
+            expected,
+            "toast: {:?}",
+            state.toast
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
