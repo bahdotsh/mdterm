@@ -303,7 +303,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("note.md"), "# Note").unwrap();
 
-        let resolved = resolve_target("note.md", &root, &root, &crate::config::PickerConfig::default());
+        let resolved = resolve_target(
+            "note.md",
+            &root,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
         assert_eq!(resolved, Some(root.join("note.md")));
 
         fs::remove_dir_all(root).unwrap();
@@ -315,7 +320,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("note.md"), "# Note").unwrap();
 
-        let resolved = resolve_target("note", &root, &root, &crate::config::PickerConfig::default());
+        let resolved = resolve_target(
+            "note",
+            &root,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
         assert_eq!(resolved, Some(root.join("note.md")));
 
         fs::remove_dir_all(root).unwrap();
@@ -372,7 +382,12 @@ mod tests {
         let root = temp_root("mdterm-wikilink-nomatch");
         fs::create_dir_all(&root).unwrap();
 
-        let resolved = resolve_target("nope", &root, &root, &crate::config::PickerConfig::default());
+        let resolved = resolve_target(
+            "nope",
+            &root,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
         assert_eq!(resolved, None);
 
         fs::remove_dir_all(root).unwrap();
