@@ -1819,6 +1819,7 @@ struct TerminologyCtx<'a> {
 }
 
 /// Pre-render an image for a specific protocol on a background thread.
+#[allow(clippy::too_many_arguments)]
 fn pre_render_image(
     img: &DynamicImage,
     protocol: ImageProtocol,
@@ -3246,7 +3247,7 @@ mod tests {
         assert!(
             buf.windows(header_prefix.len()).any(|w| w == header_prefix),
             "header not found in output.\nGot (hex): {:?}",
-            &buf
+            buf
         );
 
         // ── Check placeholder rows ────────────────────────────────────────
