@@ -5016,10 +5016,7 @@ mod tests {
 
     #[test]
     fn display_link_url_strips_wikilink_prefix() {
-        assert_eq!(
-            display_link_url("wikilink:notes/foo#bar"),
-            "notes/foo#bar"
-        );
+        assert_eq!(display_link_url("wikilink:notes/foo#bar"), "notes/foo#bar");
         assert_eq!(
             display_link_url("https://example.com"),
             "https://example.com"
