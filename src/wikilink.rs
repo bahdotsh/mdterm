@@ -124,7 +124,11 @@ fn rewrite_prose(segment: &str) -> String {
             .map(|m| m.as_str().trim())
             .filter(|s| !s.is_empty());
         let alt = label.unwrap_or(target);
-        format!("![{}](<mdembed:{}>)", escape_label(alt), escape_dest(target))
+        format!(
+            "![{}](<mdembed:{}>)",
+            escape_label(alt),
+            escape_dest(target)
+        )
     });
 
     LINK_RE
