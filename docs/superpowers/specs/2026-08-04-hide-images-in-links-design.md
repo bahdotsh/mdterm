@@ -144,7 +144,9 @@ Unit tests in `src/markdown.rs`'s existing test module, following the
 - Any notion of true inline (same-row, small) image rendering. mdterm has
   no such capability for any image, and this feature does not add one —
   it only suppresses the block entirely, per the "fully suppressed" choice
-  above. If the alt text is needed as an at-a-glance signal, the author's
+  above. When an image is the entire link label (no other text), the whole
+  link disappears as well, since there's nothing left for a link picker to
+  discover. If the alt text is needed as an at-a-glance signal, the author's
   own workaround (a plain Unicode/emoji character in the link label
   instead of a real embedded image) remains the way to get that.
 - Obsidian's embed-sizing syntax (`![[img.png|WIDTHxHEIGHT]]`) — raised in

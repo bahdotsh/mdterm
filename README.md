@@ -22,6 +22,7 @@ vault in the terminal — and adds only the following on top:
 | Addition | What it does |
 |----------|--------------|
 | `[hide] images` / `--no-images` | Skips images entirely: no placeholder rows, no caption, and no network fetch. Useful where terminal image protocols don't work well (e.g. some tmux setups) |
+| `[hide] images_in_links` | Skips only images nested inside a link's label (e.g. a decorative icon prefixing a link) — they'd otherwise break the link's line into three. Standalone images are unaffected. Config-only, no CLI flag |
 | `[hide] frontmatter` / `--no-frontmatter` | Drops a leading `---` YAML block, which otherwise renders as two rules with raw YAML between them |
 | `[hide] code_languages` / `--hide-code-lang` | Omits fenced blocks by language, e.g. Obsidian's ```` ```dataviewjs ```` blocks, which mean nothing outside Obsidian |
 | `[picker] ignore` | Skips files and directories by name in the file picker |
@@ -206,6 +207,7 @@ width = 0             # display width, 0 = auto-detect
 # Content that is parsed but never drawn.
 [hide]
 images = true                              # skip images: no placeholder, no caption, no download
+images_in_links = true                     # skip only images nested inside a link's label
 frontmatter = true                         # skip a leading `---` YAML block
 code_languages = ["dataviewjs", "dataview"]  # fenced languages to drop entirely
 
@@ -231,6 +233,9 @@ fetched from the network. Hidden code blocks are also excluded from `c` (copy ne
 block), so they can't be copied by accident.
 
 - `images` — drops the image placeholder rows *and* the caption line
+- `images_in_links` — drops only an image nested inside a link's label (e.g. a decorative
+  icon prefixing a link), leaving the link's other text intact. If the image *is* the
+  entire link label (no other text), the whole link disappears — nothing is left to click
 - `frontmatter` — drops a leading `---` … `---` block. A document that merely opens with a
   `---` rule and never closes it is left alone
 - `code_languages` — matched against the first word of the fence info string, so

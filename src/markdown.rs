@@ -1974,6 +1974,25 @@ mod tests {
     }
 
     #[test]
+    fn image_only_link_disappears_entirely_when_flag_set() {
+        let input = "[![thumb](attachments/thumb.png)](https://example.com)";
+        let (lines, _) = render_hiding(input, &hide_images_in_links());
+        let text = all_text(&lines);
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l.meta, LineMeta::Image { .. })),
+            "the image should still be suppressed"
+        );
+        assert!(
+            !text.contains("https://example.com") && !text.contains("thumb"),
+            "an image-only link label leaves nothing behind at all once suppressed \
+             (no text, no image, no clickable link): {text}"
+        );
+    }
+
+    #[test]
     fn image_nested_in_link_renders_normally_when_flag_unset() {
         let input = "[Label ![icon](attachments/icon.png)](https://example.com)";
         let (lines, _) = render_test(input);
