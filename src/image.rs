@@ -1149,6 +1149,8 @@ impl ImageCache {
         // Clone the Arc so the background thread can register temp paths even if
         // the render channel is replaced before the thread completes (M3 fix).
         let temp_files_ref = Arc::clone(&self.temp_files);
+        let base_dir = self.base_dir.clone();
+        let attachments_dir = self.attachments_dir.clone();
         std::thread::spawn(move || {
             // SAFETY (AssertUnwindSafe): all captured values are either owned
             // or wrapped in Arc/Mutex, which are both Send + unwind-safe at the
@@ -1174,6 +1176,8 @@ impl ImageCache {
                     cell_metrics,
                     bg,
                     kitty_id,
+                    &base_dir,
+                    &attachments_dir,
                     terminology.as_ref(),
                 )
             }))
@@ -1822,6 +1826,8 @@ fn pre_render_image(
     cell_metrics: CellMetrics,
     bg: (u8, u8, u8),
     kitty_id: u32,
+    base_dir: &Path,
+    attachments_dir: &str,
     terminology: Option<&TerminologyCtx<'_>>,
 ) -> Option<PreRenderedResult> {
     let (img_w, img_h) = img.dimensions();
@@ -1906,7 +1912,7 @@ fn pre_render_image(
         ImageProtocol::Terminology => {
             let ctx = terminology
                 .expect("pre_render_image: Terminology protocol requires a TerminologyCtx");
-            pre_render_terminology(img, ctx.url, content_width, cell_metrics).map(|ti| {
+            pre_render_terminology(img, ctx.url, content_width, cell_metrics, base_dir, attachments_dir).map(|ti| {
                 if ti.is_temp {
                     // Register the temp path in the shared registry *before* wrapping
                     // the result, so it is cleaned up even if the render channel is
@@ -1976,19 +1982,22 @@ fn random_hex_suffix() -> String {
 
 /// Pre-render step for the Terminology protocol.
 /// Resolves the image to a local filesystem path.
-/// - If `url` is a local path that currently exists on disk, returns it as-is
-///   (after canonicalization to an absolute path), provided the resolved path
-///   stays within the current working directory.
+/// - If `url` (after stripping any `mdembed:` prefix) is a local path that
+///   resolves to a file under `base_dir` (or, for embeds, under
+///   `base_dir`/`attachments_dir`), returns it as-is (after canonicalization
+///   to an absolute path), provided the resolved path stays within `base_dir`.
 /// - Otherwise, resizes `img` to the display pixel dimensions and writes it
 ///   atomically to a temporary PNG file in a per-process private temp directory.
 ///
 /// Returns `None` if the resolved path would be unsafe to embed in the escape
-/// sequence, escapes the working directory, or if any I/O operation fails.
+/// sequence, escapes `base_dir`, or if any I/O operation fails.
 fn pre_render_terminology(
     img: &DynamicImage,
     url: &str,
     content_width: usize,
     cell_metrics: CellMetrics,
+    base_dir: &Path,
+    attachments_dir: &str,
 ) -> Option<TerminologyImage> {
     let (img_w, img_h) = img.dimensions();
     let (cols, rows) = calc_display_cells(
@@ -2003,27 +2012,33 @@ fn pre_render_terminology(
     let cols = (cols as u32).clamp(1, 511);
     let rows = (rows as u32).clamp(1, 511);
 
+    let (target, is_embed) = match url.strip_prefix("mdembed:") {
+        Some(t) => (t, true),
+        None => (url, false),
+    };
+
     // Treat http://, https://, file://, and data: URLs as remote/non-local.
     // file:// and data: are not valid filesystem paths; canonicalize would fail
     // for them, so they fall through to the temp-file path.
-    let is_remote = url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("file://")
-        || url.starts_with("data:");
+    let is_remote = target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("file://")
+        || target.starts_with("data:");
 
     // Local file path that still exists on disk — reuse directly, no I/O needed.
     // Terminology requires an absolute path, so canonicalize before passing.
-    if !is_remote && let Ok(abs) = std::fs::canonicalize(url) {
-        // SEC: Reject if the resolved path escapes the working directory.
-        // This prevents symlinks like `./img.png -> /etc/passwd` from
-        // passing an arbitrary system path to Terminology.
-        // Canonicalize the CWD too so both paths use the same prefix form
-        // (important on Windows where canonicalize adds the `\\?\` prefix
-        // but current_dir() does not, causing starts_with to always fail).
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|d| std::fs::canonicalize(d).ok());
-        if cwd.is_some_and(|cwd| !abs.starts_with(&cwd)) {
+    if !is_remote
+        && let Some(resolved) = resolve_local_image_path(target, base_dir, attachments_dir, is_embed)
+        && let Ok(abs) = std::fs::canonicalize(&resolved)
+    {
+        // SEC: Reject if the resolved path escapes base_dir. This prevents
+        // symlinks like `./img.png -> /etc/passwd` from passing an arbitrary
+        // system path to Terminology. Canonicalize base_dir too so both paths
+        // use the same prefix form (important on Windows where canonicalize
+        // adds the `\\?\` prefix but a plain PathBuf does not, causing
+        // starts_with to always fail).
+        let base_canonical = std::fs::canonicalize(base_dir).ok();
+        if base_canonical.is_some_and(|base| !abs.starts_with(&base)) {
             return None;
         }
 
@@ -3270,25 +3285,20 @@ mod tests {
         assert_eq!(rows_seen, 2, "expected to find 2 complete rows");
     }
 
-    /// Local-path images (within the current working directory) must reuse the
-    /// original path (`is_temp = false`) and must NOT create a new temp file.
-    ///
-    /// The fixture is written into the current working directory (project root
-    /// during `cargo test`) so that the `canonicalize` result passes the
-    /// `starts_with(cwd)` security check.
+    /// Local-path images (within `base_dir`) must reuse the original path
+    /// (`is_temp = false`) and must NOT create a new temp file.
     #[test]
     fn terminology_no_temp_for_local_path() {
-        // Write the fixture PNG inside cwd so it passes the cwd-confinement check.
-        let cwd = std::env::current_dir().expect("cannot get cwd");
-        let source_path = cwd.join(format!("mdterm-test-source-{}.png", std::process::id()));
-        let source_path_str = source_path.to_str().expect("cwd path is not UTF-8");
+        let root = temp_root("mdterm-terminology-basedir");
+        std::fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("photo.png");
         {
             let img = image::DynamicImage::new_rgb8(8, 8);
-            img.save_with_format(source_path_str, image::ImageFormat::Png)
+            img.save_with_format(&source_path, image::ImageFormat::Png)
                 .expect("failed to write source fixture PNG");
         }
 
-        let img = image::open(source_path_str).expect("failed to open fixture PNG");
+        let img = image::open(&source_path).expect("failed to open fixture PNG");
         let metrics = CellMetrics {
             aspect: 2.0,
             cell_w_px: 8,
@@ -3300,18 +3310,16 @@ mod tests {
             .map(|rd| rd.flatten().count())
             .unwrap_or(0);
 
-        let result = pre_render_terminology(&img, source_path_str, 80, metrics)
-            .expect("pre_render_terminology returned None for a local path within cwd");
+        let result = pre_render_terminology(&img, "photo.png", 80, metrics, &root, "attachments")
+            .expect("pre_render_terminology returned None for a local path within base_dir");
 
         let after_count = std::fs::read_dir(&priv_dir)
             .map(|rd| rd.flatten().count())
             .unwrap_or(0);
 
-        // canonicalize may resolve symlinks (e.g. on macOS the cwd itself may
-        // have a symlinked component). Compute canonical form for the assertion.
         let canonical_source =
-            std::fs::canonicalize(source_path_str).unwrap_or_else(|_| source_path.clone());
-        let _ = std::fs::remove_file(source_path_str);
+            std::fs::canonicalize(&source_path).unwrap_or_else(|_| source_path.clone());
+        std::fs::remove_dir_all(&root).ok();
 
         assert!(!result.is_temp, "local path must not set is_temp=true");
         assert_eq!(
