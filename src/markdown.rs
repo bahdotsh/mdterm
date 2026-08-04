@@ -1624,6 +1624,8 @@ pub fn render_with(
     } else {
         input
     };
+    let preprocessed = crate::wikilink::preprocess(input);
+    let input: &str = preprocessed.as_ref();
 
     let mut renderer = Renderer::new(
         input,
@@ -2030,5 +2032,36 @@ mod tests {
             spans_with > spans_without,
             "line numbers should add extra spans"
         );
+    }
+
+    // ── Wikilinks ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn wikilink_produces_link_span_with_wikilink_prefix() {
+        let (lines, _) = render_test("[[getting-started|Getting Started]]");
+        let span = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| {
+                s.style
+                    .link_url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("wikilink:"))
+            })
+            .expect("expected a span with a wikilink: link_url");
+        assert_eq!(
+            span.style.link_url.as_deref(),
+            Some("wikilink:getting-started")
+        );
+        assert_eq!(span.text, "Getting Started");
+    }
+
+    #[test]
+    fn wikilink_embed_produces_image_meta() {
+        let (lines, _) = render_test("![[photo.png]]");
+        let has_image = lines
+            .iter()
+            .any(|l| matches!(l.meta, LineMeta::Image { ref url, .. } if url == "photo.png"));
+        assert!(has_image, "expected an Image line for the embedded photo");
     }
 }
