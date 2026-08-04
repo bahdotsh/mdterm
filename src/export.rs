@@ -40,16 +40,7 @@ pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str, hide:
         } = line.meta
         {
             if row == 0 {
-                if is_safe_img_src(url) {
-                    let _ = writeln!(
-                        out,
-                        "<div class='line'><img src='{}' alt='{}' style='max-width:100%;height:auto;'></div>",
-                        html_escape(url),
-                        html_escape(alt)
-                    );
-                } else {
-                    let _ = writeln!(out, "<div class='line'>{}</div>", html_escape(alt));
-                }
+                let _ = writeln!(out, "{}", render_image_line(url, alt));
             }
             continue;
         }
@@ -115,6 +106,22 @@ pub fn to_html(content: &str, width: usize, theme: &Theme, filename: &str, hide:
     }
 
     let _ = writeln!(out, "</body></html>");
+}
+
+/// Renders a `LineMeta::Image` line to its HTML `<div>` wrapper, stripping
+/// the internal `mdembed:` wikilink-embed marker before the safety check
+/// and the emitted `src` so embeds export the same as plain images.
+fn render_image_line(url: &str, alt: &str) -> String {
+    let src = url.strip_prefix("mdembed:").unwrap_or(url);
+    if is_safe_img_src(src) {
+        format!(
+            "<div class='line'><img src='{}' alt='{}' style='max-width:100%;height:auto;'></div>",
+            html_escape(src),
+            html_escape(alt)
+        )
+    } else {
+        format!("<div class='line'>{}</div>", html_escape(alt))
+    }
 }
 
 fn color_css(c: Color) -> String {
@@ -340,5 +347,50 @@ mod tests {
     fn safe_img_handles_empty() {
         assert!(is_safe_img_src(""));
         assert!(is_safe_img_src("   "));
+    }
+
+    // ── render_image_line ────────────────────────────────────────────────
+
+    #[test]
+    fn render_image_line_strips_mdembed_prefix() {
+        let html = render_image_line("mdembed:photo.png", "photo.png");
+        assert!(
+            html.contains("<img src='photo.png'"),
+            "expected an <img> tag with src='photo.png', got: {}",
+            html
+        );
+        assert!(!html.contains("mdembed:"));
+    }
+
+    #[test]
+    fn render_image_line_plain_url_unaffected() {
+        let html = render_image_line("photo.png", "photo.png");
+        assert!(html.contains("<img src='photo.png'"));
+    }
+
+    #[test]
+    fn wikilink_embed_exports_as_img_tag() {
+        // End-to-end: a wikilink embed goes through markdown::render (which
+        // tags the destination with the internal `mdembed:` prefix) and must
+        // still export as a real <img> tag, not a bare alt-text fallback div.
+        let theme = crate::theme::Theme::dark();
+        let (lines, _) =
+            crate::markdown::render("![[photo.png]]", 80, &theme, false, &HideConfig::default());
+        let wrapped = wrap_lines(&lines, 80);
+        let img_line = wrapped
+            .iter()
+            .find_map(|l| match &l.meta {
+                LineMeta::Image {
+                    url, alt, row: 0, ..
+                } => Some(render_image_line(url, alt)),
+                _ => None,
+            })
+            .expect("expected an Image line in wrapped output");
+        assert!(
+            img_line.contains("<img src='photo.png'"),
+            "expected an <img> tag with src='photo.png', got: {}",
+            img_line
+        );
+        assert!(!img_line.contains("mdembed:"));
     }
 }
