@@ -854,6 +854,12 @@ pub struct ImageCache {
     /// Whether mdterm is running inside a tmux session.
     /// Used by the render layer to wrap escape sequences in DCS passthrough.
     in_tmux: bool,
+    /// Directory of the currently open markdown file. Local image references
+    /// are resolved relative to this, not the process's working directory.
+    base_dir: PathBuf,
+    /// Configured "default attachment folder" name (relative to `base_dir`),
+    /// used as a fallback for bare-filename wikilink embeds.
+    attachments_dir: String,
 
     // Kitty: image uploaded once, placed per-frame (None = encode failed)
     kitty_images: HashMap<String, Option<KittyImage>>,
@@ -905,6 +911,8 @@ impl ImageCache {
             images: HashMap::new(),
             protocol,
             in_tmux,
+            base_dir: PathBuf::from("."),
+            attachments_dir: "attachments".to_string(),
             kitty_images: HashMap::new(),
             kitty_unicode_images: HashMap::new(),
             // Starts at 0; wrapping_add(1) before first use ensures IDs begin at 1.
@@ -928,6 +936,19 @@ impl ImageCache {
 
     pub fn protocol(&self) -> ImageProtocol {
         self.protocol
+    }
+
+    /// Set the directory of the currently open markdown file. Local image
+    /// references are resolved relative to this directory. Call on every
+    /// rebuild so switching files takes effect.
+    pub fn set_base_dir(&mut self, dir: PathBuf) {
+        self.base_dir = dir;
+    }
+
+    /// Set the configured "default attachment folder" name (relative to
+    /// `base_dir`), used as a fallback for bare-filename wikilink embeds.
+    pub fn set_attachments_dir(&mut self, dir: String) {
+        self.attachments_dir = dir;
     }
 
     pub fn update_cell_aspect(&mut self) {
@@ -980,13 +1001,16 @@ impl ImageCache {
         self.in_flight.insert(url.to_string());
         let sender = self.sender.clone();
         let url_owned = url.to_string();
+        let base_dir = self.base_dir.clone();
+        let attachments_dir = self.attachments_dir.clone();
         std::thread::spawn(move || {
             // Guard against panics in image decoding/downscaling so that
             // the channel always receives a result and the in_flight slot
             // is freed by poll_completed(). Without this, a panic would
             // leave the URL stuck in in_flight permanently.
             let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fetch_image(&url_owned).map(|img| downscale(img, MAX_SOURCE_DIM))
+                fetch_image(&url_owned, &base_dir, &attachments_dir)
+                    .map(|img| downscale(img, MAX_SOURCE_DIM))
             }))
             .unwrap_or(None);
             let _ = sender.send((url_owned, img));
@@ -1065,7 +1089,8 @@ impl ImageCache {
         if self.images.contains_key(url) {
             return;
         }
-        let img = fetch_image(url).map(|img| Arc::new(downscale(img, MAX_SOURCE_DIM)));
+        let img = fetch_image(url, &self.base_dir, &self.attachments_dir)
+            .map(|img| Arc::new(downscale(img, MAX_SOURCE_DIM)));
         self.images.insert(url.to_string(), img);
     }
 
@@ -2153,24 +2178,16 @@ fn resolve_local_image_path(
     None
 }
 
-fn fetch_image(url: &str) -> Option<DynamicImage> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        fetch_image_http(url)
-    } else {
-        // Only allow relative paths and paths under the current directory;
-        // reject absolute paths to prevent reading arbitrary local files.
-        let path = std::path::Path::new(url);
-        if path.is_absolute() {
-            return None;
-        }
-        // Reject paths that escape the working directory via ".."
-        for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return None;
-            }
-        }
-        image::open(url).ok()
+fn fetch_image(url: &str, base_dir: &Path, attachments_dir: &str) -> Option<DynamicImage> {
+    let (target, is_embed) = match url.strip_prefix("mdembed:") {
+        Some(target) => (target, true),
+        None => (url, false),
+    };
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return fetch_image_http(target);
     }
+    let path = resolve_local_image_path(target, base_dir, attachments_dir, is_embed)?;
+    image::open(path).ok()
 }
 
 /// Returns true if `host` falls in the RFC 1918 172.16.0.0/12 range (172.16.x.x – 172.31.x.x).
@@ -2373,6 +2390,61 @@ mod tests {
         // Still None — was not replaced by a fresh (failed) attempt.
         assert!(!cache.has_image("local_nonexistent.png"));
         assert!(cache.has_attempted("local_nonexistent.png"));
+    }
+
+    #[test]
+    fn fetch_if_missing_resolves_relative_to_base_dir_not_cwd() {
+        let root = temp_root("mdterm-cache-basedir");
+        std::fs::create_dir_all(&root).unwrap();
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        img.save_with_format(root.join("photo.png"), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(root.clone());
+        cache.fetch_if_missing("photo.png");
+
+        assert!(cache.has_image("photo.png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fetch_if_missing_embed_falls_back_to_attachments_dir() {
+        let root = temp_root("mdterm-cache-embedfallback");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        img.save_with_format(
+            root.join("attachments").join("photo.png"),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(root.clone());
+        cache.set_attachments_dir("attachments".to_string());
+        cache.fetch_if_missing("mdembed:photo.png");
+
+        assert!(cache.has_image("mdembed:photo.png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fetch_if_missing_plain_image_ignores_attachments_dir() {
+        let root = temp_root("mdterm-cache-plainnofallback");
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        img.save_with_format(
+            root.join("attachments").join("photo.png"),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let mut cache = ImageCache::new();
+        cache.set_base_dir(root.clone());
+        cache.fetch_if_missing("photo.png"); // no mdembed: prefix
+
+        assert!(!cache.has_image("photo.png"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // ── extract_host ─────────────────────────────────────────────────────────
