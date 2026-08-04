@@ -2095,9 +2095,9 @@ mod tests {
     #[test]
     fn wikilink_embed_produces_image_meta() {
         let (lines, _) = render_test("![[photo.png]]");
-        let has_image = lines
-            .iter()
-            .any(|l| matches!(l.meta, LineMeta::Image { ref url, .. } if url == "photo.png"));
+        let has_image = lines.iter().any(
+            |l| matches!(l.meta, LineMeta::Image { ref url, .. } if url == "mdembed:photo.png"),
+        );
         assert!(has_image, "expected an Image line for the embedded photo");
     }
 
