@@ -38,6 +38,7 @@ pub struct ViewerOptions {
     pub start_in_picker: bool,
     pub hide: HideConfig,
     pub picker: PickerConfig,
+    pub attachments_dir: String,
 }
 
 pub fn run(opts: ViewerOptions) -> io::Result<()> {
@@ -420,6 +421,9 @@ impl ViewerState {
             None
         };
 
+        let mut image_cache = crate::image::ImageCache::new();
+        image_cache.set_attachments_dir(opts.attachments_dir.clone());
+
         ViewerState {
             files: opts.files,
             current_file_idx: 0,
@@ -461,7 +465,7 @@ impl ViewerState {
             file_change_rx,
             file_change_tx,
             toast: None,
-            image_cache: crate::image::ImageCache::new(),
+            image_cache,
             pending_image_urls: std::collections::VecDeque::new(),
             fast_scrolling: false,
             dirty: true,
@@ -606,6 +610,12 @@ impl ViewerState {
     }
 
     fn rebuild(&mut self) {
+        let base_dir = std::path::Path::new(&self.filename)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        self.image_cache.set_base_dir(base_dir);
+
         // Save the scroll position before re-rendering.  finalize_layout()
         // adjusts the offset for image-row expansion, but when called from
         // rebuild() the offset was already correct for the previous layout's
@@ -4855,6 +4865,7 @@ mod tests {
             start_in_picker: false,
             hide: HideConfig::default(),
             picker: PickerConfig::default(),
+            attachments_dir: String::new(),
         };
         let mut state = ViewerState::new(opts, 80, 24);
         state.wrapped = lines;
@@ -4978,6 +4989,7 @@ mod tests {
             start_in_picker: false,
             hide: HideConfig::default(),
             picker: PickerConfig::default(),
+            attachments_dir: String::new(),
         };
         ViewerState::new(opts, 80, 24)
     }

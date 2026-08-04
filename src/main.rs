@@ -173,6 +173,7 @@ fn main() {
             start_in_picker,
             hide,
             picker: picker_config,
+            attachments_dir: config.attachments_dir,
         };
         if let Err(e) = viewer::run(opts) {
             eprintln!("Viewer error: {}", e);
