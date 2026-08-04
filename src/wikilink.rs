@@ -175,11 +175,6 @@ fn escape_label(s: &str) -> String {
 /// `search_root` — the same directory tree the file picker (`p`) walks.
 /// Ambiguous matches resolve to the first hit in `discover_markdown_files`'s
 /// existing sort order (shallowest/alphabetically-first).
-// TODO(Task 4): remove once `resolve_target` gets a real caller in viewer.rs —
-// until then `cargo clippy -D warnings` flags it as dead code (its only
-// caller right now is its own #[cfg(test)] module, which clippy's default
-// non-test build doesn't compile).
-#[allow(dead_code)]
 pub fn resolve_target(
     target: &str,
     current_dir: &Path,

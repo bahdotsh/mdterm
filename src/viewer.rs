@@ -826,7 +826,7 @@ impl ViewerState {
                         continue;
                     }
                     self.link_entries.push(LinkEntry {
-                        url: url.clone(),
+                        url: display_link_url(url).to_string(),
                         text,
                     });
                     prev_url = Some(url.clone());
@@ -2082,6 +2082,12 @@ pub(crate) fn heading_to_slug(text: &str) -> String {
     result
 }
 
+/// Strip the internal `wikilink:` tag so the link picker shows a clean
+/// target/anchor instead of leaking the implementation detail.
+fn display_link_url(url: &str) -> &str {
+    url.strip_prefix("wikilink:").unwrap_or(url)
+}
+
 /// Open a URL externally, navigate to an anchor heading, open a local file, or block unsupported schemes.
 fn dispatch_link(state: &mut ViewerState, url: &str) {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
@@ -2091,34 +2097,74 @@ fn dispatch_link(state: &mut ViewerState, url: &str) {
         }
     } else if let Some(anchor) = url.strip_prefix('#') {
         navigate_to_anchor(state, anchor);
-    } else if let Some(resolved) = resolve_local_link(state, url) {
-        let (path, anchor) = resolved;
-        let prev_file_idx = state.current_file_idx;
-        let prev_offset = state.offset;
-        // Find existing entry by canonicalizing both sides to handle relative vs absolute paths
-        let existing_idx = state.files.iter().position(|f| {
-            std::path::Path::new(f)
-                .canonicalize()
-                .ok()
-                .is_some_and(|c| c == std::path::Path::new(&path))
-        });
-        let target_idx = existing_idx.unwrap_or_else(|| {
-            state.files.push(path.clone());
-            state.files.len() - 1
-        });
-        let switched = state.switch_file(target_idx);
-        if switched {
-            // Save previous position only after confirming the switch succeeded
-            state.nav_history.push((prev_file_idx, prev_offset));
-            if let Some(anchor) = anchor {
-                navigate_to_anchor(state, &anchor);
-            }
-        } else {
-            state.set_toast(format!("Failed to open: {}", url));
+    } else if let Some(target) = url.strip_prefix("wikilink:") {
+        match resolve_wikilink(state, target) {
+            Some(resolved) => navigate_to_resolved(state, resolved, url),
+            None => state.set_toast(format!("Wikilink not found: {}", target)),
         }
+    } else if let Some(resolved) = resolve_local_link(state, url) {
+        navigate_to_resolved(state, resolved, url);
     } else {
         state.set_toast(format!("Blocked: unsupported URL scheme in '{}'", url));
     }
+}
+
+/// Switch to a resolved `(path, anchor)` target, recording nav history and
+/// jumping to the anchor if one was given. Shared by plain relative links
+/// and wikilinks, which differ only in how they produce `resolved`.
+fn navigate_to_resolved(state: &mut ViewerState, resolved: (String, Option<String>), url: &str) {
+    let (path, anchor) = resolved;
+    let prev_file_idx = state.current_file_idx;
+    let prev_offset = state.offset;
+    // Find existing entry by canonicalizing both sides to handle relative vs absolute paths
+    let existing_idx = state.files.iter().position(|f| {
+        std::path::Path::new(f)
+            .canonicalize()
+            .ok()
+            .is_some_and(|c| c == std::path::Path::new(&path))
+    });
+    let target_idx = existing_idx.unwrap_or_else(|| {
+        state.files.push(path.clone());
+        state.files.len() - 1
+    });
+    let switched = state.switch_file(target_idx);
+    if switched {
+        // Save previous position only after confirming the switch succeeded
+        state.nav_history.push((prev_file_idx, prev_offset));
+        if let Some(anchor) = anchor {
+            navigate_to_anchor(state, &anchor);
+        }
+    } else {
+        state.set_toast(format!("Failed to open: {}", url));
+    }
+}
+
+/// Resolve a `wikilink:target[#anchor]` destination to a local file,
+/// trying the current file's directory first and falling back to a
+/// vault-wide search rooted at the same directory the file picker (`p`)
+/// uses.
+fn resolve_wikilink(state: &ViewerState, target: &str) -> Option<(String, Option<String>)> {
+    let (file_part, anchor) = match target.split_once('#') {
+        Some((f, a)) => (f, Some(a.to_string())),
+        None => (target, None),
+    };
+    if file_part.is_empty() {
+        return None;
+    }
+
+    let current_dir = std::path::Path::new(&state.filename)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let search_root = std::env::current_dir()
+        .ok()
+        .or_else(|| state.current_file_parent())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let resolved =
+        crate::wikilink::resolve_target(file_part, &current_dir, &search_root, &state.picker)?;
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
+    Some((canonical.to_string_lossy().into_owned(), anchor))
 }
 
 /// Navigate to a heading anchor within the current document.
@@ -4896,5 +4942,87 @@ mod tests {
         assert_eq!(state.link_at_position(1, 2 + 2), None); // space
         assert_eq!(state.link_at_position(1, 2 + 3), Some("https://b.com"));
         assert_eq!(state.link_at_position(1, 2 + 4), Some("https://b.com"));
+    }
+
+    // ── wikilink navigation tests ───────────────────────────────────────────
+
+    fn wikilink_temp_root(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    fn wikilink_test_state(current: &Path) -> ViewerState {
+        let current_str = current.to_string_lossy().into_owned();
+        let opts = ViewerOptions {
+            files: vec![current_str.clone()],
+            initial_content: std::fs::read_to_string(current).unwrap(),
+            filename: current_str,
+            theme: crate::theme::Theme::dark(),
+            slide_mode: false,
+            line_numbers: false,
+            width_override: None,
+            picker_root: None,
+            start_in_picker: false,
+            hide: HideConfig::default(),
+            picker: PickerConfig::default(),
+        };
+        ViewerState::new(opts, 80, 24)
+    }
+
+    #[test]
+    fn dispatch_link_navigates_relative_wikilink() {
+        let root = wikilink_temp_root("mdterm-viewer-wikilink");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = root.join("index.md");
+        let target = root.join("getting-started.md");
+        std::fs::write(&current, "[[getting-started]]").unwrap();
+        std::fs::write(&target, "# Getting Started\n\nWelcome.").unwrap();
+
+        let mut state = wikilink_test_state(&current);
+
+        dispatch_link(&mut state, "wikilink:getting-started");
+
+        let expected = target.canonicalize().unwrap();
+        assert_eq!(PathBuf::from(&state.filename), expected);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dispatch_link_toasts_on_unresolved_wikilink() {
+        let root = wikilink_temp_root("mdterm-viewer-wikilink-missing");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = root.join("index.md");
+        std::fs::write(&current, "[[nope]]").unwrap();
+
+        let mut state = wikilink_test_state(&current);
+
+        dispatch_link(&mut state, "wikilink:nope");
+
+        assert!(
+            state
+                .toast
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Wikilink not found")),
+            "expected a 'Wikilink not found' toast, got {:?}",
+            state.toast
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn display_link_url_strips_wikilink_prefix() {
+        assert_eq!(
+            display_link_url("wikilink:notes/foo#bar"),
+            "notes/foo#bar"
+        );
+        assert_eq!(
+            display_link_url("https://example.com"),
+            "https://example.com"
+        );
     }
 }
