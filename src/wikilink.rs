@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
@@ -167,6 +168,48 @@ fn escape_label(s: &str) -> String {
         .replace(']', "\\]")
 }
 
+/// Resolve a wikilink target to a file on disk: first relative to the
+/// directory of the file containing the link (matching how a plain
+/// relative Markdown link resolves, with `.md` inferred since Obsidian
+/// targets omit it), then falling back to a vault-wide search rooted at
+/// `search_root` — the same directory tree the file picker (`p`) walks.
+/// Ambiguous matches resolve to the first hit in `discover_markdown_files`'s
+/// existing sort order (shallowest/alphabetically-first).
+// TODO(Task 4): remove once `resolve_target` gets a real caller in viewer.rs —
+// until then `cargo clippy -D warnings` flags it as dead code (its only
+// caller right now is its own #[cfg(test)] module, which clippy's default
+// non-test build doesn't compile).
+#[allow(dead_code)]
+pub fn resolve_target(
+    target: &str,
+    current_dir: &Path,
+    search_root: &Path,
+    picker: &crate::config::PickerConfig,
+) -> Option<PathBuf> {
+    let candidate = current_dir.join(target);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+
+    let with_md = current_dir.join(format!("{target}.md"));
+    if with_md.is_file() {
+        return Some(with_md);
+    }
+
+    let entries = crate::file_picker::discover_markdown_files(search_root, picker).ok()?;
+    let target_lower = target.to_lowercase();
+    let target_md_lower = format!("{target_lower}.md");
+
+    entries.into_iter().find_map(|entry| {
+        let display_lower = entry.display.to_lowercase();
+        let matches = display_lower == target_lower
+            || display_lower == target_md_lower
+            || display_lower.ends_with(&format!("/{target_lower}"))
+            || display_lower.ends_with(&format!("/{target_md_lower}"));
+        matches.then_some(entry.path)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +284,119 @@ mod tests {
     fn preprocess_wraps_target_with_spaces() {
         let out = preprocess("[[Getting Started]]");
         assert_eq!(out, "[Getting Started](<wikilink:Getting Started>)");
+    }
+
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn resolve_target_finds_file_relative_to_current_dir() {
+        let root = temp_root("mdterm-wikilink-reldir");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("note.md"), "# Note").unwrap();
+
+        let resolved = resolve_target("note.md", &root, &root, &crate::config::PickerConfig::default());
+        assert_eq!(resolved, Some(root.join("note.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_target_infers_md_extension() {
+        let root = temp_root("mdterm-wikilink-inferext");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("note.md"), "# Note").unwrap();
+
+        let resolved = resolve_target("note", &root, &root, &crate::config::PickerConfig::default());
+        assert_eq!(resolved, Some(root.join("note.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_vault_wide_search_by_bare_name() {
+        let root = temp_root("mdterm-wikilink-vaultbare");
+        let current_dir = root.join("current");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("getting-started.md"), "# GS").unwrap();
+
+        let resolved = resolve_target(
+            "getting-started",
+            &current_dir,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
+        assert_eq!(resolved, Some(elsewhere.join("getting-started.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_vault_wide_search_by_subpath() {
+        let root = temp_root("mdterm-wikilink-vaultsubpath");
+        let current_dir = root.join("current");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::create_dir_all(root.join("handbook").join("processes")).unwrap();
+        fs::write(
+            root.join("handbook").join("processes").join("processes.md"),
+            "# Processes",
+        )
+        .unwrap();
+
+        let resolved = resolve_target(
+            "handbook/processes/processes",
+            &current_dir,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
+        assert_eq!(
+            resolved,
+            Some(root.join("handbook").join("processes").join("processes.md"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_target_returns_none_when_nothing_matches() {
+        let root = temp_root("mdterm-wikilink-nomatch");
+        fs::create_dir_all(&root).unwrap();
+
+        let resolved = resolve_target("nope", &root, &root, &crate::config::PickerConfig::default());
+        assert_eq!(resolved, None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_target_picks_first_sorted_match_when_ambiguous() {
+        let root = temp_root("mdterm-wikilink-ambiguous");
+        let current_dir = root.join("current");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a").join("dup.md"), "# A").unwrap();
+        fs::write(root.join("b").join("dup.md"), "# B").unwrap();
+
+        let resolved = resolve_target(
+            "dup",
+            &current_dir,
+            &root,
+            &crate::config::PickerConfig::default(),
+        );
+        // discover_markdown_files sorts by display path, so "a/dup.md" sorts before "b/dup.md".
+        assert_eq!(resolved, Some(root.join("a").join("dup.md")));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
