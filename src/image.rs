@@ -26,19 +26,36 @@ pub enum ImageProtocol {
     HalfBlock,
 }
 
-/// Query whether the active tmux session has `allow-passthrough` set to `on`
-/// or `all`.  Returns `false` on any error (tmux not found, option absent, etc.).
+/// Strip an option name from a `tmux show-options -A` output line, along with
+/// the `-A` inheritance marker: an asterisk attached to the name, not the
+/// value, e.g. `"allow-passthrough* off"`.
+fn strip_tmux_option_name<'a>(raw: &'a str, name: &str) -> &'a str {
+    raw.trim()
+        .strip_prefix(name)
+        .unwrap_or("")
+        .trim_start_matches('*')
+        .trim()
+}
+
+/// Query whether the *current pane's effective* `allow-passthrough` value is
+/// `on` or `all`.  Returns `false` on any error (tmux not found, option
+/// absent, etc.).
 ///
 /// DCS passthrough (`\x1bPtmux;…\x1b\\`) is the mechanism used to forward
 /// Kitty graphics sequences and iTerm2 inline-image OSC sequences through
-/// tmux to the outer terminal.  Without `allow-passthrough on` in tmux.conf,
-/// tmux silently drops every DCS sequence.
+/// tmux to the outer terminal.  Without `allow-passthrough on` (or `all`)
+/// active for this pane, tmux silently drops every DCS sequence.
+///
+/// Queries with `-p -A` (pane scope, inheriting from session/global if
+/// unset) rather than `-g` (global only), so a pane-level override such as
+/// `tmux set -p allow-passthrough on` — which lets a single invocation opt
+/// in without touching the global tmux.conf default — is actually detected.
 ///
 /// This is intentionally a blocking subprocess call: it runs once at startup
 /// during protocol detection and typically completes in under 5 ms.
 fn tmux_allows_passthrough() -> bool {
     std::process::Command::new("tmux")
-        .args(["show-options", "-g", "allow-passthrough"])
+        .args(["show-options", "-p", "-A", "allow-passthrough"])
         .output()
         .ok()
         .and_then(|out| {
@@ -49,12 +66,7 @@ fn tmux_allows_passthrough() -> bool {
             }
         })
         .is_some_and(|s| {
-            // Output format: "allow-passthrough on\n" or "allow-passthrough all\n"
-            let val = s
-                .trim()
-                .strip_prefix("allow-passthrough")
-                .unwrap_or("")
-                .trim();
+            let val = strip_tmux_option_name(&s, "allow-passthrough");
             val == "on" || val == "all"
         })
 }
@@ -164,9 +176,10 @@ pub fn detect_protocol() -> ImageProtocol {
     // place via U+10EEEE characters that tmux treats as normal text.
     //
     // IMPORTANT: DCS passthrough only reaches the outer terminal when
-    // `allow-passthrough on` (or `all`) is set in tmux.conf.  Without
-    // that option, tmux silently drops every DCS sequence while the
-    // U+10EEEE placeholder characters still pass through as plain text.
+    // `allow-passthrough on` (or `all`) is active for this pane (whether via
+    // tmux.conf or a pane-level override).  Without it, tmux silently drops
+    // every DCS sequence while the U+10EEEE placeholder characters still
+    // pass through as plain text.
     // The outer Kitty-compatible terminal then renders an orange
     // "unknown image" rectangle for each placeholder cell.  We therefore
     // query tmux at startup and only select protocols that require DCS
@@ -3020,6 +3033,41 @@ mod tests {
         // _env restores all saved vars on drop.
     }
 
+    #[test]
+    fn strip_tmux_option_name_handles_inherited_asterisk() {
+        // Set on this pane directly: no asterisk.
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough on", "allow-passthrough"),
+            "on"
+        );
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough all", "allow-passthrough"),
+            "all"
+        );
+        // Inherited from session/global via `-A`: asterisk attached to the
+        // name, not the value.
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough* off", "allow-passthrough"),
+            "off"
+        );
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough* on", "allow-passthrough"),
+            "on"
+        );
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough* all", "allow-passthrough"),
+            "all"
+        );
+        // Real `Command::output()` stdout keeps the trailing newline.
+        assert_eq!(
+            strip_tmux_option_name("allow-passthrough on\n", "allow-passthrough"),
+            "on"
+        );
+        // Malformed/empty input must not panic and must not match a truthy value.
+        assert_eq!(strip_tmux_option_name("", "allow-passthrough"), "");
+        assert_eq!(strip_tmux_option_name("garbage", "allow-passthrough"), "");
+    }
+
     /// When a Kitty-compatible terminal (e.g. Ghostty) is detected inside tmux
     /// but `tmux show-options` does NOT confirm `allow-passthrough on`, the
     /// protocol must fall back to `HalfBlock`.  Without passthrough, tmux drops
@@ -3027,7 +3075,7 @@ mod tests {
     /// indicator for each U+10EEEE placeholder character.
     ///
     /// In the CI test environment no tmux server is running, so
-    /// `tmux show-options -g allow-passthrough` exits with an error and
+    /// `tmux show-options -p -A allow-passthrough` exits with an error and
     /// `tmux_allows_passthrough()` returns `false`.  The test exploits this to
     /// exercise the fallback path without needing a mock.
     #[test]
