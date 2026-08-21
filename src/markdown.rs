@@ -57,6 +57,10 @@ struct Renderer<'a> {
     in_link: bool,
     link_url: String,
 
+    // Frontmatter state
+    in_metadata: bool,
+    metadata_content: String,
+
     // Image state
     in_image: bool,
     image_url: String,
@@ -116,6 +120,8 @@ impl<'a> Renderer<'a> {
             table_current_row: Vec::new(),
             in_link: false,
             link_url: String::new(),
+            in_metadata: false,
+            metadata_content: String::new(),
             in_image: false,
             image_url: String::new(),
             image_alt: String::new(),
@@ -173,6 +179,68 @@ impl<'a> Renderer<'a> {
         }
 
         style
+    }
+
+    fn render_metadata(&mut self) {
+        let content = std::mem::take(&mut self.metadata_content);
+        let key_style = Style {
+            fg: Some(self.theme.json_key),
+            bold: true,
+            ..Default::default()
+        };
+        let value_style = Style {
+            fg: Some(self.theme.json_string),
+            ..Default::default()
+        };
+        let colon_style = Style {
+            fg: Some(self.theme.overlay_muted),
+            ..Default::default()
+        };
+
+        for raw in content.lines() {
+            let body = raw.trim_start();
+            if body.is_empty() {
+                continue;
+            }
+
+            // keep the source indentation, a list element ("- item") gets a
+            // bullet, and what follows it may still be a `key: value` pair
+            let indent = &raw[..raw.len() - body.len()];
+            let rest = match body.strip_prefix("- ") {
+                Some(item) => {
+                    self.push_span(
+                        &format!("{}• ", indent),
+                        Style {
+                            fg: Some(self.theme.bullet),
+                            ..Default::default()
+                        },
+                    );
+                    item
+                }
+                None => {
+                    self.push_span(indent, value_style.clone());
+                    body
+                }
+            };
+
+            // a key containing a space means the colon belongs to a value
+            // (a wrapped scalar, a quoted string), not to a new entry
+            match rest.split_once(':') {
+                Some((key, value)) if !key.is_empty() && !key.contains(' ') => {
+                    self.push_span(key, key_style.clone());
+                    self.push_span(":", colon_style.clone());
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        self.push_span(&format!(" {}", value), value_style.clone());
+                    }
+                }
+                _ => self.push_span(rest, value_style.clone()),
+            }
+
+            self.flush_line();
+        }
+
+        self.push_empty_line();
     }
 
     fn push_span(&mut self, text: &str, style: Style) {
@@ -916,6 +984,15 @@ impl<'a> Renderer<'a> {
                 self.in_link = false;
             }
 
+            Event::Start(Tag::MetadataBlock(_)) => {
+                self.in_metadata = true;
+                self.metadata_content.clear();
+            }
+            Event::End(TagEnd::MetadataBlock(_)) => {
+                self.in_metadata = false;
+                self.render_metadata();
+            }
+
             // Image handling
             Event::Start(Tag::Image { dest_url, .. }) => {
                 self.in_image = true;
@@ -1006,7 +1083,9 @@ impl<'a> Renderer<'a> {
             }
 
             Event::Text(text) => {
-                if self.in_image {
+                if self.in_metadata {
+                    self.metadata_content.push_str(&text);
+                } else if self.in_image {
                     self.image_alt.push_str(&text);
                 } else if self.in_table {
                     let mut style = self.current_style();
@@ -1579,6 +1658,8 @@ pub fn render_with(
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_MATH);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
 
     let parser = Parser::new_ext(input, options);
 
@@ -1608,6 +1689,28 @@ mod tests {
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    // ── Frontmatter ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn yaml_frontmatter_renders_one_entry_per_line() {
+        let input = "---\ntitle: Doc\nauthor: Foobar\ntags:\n  - one\n  - two\n---\n\nBody";
+        let (lines, _) = render_test(input);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts[0], "title: Doc");
+        assert_eq!(texts[1], "author: Foobar");
+        assert_eq!(texts[2], "tags:");
+        assert_eq!(texts[3], "  • one");
+        assert_eq!(texts[4], "  • two");
+        assert!(texts.iter().any(|t| t == "Body"));
+    }
+
+    #[test]
+    fn yaml_frontmatter_produces_no_slide_break() {
+        let input = "---\ntitle: Doc\n---\n\nBody";
+        let (lines, _) = render_test(input);
+        assert!(!lines.iter().any(|l| matches!(l.meta, LineMeta::SlideBreak)));
     }
 
     // ── Headings ────────────────────────────────────────────────────────────
