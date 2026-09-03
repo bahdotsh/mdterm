@@ -3103,7 +3103,7 @@ mod tests {
         assert!(
             buf.windows(header_prefix.len()).any(|w| w == header_prefix),
             "header not found in output.\nGot (hex): {:?}",
-            &buf
+            buf
         );
 
         // ── Check placeholder rows ────────────────────────────────────────
