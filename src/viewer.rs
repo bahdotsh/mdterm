@@ -2639,13 +2639,10 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     let fill_bg = if is_json_cursor {
                         Some(line_bg)
                     } else {
-                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                                Some(bg)
-                            } else {
-                                None
-                            }
-                        })
+                        line.spans
+                            .first()
+                            .and_then(|s| s.style.bg)
+                            .filter(|&bg| line.spans.iter().all(|s| s.style.bg == Some(bg)))
                     };
                     if let Some(bg) = fill_bg {
                         queue!(
