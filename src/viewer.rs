@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ pub struct ViewerOptions {
     pub slide_mode: bool,
     pub line_numbers: bool,
     pub width_override: Option<usize>,
+    pub picker_root: Option<PathBuf>,
+    pub start_in_picker: bool,
 }
 
 pub fn run(opts: ViewerOptions) -> io::Result<()> {
@@ -233,6 +236,7 @@ enum ViewMode {
     Toc,
     LinkPicker,
     FuzzyHeading,
+    FilePicker,
     Help,
 }
 
@@ -240,7 +244,10 @@ impl ViewMode {
     /// Modes where the user is typing free-form text; single-letter bindings
     /// like `?` or `h` must be passed through as input, not intercepted.
     fn accepts_text_input(self) -> bool {
-        matches!(self, ViewMode::Search | ViewMode::FuzzyHeading)
+        matches!(
+            self,
+            ViewMode::Search | ViewMode::FuzzyHeading | ViewMode::FilePicker
+        )
     }
 }
 
@@ -316,6 +323,7 @@ struct ViewerState {
 
     // Help overlay
     help_scroll: usize,
+    help_return_mode: ViewMode,
 
     // Link picker
     link_entries: Vec<LinkEntry>,
@@ -326,6 +334,10 @@ struct ViewerState {
     fuzzy_input: String,
     fuzzy_selected: usize,
     fuzzy_scroll: usize,
+
+    // File picker
+    file_picker: Option<crate::file_picker::FilePickerState>,
+    file_picker_can_close: bool,
 
     // Slide mode
     current_slide: usize,
@@ -420,18 +432,22 @@ impl ViewerState {
             slide_mode: opts.slide_mode,
             line_numbers: opts.line_numbers,
             width_override: opts.width_override,
-            mode: ViewMode::Normal,
             search: SearchState::new(),
             toc_entries: Vec::new(),
             toc_selected: 0,
             toc_scroll: 0,
             help_scroll: 0,
+            help_return_mode: ViewMode::Normal,
             link_entries: Vec::new(),
             link_selected: 0,
             link_scroll: 0,
             fuzzy_input: String::new(),
             fuzzy_selected: 0,
             fuzzy_scroll: 0,
+            file_picker: opts
+                .picker_root
+                .map(crate::file_picker::FilePickerState::new),
+            file_picker_can_close: !opts.start_in_picker,
             current_slide: 0,
             slide_boundaries: Vec::new(),
             file_watcher,
@@ -448,6 +464,11 @@ impl ViewerState {
             nav_history: Vec::new(),
             json_view: None,
             cached_json: None,
+            mode: if opts.start_in_picker {
+                ViewMode::FilePicker
+            } else {
+                ViewMode::Normal
+            },
         }
     }
 
@@ -473,6 +494,74 @@ impl ViewerState {
         let viewport = self.viewport();
         let box_h = (count + 2).min(viewport.saturating_sub(4).max(3));
         box_h.saturating_sub(2).max(1)
+    }
+
+    fn file_picker_visible_entries(&self) -> usize {
+        self.viewport().saturating_sub(7).max(1)
+    }
+
+    fn has_current_file(&self) -> bool {
+        !self.files.is_empty()
+            && self.current_file_idx < self.files.len()
+            && self.filename == self.files[self.current_file_idx]
+    }
+
+    fn open_file_picker(&mut self) {
+        if self.file_picker.is_none() {
+            let root = self
+                .current_file_parent()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            self.file_picker = Some(crate::file_picker::FilePickerState::new(root));
+        }
+
+        let visible_entries = self.file_picker_visible_entries();
+        if let Some(current) = self.current_file_path()
+            && let Some(picker) = self.file_picker.as_mut()
+        {
+            picker.select_path(&current);
+            picker.keep_selection_visible(visible_entries);
+        }
+
+        self.file_picker_can_close = true;
+        reset_cursor_shape(self);
+        self.mode = ViewMode::FilePicker;
+        self.dirty = true;
+    }
+
+    fn current_file_path(&self) -> Option<PathBuf> {
+        if self.has_current_file() {
+            Some(PathBuf::from(&self.files[self.current_file_idx]))
+        } else {
+            None
+        }
+    }
+
+    fn current_file_parent(&self) -> Option<PathBuf> {
+        self.current_file_path()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+    }
+
+    fn open_path_from_picker(&mut self, path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let target_idx = self.files.iter().position(|file| {
+            Path::new(file)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(file))
+                == canonical
+        });
+        let target_idx = target_idx.unwrap_or_else(|| {
+            self.files
+                .push(crate::file_picker::display_path(&canonical));
+            self.files.len() - 1
+        });
+
+        if self.switch_file(target_idx) {
+            self.file_picker_can_close = true;
+            self.mode = ViewMode::Normal;
+            true
+        } else {
+            false
+        }
     }
 
     fn max_offset(&self) -> usize {
@@ -800,8 +889,11 @@ impl ViewerState {
     }
 
     fn switch_file(&mut self, idx: usize) -> bool {
-        if idx >= self.files.len() || idx == self.current_file_idx {
-            return idx < self.files.len() && idx == self.current_file_idx;
+        if idx >= self.files.len() {
+            return false;
+        }
+        if idx == self.current_file_idx && self.filename == self.files[idx] {
+            return true;
         }
         let path = self.files[idx].clone();
         if let Ok(c) = std::fs::read_to_string(&path) {
@@ -990,6 +1082,19 @@ impl ViewerState {
 
 // ── Event handling ──────────────────────────────────────────────────────────
 
+fn open_help(state: &mut ViewerState) {
+    reset_cursor_shape(state);
+    state.help_scroll = 0;
+    state.help_return_mode = state.mode;
+    state.mode = ViewMode::Help;
+    state.dirty = true;
+}
+
+fn close_help(state: &mut ViewerState) {
+    state.mode = state.help_return_mode;
+    state.dirty = true;
+}
+
 fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
     match ev {
         Event::Key(ke) if ke.kind == KeyEventKind::Press => {
@@ -1004,13 +1109,10 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 json_nav_active(state),
             ) {
                 if state.mode == ViewMode::Help {
-                    state.mode = ViewMode::Normal;
+                    close_help(state);
                 } else {
-                    reset_cursor_shape(state);
-                    state.help_scroll = 0;
-                    state.mode = ViewMode::Help;
+                    open_help(state);
                 }
-                state.dirty = true;
                 return false;
             }
             if state.mode == ViewMode::Help {
@@ -1018,7 +1120,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_mode = state.mode;
                 match ke.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        state.mode = ViewMode::Normal;
+                        close_help(state);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let total = help_total_rows();
@@ -1100,6 +1202,10 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                         state.dirty = true;
                     }
                 }
+                ViewMode::FilePicker => {
+                    state.dirty = true;
+                    return handle_file_picker(state, ke.code, ke.modifiers);
+                }
                 ViewMode::Help => {}
             }
         }
@@ -1110,6 +1216,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_help = state.help_scroll;
                 let prev_toc = (state.toc_selected, state.toc_scroll);
                 let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
+                let prev_picker = state.file_picker.as_ref().map(|p| (p.selected, p.scroll));
                 match state.mode {
                     ViewMode::Help => {
                         let total = help_total_rows();
@@ -1126,6 +1233,9 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     ViewMode::FuzzyHeading => {
                         handle_fuzzy(state, KeyCode::Down, KeyModifiers::empty());
                     }
+                    ViewMode::FilePicker => {
+                        handle_file_picker(state, KeyCode::Down, KeyModifiers::empty());
+                    }
                     _ if state.slide_mode => {
                         if state.current_slide + 1 < state.slide_boundaries.len() {
                             state.current_slide += 1;
@@ -1141,6 +1251,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     || state.help_scroll != prev_help
                     || (state.toc_selected, state.toc_scroll) != prev_toc
                     || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                    || state.file_picker.as_ref().map(|p| (p.selected, p.scroll)) != prev_picker
                 {
                     state.dirty = true;
                 }
@@ -1151,6 +1262,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                 let prev_help = state.help_scroll;
                 let prev_toc = (state.toc_selected, state.toc_scroll);
                 let prev_fuzzy = (state.fuzzy_selected, state.fuzzy_scroll);
+                let prev_picker = state.file_picker.as_ref().map(|p| (p.selected, p.scroll));
                 match state.mode {
                     ViewMode::Help => {
                         state.help_scroll = state.help_scroll.saturating_sub(3);
@@ -1160,6 +1272,9 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     }
                     ViewMode::FuzzyHeading => {
                         handle_fuzzy(state, KeyCode::Up, KeyModifiers::empty());
+                    }
+                    ViewMode::FilePicker => {
+                        handle_file_picker(state, KeyCode::Up, KeyModifiers::empty());
                     }
                     _ if state.slide_mode => {
                         state.current_slide = state.current_slide.saturating_sub(1);
@@ -1173,6 +1288,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     || state.help_scroll != prev_help
                     || (state.toc_selected, state.toc_scroll) != prev_toc
                     || (state.fuzzy_selected, state.fuzzy_scroll) != prev_fuzzy
+                    || state.file_picker.as_ref().map(|p| (p.selected, p.scroll)) != prev_picker
                 {
                     state.dirty = true;
                 }
@@ -1717,6 +1833,11 @@ fn handle_normal(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> 
             state.mode = ViewMode::FuzzyHeading;
         }
 
+        // File picker
+        KeyCode::Char('p') => {
+            state.open_file_picker();
+        }
+
         // Copy full document
         KeyCode::Char('Y') => {
             let text = state.full_text();
@@ -1831,6 +1952,9 @@ fn handle_slide_keys(state: &mut ViewerState, code: KeyCode) -> bool {
         KeyCode::Char('t') => {
             state.theme = state.theme.toggle();
             state.rebuild();
+        }
+        KeyCode::Char('p') => {
+            state.open_file_picker();
         }
         _ => {}
     }
@@ -2165,6 +2289,106 @@ fn fuzzy_filter(entries: &[TocEntry], query: &str) -> Vec<TocEntry> {
         .filter(|e| e.text.to_lowercase().contains(&q))
         .cloned()
         .collect()
+}
+
+fn handle_file_picker(state: &mut ViewerState, code: KeyCode, mods: KeyModifiers) -> bool {
+    if state.file_picker.is_none() {
+        state.open_file_picker();
+    }
+
+    let visible_entries = state.file_picker_visible_entries();
+    let is_nav_down = code == KeyCode::Down
+        || code == KeyCode::PageDown
+        || (code == KeyCode::Char('n') && mods.contains(KeyModifiers::CONTROL));
+    let is_nav_up = code == KeyCode::Up
+        || code == KeyCode::PageUp
+        || (code == KeyCode::Char('p') && mods.contains(KeyModifiers::CONTROL));
+
+    if is_nav_up || is_nav_down {
+        if let Some(picker) = state.file_picker.as_mut() {
+            let step = if matches!(code, KeyCode::PageUp | KeyCode::PageDown) {
+                visible_entries
+            } else {
+                1
+            };
+            if is_nav_up {
+                picker.move_up(step, visible_entries);
+            } else {
+                picker.move_down(step, visible_entries);
+            }
+        }
+        return false;
+    }
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('p') => {
+            if state.file_picker_can_close {
+                state.mode = ViewMode::Normal;
+                false
+            } else {
+                true
+            }
+        }
+        KeyCode::Char('q') => {
+            if state.file_picker_can_close {
+                state.mode = ViewMode::Normal;
+                false
+            } else {
+                true
+            }
+        }
+        KeyCode::Enter => {
+            let selected_path = state
+                .file_picker
+                .as_ref()
+                .and_then(crate::file_picker::FilePickerState::selected_path);
+            if let Some(path) = selected_path {
+                if !state.open_path_from_picker(&path) {
+                    state.set_toast("Failed to open file");
+                }
+            } else {
+                state.set_toast("No file selected");
+            }
+            false
+        }
+        KeyCode::Backspace => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.backspace();
+            }
+            false
+        }
+        KeyCode::Home => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.move_home();
+            }
+            false
+        }
+        KeyCode::End => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.move_end(visible_entries);
+            }
+            false
+        }
+        KeyCode::F(5) => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.refresh();
+            }
+            false
+        }
+        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.clear();
+            }
+            false
+        }
+        KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            if let Some(picker) = state.file_picker.as_mut() {
+                picker.push(c);
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 // ── Search state ────────────────────────────────────────────────────────────
@@ -2762,6 +2986,7 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
         ViewMode::Toc => render_toc_overlay(stdout, state)?,
         ViewMode::LinkPicker => render_link_picker_overlay(stdout, state)?,
         ViewMode::FuzzyHeading => render_fuzzy_overlay(stdout, state)?,
+        ViewMode::FilePicker => render_file_picker_overlay(stdout, state)?,
         ViewMode::Help => render_help_overlay(stdout, state)?,
         _ => {}
     }
@@ -2779,6 +3004,45 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     let width = state.cols as usize;
     let viewport = state.viewport();
     let theme = &state.theme;
+
+    if state.mode == ViewMode::FilePicker {
+        let count_label = state
+            .file_picker
+            .as_ref()
+            .map(|picker| format!(" {}/{} ", picker.match_count(), picker.total_count()))
+            .unwrap_or_else(|| " 0/0 ".to_string());
+        let count_len = count_label.chars().count();
+        let hint = " type search · ↑↓ select · Enter open · p/Esc close ";
+        let hint_len = hint.chars().count();
+        let needed = 4 + hint_len + count_len;
+        let (show_hint, fill) = if width > needed {
+            (true, width - needed)
+        } else {
+            (false, width.saturating_sub(4 + count_len))
+        };
+
+        queue!(
+            stdout,
+            MoveTo(0, (viewport + 1) as u16),
+            SetBackgroundColor(theme.bg),
+            SetForegroundColor(theme.border),
+            Print("╰─"),
+        )?;
+        if show_hint {
+            queue!(stdout, SetForegroundColor(theme.help_hint), Print(hint))?;
+        }
+        queue!(
+            stdout,
+            SetForegroundColor(theme.border),
+            Print("─".repeat(fill)),
+            SetForegroundColor(theme.position),
+            Print(&count_label),
+            SetForegroundColor(theme.border),
+            Print("─╯"),
+            SetAttribute(Attribute::Reset),
+        )?;
+        return Ok(());
+    }
 
     if state.slide_mode {
         let num_slides = state.slide_boundaries.len().max(1);
@@ -2961,7 +3225,7 @@ fn render_status_bar(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result
     };
     let loading_len = loading_label.chars().count();
 
-    let hint = " / search · o toc · f links · t theme · ? help ";
+    let hint = " / search · p files · o toc · f links · t theme · ? help ";
     let hint_len = hint.chars().count();
     let needed = 4 + hint_len + loading_len + pos_len;
     let (show_hint, fill) = if width > needed {
@@ -3585,6 +3849,200 @@ fn render_fuzzy_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Res
     Ok(())
 }
 
+fn render_file_picker_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Result<()> {
+    let Some(picker) = state.file_picker.as_ref() else {
+        return Ok(());
+    };
+    let theme = &state.theme;
+    let width = state.cols as usize;
+    let viewport = state.viewport();
+
+    if width < 24 || viewport < 5 {
+        return Ok(());
+    }
+
+    let total = picker.match_count();
+    let visible_capacity = state.file_picker_visible_entries();
+    let visible = if total == 0 {
+        1
+    } else {
+        total.min(visible_capacity)
+    };
+    let box_w = (width * 4 / 5).max(42).min(width.saturating_sub(4));
+    let box_h = visible + 4;
+    let x_off = (width.saturating_sub(box_w)) / 2;
+    let y_off = (viewport.saturating_sub(box_h)) / 2 + 1;
+    let inner = box_w.saturating_sub(2);
+
+    let count_label = if picker.input.trim().is_empty() {
+        format!(" {} files ", picker.total_count())
+    } else if total == 0 {
+        " no match ".to_string()
+    } else {
+        format!(" {}/{} ", picker.selected + 1, total)
+    };
+    let count_len = count_label.chars().count();
+    let title_budget = box_w.saturating_sub(4 + count_len);
+    let title = truncate_middle_text(&format!(" Files {} ", picker.root_label), title_budget);
+    let title_len = title.chars().count();
+    let top_dashes = box_w.saturating_sub(3 + title_len + count_len);
+
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, y_off as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("╭─"),
+        SetForegroundColor(theme.overlay_text),
+        Print(&title),
+        SetForegroundColor(theme.overlay_border),
+        Print("─".repeat(top_dashes)),
+        SetForegroundColor(theme.overlay_muted),
+        Print(&count_label),
+        SetForegroundColor(theme.overlay_border),
+        Print("╮"),
+    )?;
+
+    let search_prefix = " Search ";
+    let input_budget = inner.saturating_sub(search_prefix.chars().count() + 4);
+    let input = truncate_start_text(&picker.input, input_budget);
+    let search_display = format!("{search_prefix}> {input}█");
+    let search_len = search_display.chars().count();
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, (y_off + 1) as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("│"),
+        SetForegroundColor(theme.search_prompt),
+        Print(&search_display),
+        SetForegroundColor(theme.overlay_bg),
+        Print(" ".repeat(inner.saturating_sub(search_len))),
+        SetForegroundColor(theme.overlay_border),
+        Print("│"),
+    )?;
+
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, (y_off + 2) as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("├"),
+        Print("─".repeat(inner)),
+        Print("┤"),
+    )?;
+
+    if total == 0 {
+        let message = if let Some(error) = picker.error.as_ref() {
+            format!("  Error: {error}")
+        } else if picker.total_count() == 0 {
+            "  No .md files found".to_string()
+        } else {
+            "  No matching files".to_string()
+        };
+        let display = truncate_end_text(&message, inner);
+        let display_len = display.chars().count();
+        queue!(
+            stdout,
+            MoveTo(x_off as u16, (y_off + 3) as u16),
+            SetBackgroundColor(theme.overlay_bg),
+            SetForegroundColor(theme.overlay_border),
+            Print("│"),
+            SetForegroundColor(theme.overlay_muted),
+            Print(&display),
+            Print(" ".repeat(inner.saturating_sub(display_len))),
+            SetForegroundColor(theme.overlay_border),
+            Print("│"),
+        )?;
+    } else {
+        for (row, entry) in picker.visible_entries(visible).iter().enumerate() {
+            let match_idx = picker.scroll + row;
+            let is_selected = match_idx == picker.selected;
+            let marker = if is_selected { " ▸ " } else { "   " };
+            let marker_len = marker.chars().count();
+            let available = inner.saturating_sub(marker_len);
+            let display = truncate_middle_text(&entry.display, available);
+            let display_len = display.chars().count();
+            let padding = inner.saturating_sub(marker_len + display_len);
+
+            queue!(
+                stdout,
+                MoveTo(x_off as u16, (y_off + 3 + row) as u16),
+                SetBackgroundColor(theme.overlay_bg),
+                SetForegroundColor(theme.overlay_border),
+                Print("│"),
+            )?;
+
+            if is_selected {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(theme.overlay_selected_bg),
+                    SetForegroundColor(theme.overlay_selected_fg),
+                    Print(marker),
+                    Print(&display),
+                    Print(" ".repeat(padding)),
+                    SetBackgroundColor(theme.overlay_bg),
+                    SetForegroundColor(theme.overlay_border),
+                    Print("│"),
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetForegroundColor(theme.overlay_text),
+                    Print(marker),
+                    Print(&display),
+                    Print(" ".repeat(padding)),
+                    SetForegroundColor(theme.overlay_border),
+                    Print("│"),
+                )?;
+            }
+        }
+    }
+
+    let has_above = picker.scroll > 0;
+    let has_below = total > 0 && picker.scroll + visible < total;
+    let scroll_hint = match (has_above, has_below) {
+        (true, true) => " ▲▼ ",
+        (true, false) => " ▲ ",
+        (false, true) => " ▼ ",
+        (false, false) => "",
+    };
+    let footer_raw = if state.file_picker_can_close {
+        " type search · ↑↓ select · Enter open · F5 refresh · p/Esc close "
+    } else {
+        " type search · ↑↓ select · Enter open · F5 refresh · q quit "
+    };
+    let scroll_hint_len = scroll_hint.chars().count();
+    let footer = truncate_end_text(footer_raw, box_w.saturating_sub(3 + scroll_hint_len));
+    let footer_len = footer.chars().count() + scroll_hint_len;
+    let bot_dashes = box_w.saturating_sub(3 + footer_len);
+
+    queue!(
+        stdout,
+        MoveTo(x_off as u16, (y_off + 3 + visible) as u16),
+        SetBackgroundColor(theme.overlay_bg),
+        SetForegroundColor(theme.overlay_border),
+        Print("╰─"),
+        SetForegroundColor(theme.overlay_muted),
+        Print(&footer),
+    )?;
+    if !scroll_hint.is_empty() {
+        queue!(
+            stdout,
+            SetForegroundColor(theme.overlay_text),
+            Print(scroll_hint),
+        )?;
+    }
+    queue!(
+        stdout,
+        SetForegroundColor(theme.overlay_border),
+        Print(format!("{}╯", "─".repeat(bot_dashes))),
+        SetAttribute(Attribute::Reset),
+    )?;
+
+    Ok(())
+}
+
 // ── Help overlay ────────────────────────────────────────────────────────────
 
 /// A section in the help overlay: section title + list of (key, description) pairs.
@@ -3623,6 +4081,7 @@ pub(crate) fn help_sections() -> &'static [HelpSection] {
                 ("o", "Table of contents"),
                 ("f", "Link picker (open URLs)"),
                 (":", "Fuzzy heading jump"),
+                ("p", "File picker"),
                 ("h / ? / F1", "This help screen"),
             ],
         },
@@ -3835,6 +4294,71 @@ fn render_help_overlay(stdout: &mut io::Stdout, state: &ViewerState) -> io::Resu
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+fn truncate_end_text(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+fn truncate_start_text(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{suffix}")
+}
+
+fn truncate_middle_text(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let left = max_chars.saturating_sub(1) / 2;
+    let right = max_chars.saturating_sub(1).saturating_sub(left);
+    let prefix: String = value.chars().take(left).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
+}
+
 fn format_position(lines: &[Line], offset: usize, viewport: usize) -> String {
     if lines.len() <= viewport {
         "All".to_string()
@@ -4012,6 +4536,7 @@ mod tests {
         ViewMode::Toc,
         ViewMode::LinkPicker,
         ViewMode::FuzzyHeading,
+        ViewMode::FilePicker,
         ViewMode::Help,
     ];
 
@@ -4255,6 +4780,8 @@ mod tests {
             slide_mode: false,
             line_numbers: false,
             width_override: None,
+            picker_root: None,
+            start_in_picker: false,
         };
         let mut state = ViewerState::new(opts, 80, 24);
         state.wrapped = lines;

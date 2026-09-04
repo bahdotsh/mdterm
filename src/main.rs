@@ -1,6 +1,7 @@
 mod config;
 mod diagram;
 mod export;
+mod file_picker;
 mod image;
 mod json;
 mod markdown;
@@ -9,6 +10,7 @@ mod theme;
 mod viewer;
 
 use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
 use std::{fs, process};
 
 use clap::Parser;
@@ -55,6 +57,9 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     let config = config::Config::load();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let interactive = stdout_is_terminal && !cli.no_color;
 
     // Determine theme
     let theme_name = cli.theme.as_deref().unwrap_or(&config.theme);
@@ -72,36 +77,47 @@ fn main() {
         0
     };
 
-    // Read content: stdin or file(s)
-    let (content, filename) = if cli.files.is_empty() {
-        if io::stdin().is_terminal() {
-            eprintln!("Usage: mdterm [OPTIONS] <FILE>...");
-            eprintln!("       command | mdterm");
-            eprintln!();
-            eprintln!("Try 'mdterm --help' for more information.");
-            process::exit(1);
-        }
-        const MAX_STDIN_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
-        let mut buf = String::new();
-        let n = io::stdin()
-            .take(MAX_STDIN_BYTES + 1)
-            .read_to_string(&mut buf)
-            .unwrap_or_else(|e| {
-                eprintln!("Error reading stdin: {}", e);
+    // Read content: stdin, file(s), or prepare an interactive directory picker.
+    let mut picker_root: Option<PathBuf> = None;
+    let mut start_in_picker = false;
+    let (content, filename, files) = if cli.files.is_empty() {
+        if stdin_is_terminal {
+            if interactive && cli.export.is_none() {
+                let root = current_dir_or_exit();
+                let filename = file_picker::display_path(&root);
+                picker_root = Some(root);
+                start_in_picker = true;
+                (String::new(), filename, Vec::new())
+            } else {
+                eprintln!("Usage: mdterm [OPTIONS] <FILE|DIRECTORY>...");
+                eprintln!("       command | mdterm");
+                eprintln!();
+                eprintln!("Try 'mdterm --help' for more information.");
                 process::exit(1);
-            });
-        if n as u64 > MAX_STDIN_BYTES {
-            eprintln!("Error: stdin input exceeds 100 MB limit");
+            }
+        } else {
+            let content = read_stdin_or_exit();
+            (content, "<stdin>".to_string(), Vec::new())
+        }
+    } else if Path::new(&cli.files[0]).is_dir() {
+        if !interactive || cli.export.is_some() {
+            eprintln!("Error: directory picker requires an interactive terminal");
             process::exit(1);
         }
-        (buf, "<stdin>".to_string())
+        let root = Path::new(&cli.files[0])
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&cli.files[0]));
+        let filename = file_picker::display_path(&root);
+        picker_root = Some(root);
+        start_in_picker = true;
+        (String::new(), filename, Vec::new())
     } else {
         let path = &cli.files[0];
         let c = fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("Error reading '{}': {}", path, e);
             process::exit(1);
         });
-        (c, path.clone())
+        (c, path.clone(), cli.files.clone())
     };
 
     let is_json = filename.ends_with(".json");
@@ -122,15 +138,17 @@ fn main() {
     }
 
     // Interactive or piped
-    if io::stdout().is_terminal() && !cli.no_color {
+    if interactive {
         let opts = viewer::ViewerOptions {
-            files: cli.files,
+            files,
             initial_content: content,
             filename,
             theme: initial_theme,
             slide_mode: cli.slides,
             line_numbers,
             width_override: if width > 0 { Some(width) } else { None },
+            picker_root,
+            start_in_picker,
         };
         if let Err(e) = viewer::run(opts) {
             eprintln!("Viewer error: {}", e);
@@ -162,4 +180,28 @@ fn main() {
             viewer::print_lines(&wrapped);
         }
     }
+}
+
+fn read_stdin_or_exit() -> String {
+    const MAX_STDIN_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+    let mut buf = String::new();
+    let n = io::stdin()
+        .take(MAX_STDIN_BYTES + 1)
+        .read_to_string(&mut buf)
+        .unwrap_or_else(|e| {
+            eprintln!("Error reading stdin: {}", e);
+            process::exit(1);
+        });
+    if n as u64 > MAX_STDIN_BYTES {
+        eprintln!("Error: stdin input exceeds 100 MB limit");
+        process::exit(1);
+    }
+    buf
+}
+
+fn current_dir_or_exit() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("Error reading current directory: {}", e);
+        process::exit(1);
+    })
 }
