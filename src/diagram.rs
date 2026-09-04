@@ -444,7 +444,9 @@ pub(crate) struct FeedbackRouteLr {
     /// Row of the destination's bottom border.
     pub(crate) dst_bottom_y: usize,
     /// Gap column left of the destination's column that carries the rise from
-    /// the lane.
+    /// the lane, two columns clear of it rather than one: the column
+    /// immediately left of a box is where every forward arrowhead into it
+    /// lands, and sharing it would overwrite the junction.
     pub(crate) entry_lane_x: usize,
     /// Row of the horizontal lane in the gutter below the diagram.
     pub(crate) lane_y: usize,
@@ -752,6 +754,9 @@ pub(crate) struct CanvasCell {
     pub(crate) bg: Option<Color>,
     pub(crate) is_node: bool,
     pub(crate) connects: u8,
+    /// Drawn by a feedback route. Labels go on last and overwrite whatever is
+    /// under them, so this is what [`Canvas::set_label`] checks against.
+    is_feedback: bool,
 }
 
 impl Default for CanvasCell {
@@ -762,6 +767,7 @@ impl Default for CanvasCell {
             bg: None,
             is_node: false,
             connects: 0,
+            is_feedback: false,
         }
     }
 }
@@ -824,6 +830,68 @@ impl Canvas {
             );
         }
         self.add_connection(x, y, dir, fg);
+        if y < self.height && x < self.width {
+            self.cells[y][x].is_feedback = true;
+        }
+    }
+
+    /// Write one character of a label.
+    ///
+    /// Labels are drawn after the routes and overwrite whatever is under them,
+    /// so one placed badly hides a route instead of the other way round. Under
+    /// test the only cells a label may take are ones no feedback route drew,
+    /// plus, for a label riding inline on a left-right lane, that lane's own
+    /// plain horizontal run.
+    fn set_label(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>, on_lane: bool) {
+        // Only the assertion below reads `on_lane`, and it is test-only.
+        #[cfg(not(test))]
+        let _ = on_lane;
+        #[cfg(test)]
+        if y < self.height && x < self.width {
+            let cell = &self.cells[y][x];
+            let allowed = !cell.is_feedback
+                || (on_lane && !cell.is_node && cell.connects == (CONN_LEFT | CONN_RIGHT));
+            assert!(
+                allowed,
+                "label character {ch:?} lands on the feedback route cell at ({x}, {y})"
+            );
+        }
+        self.set(x, y, ch, fg);
+    }
+
+    /// True when the cell carries a plain horizontal run and nothing else, so
+    /// a label may be written over it without hiding a corner, a crossing or
+    /// a box.
+    fn is_plain_horizontal(&self, x: usize, y: usize) -> bool {
+        y < self.height && x < self.width && {
+            let cell = &self.cells[y][x];
+            !cell.is_node && cell.connects == (CONN_LEFT | CONN_RIGHT)
+        }
+    }
+
+    /// Longest stretch of plain horizontal run in `lo..=hi` on row `y`,
+    /// as `(start, length)`. Length is zero when there is no such stretch.
+    fn longest_plain_run(&self, y: usize, lo: usize, hi: usize) -> (usize, usize) {
+        if hi < lo {
+            return (lo, 0);
+        }
+        let (mut best_start, mut best_len) = (lo, 0);
+        let (mut start, mut len) = (lo, 0);
+        for x in lo..=hi {
+            if !self.is_plain_horizontal(x, y) {
+                len = 0;
+                continue;
+            }
+            if len == 0 {
+                start = x;
+            }
+            len += 1;
+            if len > best_len {
+                best_len = len;
+                best_start = start;
+            }
+        }
+        (best_start, best_len)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1009,6 +1077,9 @@ impl Canvas {
         row_ys
     }
 
+    /// `label_max_x` is the last column a label may use. The gutter lanes sit
+    /// right of the diagram on every row, so a label long enough to reach them
+    /// would cut a feedback route; it is truncated instead.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_edge_td(
         &mut self,
@@ -1020,6 +1091,7 @@ impl Canvas {
         edge_fg: Option<Color>,
         label_fg: Option<Color>,
         bus_y_override: Option<usize>,
+        label_max_x: Option<usize>,
     ) {
         if src_bottom_y + 1 >= dst_top_y {
             return;
@@ -1043,8 +1115,10 @@ impl Canvas {
             // Place label beside the vertical line
             if let Some(text) = label {
                 let label_y = src_bottom_y + 1;
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(src_cx + 2 + i, label_y, ch, label_fg);
+                let label_x = src_cx + 2;
+                let room = label_max_x.map_or(usize::MAX, |hi| (hi + 1).saturating_sub(label_x));
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg, false);
                 }
             }
         } else {
@@ -1092,20 +1166,27 @@ impl Canvas {
                 let label_len = text.chars().count();
                 let label_start = min_x + (max_x - min_x).saturating_sub(label_len) / 2;
                 let label_y = if mid_y > 0 { mid_y - 1 } else { mid_y };
-                for (i, ch) in text.chars().enumerate() {
+                let room =
+                    label_max_x.map_or(usize::MAX, |hi| (hi + 1).saturating_sub(label_start));
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
                     let lx = label_start + i;
                     if lx < self.width {
-                        self.set(lx, label_y, ch, label_fg);
+                        self.set_label(lx, label_y, ch, label_fg, false);
                     }
                 }
             }
         }
     }
 
+    /// `label_bounds` is the inclusive range of columns a label may occupy.
+    /// The gap between two node columns also carries the drop and rise
+    /// columns of the feedback routes, and a label written over one of those
+    /// hides the route instead of the other way round, so the renderer passes
+    /// the columns that are free and a label too long for them is cut.
+    /// `None` leaves the label unbounded.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_edge_lr(
         &mut self,
-        _src_cx: usize,
         src_right_x: usize,
         src_cy: usize,
         dst_left_x: usize,
@@ -1114,6 +1195,7 @@ impl Canvas {
         edge_fg: Option<Color>,
         label_fg: Option<Color>,
         mid_x_override: Option<usize>,
+        label_bounds: Option<(usize, usize)>,
     ) {
         if src_right_x + 1 >= dst_left_x {
             return;
@@ -1130,12 +1212,18 @@ impl Canvas {
             // Arrow replaces last segment
             self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
 
-            // Label above the horizontal line
+            // Label above the horizontal line, held inside the free columns.
             if let Some(text) = label {
-                let label_x = src_right_x + 2;
                 let label_y = if src_cy > 0 { src_cy - 1 } else { 0 };
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(label_x + i, label_y, ch, label_fg);
+                let (label_x, room) = match label_bounds {
+                    Some((lo, hi)) => {
+                        let x = (src_right_x + 2).max(lo);
+                        (x, (hi + 1).saturating_sub(x))
+                    }
+                    None => (src_right_x + 2, usize::MAX),
+                };
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg, false);
                 }
             }
         } else {
@@ -1178,11 +1266,33 @@ impl Canvas {
             // Arrow
             self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
 
-            // Label near the vertical segment
+            // Label beside the vertical segment: right of the bend where
+            // there is room for it, otherwise left of the bend, and cut when
+            // neither side can hold it. Running past the free columns would
+            // hide a feedback route or the destination box.
             if let Some(text) = label {
                 let label_y = min_y + (max_y - min_y).saturating_sub(1) / 2;
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(mid_x + 2 + i, label_y, ch, label_fg);
+                let len = text.chars().count();
+                let (label_x, room) = match label_bounds {
+                    Some((lo, hi)) => {
+                        let right_x = (mid_x + 2).max(lo);
+                        let right_room = (hi + 1).saturating_sub(right_x);
+                        let left_hi = mid_x.saturating_sub(1).min(hi);
+                        let left_room = (left_hi + 1).saturating_sub(lo);
+                        if len <= right_room {
+                            (right_x, right_room)
+                        } else if len <= left_room {
+                            (left_hi + 1 - len, left_room)
+                        } else if right_room >= left_room {
+                            (right_x, right_room)
+                        } else {
+                            (lo, left_room)
+                        }
+                    }
+                    None => (mid_x + 2, usize::MAX),
+                };
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg, false);
                 }
             }
         }
@@ -1487,6 +1597,12 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) else {
             continue;
         };
+        let (Some(&(src_layer, _)), Some(&(dst_layer, _))) = (
+            layout.node_pos.get(&edge.from),
+            layout.node_pos.get(&edge.to),
+        ) else {
+            continue;
+        };
         let route = FeedbackRouteTd {
             // Leave under the left border. A straight forward edge writes its
             // label two columns right of the box centre on the first gap row,
@@ -1502,14 +1618,48 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         canvas.draw_feedback_edge_td(&route, edge_fg);
 
         if let Some(text) = edge.label.as_deref() {
-            // Beside this edge's lane, level with the middle of its vertical run.
-            let y = (route.entry_y + route.exit_y) / 2;
+            // Beside this edge's lane, on the middle row of whichever box the
+            // lane passes closest to its centre. Only node rows will do: every
+            // gap row in the gutter can carry the horizontal run of an outer
+            // lane, and a label there would cut another edge's route.
+            let middle = (route.entry_y + route.exit_y) / 2;
+            let y = (src_layer.min(dst_layer)..=src_layer.max(dst_layer))
+                .map(|l| layer_top[l] + 1)
+                .min_by_key(|&row| row.abs_diff(middle))
+                .unwrap_or(middle);
             labels.push((route.lane_x + 2, y, text.to_string()));
         }
     }
     for (x, y, text) in &labels {
         for (i, ch) in text.chars().enumerate() {
-            canvas.set(x + i, *y, ch, label_fg);
+            canvas.set_label(x + i, *y, ch, label_fg, false);
+        }
+    }
+
+    // Columns where a feedback stem drops out of each layer. A straight
+    // forward edge writes its label along the first gap row, which is the row
+    // those stems drop through, so the label stops before the nearest one.
+    let mut stem_cols: Vec<Vec<usize>> = vec![Vec::new(); layers.len()];
+    for plan in &feedback.plans {
+        let from = &graph.edges[plan.edge].from;
+        if let (Some(src), Some(&(layer, _))) = (positions.get(from), layout.node_pos.get(from)) {
+            stem_cols[layer].push(src.left_x() + 1);
+        }
+    }
+    for cols in &mut stem_cols {
+        cols.sort_unstable();
+        cols.dedup();
+    }
+
+    // Every row a feedback route reserved, so that a forward edge whose span
+    // no gap budget covers can be moved off one.
+    let mut reserved_rows: HashSet<usize> = HashSet::new();
+    for (k, &top) in layer_top.iter().enumerate() {
+        for r in 0..feedback.exits[k] {
+            reserved_rows.insert(top + 4 + r);
+        }
+        for r in 0..feedback.entries[k] {
+            reserved_rows.insert(top.saturating_sub(2 + r));
         }
     }
 
@@ -1521,7 +1671,10 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
             // Between adjacent layers the bus sits below the gap's exit rows
             // and above its entry rows, so neither it nor the label on the row
-            // above it can land on a feedback route.
+            // above it can land on a feedback route. An edge spanning more
+            // than one layer keeps the midpoint of its own span, which no gap
+            // budget accounts for, so it is pushed down off any reserved row
+            // it or its label would otherwise land on.
             let bus_y = match (
                 layout.node_pos.get(&edge.from),
                 layout.node_pos.get(&edge.to),
@@ -1529,8 +1682,24 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                 (Some(&(from, _)), Some(&(to, _))) if to == from + 1 => {
                     Some(src.bottom_y() + 3 + feedback.exits[from])
                 }
+                _ if dst.top_y > src.bottom_y() + 1 => {
+                    let mut y = src.bottom_y() + 1 + (dst.top_y - src.bottom_y() - 1) / 2;
+                    while y + 1 < dst.top_y
+                        && (reserved_rows.contains(&y) || reserved_rows.contains(&(y - 1)))
+                    {
+                        y += 1;
+                    }
+                    Some(y)
+                }
                 _ => None,
             };
+            let mut label_max_x = core_width.saturating_sub(1);
+            if src.center_x == dst.center_x
+                && let Some(&(from, _)) = layout.node_pos.get(&edge.from)
+                && let Some(&stem) = stem_cols[from].iter().find(|&&x| x >= src.center_x + 2)
+            {
+                label_max_x = label_max_x.min(stem.saturating_sub(1));
+            }
             canvas.draw_edge_td(
                 src.center_x,
                 src.bottom_y(),
@@ -1540,6 +1709,7 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                 edge_fg,
                 label_fg,
                 bus_y,
+                Some(label_max_x),
             );
         }
     }
@@ -1589,8 +1759,11 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     // The gap right of column `k` carries the drop column of every feedback
     // source in column k and the rise column of every feedback target in
     // column k+1, and still has to leave the forward edges' bend column clear
-    // between them. With no feedback edges the gap is the original six
-    // columns, so acyclic diagrams are unaffected.
+    // between them. The rises start two columns left of their own column
+    // rather than one, because the column immediately left of a box is where
+    // every forward arrowhead into it lands; sharing it would overwrite the
+    // junction. With no feedback edges the gap is the original six columns,
+    // so acyclic diagrams are unaffected.
     let gap_widths: Vec<usize> = (0..last_layer)
         .map(|k| {
             let exits = feedback.exits[k];
@@ -1598,11 +1771,11 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             node_h_gap
                 .max(exits + entries + 4)
                 .max(2 * exits)
-                .max(2 * entries + 2)
+                .max(2 * entries + 3)
         })
         .collect();
     // Routes into the first column or out of the last one use the margins.
-    let left_margin = 2.max(feedback.entries[0]);
+    let left_margin = 2.max(feedback.entries[0] + 1);
     let right_margin = 2.max(feedback.exits[last_layer]);
 
     let canvas_width: usize = left_margin
@@ -1662,7 +1835,7 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     // Feedback edges go first so that forward-edge arrowheads, which overwrite
     // cells, end up on top of any route they cross.
     let lane_y = |lane: usize| core_height + 1 + lane * lane_gap;
-    let mut labels: Vec<(usize, usize, String)> = Vec::new();
+    let mut lane_labels: Vec<(FeedbackRouteLr, String)> = Vec::new();
     for plan in &feedback.plans {
         let edge = &graph.edges[plan.edge];
         let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) else {
@@ -1684,24 +1857,42 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             exit_lane_x: col_bounds[src_layer].1 + 1 + plan.src_rank,
             entry_x: dst.left_x() + 1,
             dst_bottom_y: dst.bottom_y(),
-            entry_lane_x: col_bounds[dst_layer].0.saturating_sub(1 + plan.dst_rank),
+            entry_lane_x: col_bounds[dst_layer].0.saturating_sub(2 + plan.dst_rank),
             lane_y: lane_y(plan.lane),
         };
         canvas.draw_feedback_edge_lr(&route, edge_fg);
 
         if let Some(text) = edge.label.as_deref() {
-            // Inline on the lane, centered on its horizontal run. The run is
-            // all the room there is, so a longer label is cut rather than
-            // written over the route's own corner.
-            let inner = route.exit_lane_x.saturating_sub(route.entry_lane_x + 1);
-            let text = fit_label(text, inner);
-            let x = route.entry_lane_x + 1 + inner.saturating_sub(text.chars().count()) / 2;
-            labels.push((x, route.lane_y, text));
+            lane_labels.push((route, text.to_string()));
         }
     }
-    for (x, y, text) in &labels {
+    // Lane labels go on once every route is on the canvas. An outer lane drops
+    // through this lane's row on its way past, and a label centred across that
+    // crossing would hide it, so the label takes the longest unbroken stretch
+    // of its own run. That stretch is all the room there is, and a longer
+    // label is cut rather than written over the route's own corner.
+    for (route, text) in &lane_labels {
+        let (start, room) = canvas.longest_plain_run(
+            route.lane_y,
+            route.entry_lane_x + 1,
+            route.exit_lane_x.saturating_sub(1),
+        );
+        let text = fit_label(text, room);
+        let x = start + room.saturating_sub(text.chars().count()) / 2;
         for (i, ch) in text.chars().enumerate() {
-            canvas.set(x + i, *y, ch, label_fg);
+            canvas.set_label(x + i, route.lane_y, ch, label_fg, true);
+        }
+    }
+
+    // Every column a feedback route reserved, so that a forward edge spanning
+    // more than one gap can bend clear of one.
+    let mut reserved_cols: HashSet<usize> = HashSet::new();
+    for (k, &(left, right)) in col_bounds.iter().enumerate() {
+        for r in 0..feedback.exits[k] {
+            reserved_cols.insert(right + 1 + r);
+        }
+        for r in 0..feedback.entries[k] {
+            reserved_cols.insert(left.saturating_sub(2 + r));
         }
     }
 
@@ -1713,21 +1904,39 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
             // Bend in the middle of the gap between the two columns, so that
             // every edge between them turns in the same column no matter how
-            // wide the individual nodes are.
-            let mid_x = match (
+            // wide the individual nodes are. Between adjacent columns the gap
+            // budget already keeps that column clear; an edge spanning further
+            // is nudged right off any column a route holds.
+            let (mid_x, label_bounds) = match (
                 layout.node_pos.get(&edge.from),
                 layout.node_pos.get(&edge.to),
             ) {
                 (Some(&(src_layer, _)), Some(&(dst_layer, _))) => {
                     let src_right = col_bounds[src_layer].1;
                     let dst_left = col_bounds[dst_layer].0;
-                    (dst_left > src_right + 1)
+                    let mid = (dst_left > src_right + 1)
                         .then(|| src_right + 1 + (dst_left - src_right - 1) / 2)
+                        .map(|mut x| {
+                            while x + 1 < dst_left && reserved_cols.contains(&x) {
+                                x += 1;
+                            }
+                            x
+                        });
+                    // Free columns for the label: right of this column's drops,
+                    // left of the next column's rises, and clear of the
+                    // arrowhead column just left of that column's boxes. An
+                    // edge that spans further keeps to this first gap, because
+                    // past it lie other columns' boxes and routes.
+                    let next = (src_layer + 1).min(dst_layer);
+                    let lo = src_right + 1 + feedback.exits[src_layer];
+                    let hi = col_bounds[next]
+                        .0
+                        .saturating_sub(2 + feedback.entries[next]);
+                    (mid, (hi >= lo).then_some((lo, hi)))
                 }
-                _ => None,
+                _ => (None, None),
             };
             canvas.draw_edge_lr(
-                src.center_x,
                 src.right_x(),
                 src.top_y + 1,
                 dst.left_x(),
@@ -1736,6 +1945,7 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                 edge_fg,
                 label_fg,
                 mid_x,
+                label_bounds,
             );
         }
     }
@@ -1884,15 +2094,19 @@ mod tests {
                 }
             }
 
-            let theme = Theme::dark();
-            let leaked: &'static str = Box::leak(code.clone().into_boxed_str());
+            let source = code.clone();
             let (tx, rx) = mpsc::channel();
             let handle = thread::spawn(move || {
-                let _ = tx.send(render_mermaid(leaked, &theme).is_some());
+                let theme = Theme::dark();
+                let _ = tx.send(render_mermaid(&source, &theme).is_some());
             });
-            if let Err(err) = rx.recv_timeout(Duration::from_secs(20)) {
-                let _ = handle.join();
-                panic!("case {case} failed ({err:?}) for:\n{code}");
+            match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(true) => {}
+                Ok(false) => panic!("case {case} did not render:\n{code}"),
+                Err(err) => {
+                    let _ = handle.join();
+                    panic!("case {case} failed ({err:?}) for:\n{code}");
+                }
             }
             handle.join().unwrap();
         }
@@ -1986,10 +2200,10 @@ mod tests {
             r#"
 
                                      ┌──────────┐
-                                  ┌─YesAction 1 │───┐
+                               Yes┌─▶│ Action 1 │───┐
   ┌───────┐      ◆────────────◆   │  └──────────┘   │  ┌─────┐
   │ Start │─────▶│  Decision  │───┤                 ├─▶│ End │
-  └───────┘      ◆────────────◆   │ No              │  └─────┘
+  └───────┘      ◆────────────◆ No│                 │  └─────┘
                                   │     ┌─────┐     │
                                   └────▶│ Do  │─────┘
                                         └─────┘
@@ -2040,8 +2254,8 @@ mod tests {
   │ Start │─────▶│ End │
   └───────┘      └─────┘
    ▲                  └─┐
- ┌─┘                    │
- └──────────────────────┘
+┌──┘                    │
+└───────────────────────┘
 
 "#,
         );
@@ -2073,8 +2287,8 @@ mod tests {
   │ Self │
   └──────┘
    ▲    └─┐
- ┌─┘      │
- └────────┘
+┌──┘      │
+└─────────┘
 
 "#,
         );
@@ -2124,13 +2338,13 @@ mod tests {
             ┌─▶│  B  │───┐
   ┌─────┐   │  └─────┘   │  ┌─────┐
   │  A  │───┤   ▲        ├─▶│  D  │
-  └─────┘   │ ┌─┘        │  └─────┘
-            │ │┌─────┐   │       └─┐
-            └─▶│  C  │───┘         │
-              │└─────┘             │
-              │                    │
-              │                    │
-              └────────────────────┘
+  └─────┘   │┌──┘        │  └─────┘
+            ││ ┌─────┐   │       └─┐
+            └┼▶│  C  │───┘         │
+             │ └─────┘             │
+             │                     │
+             │                     │
+             └─────────────────────┘
 
 "#,
         );
@@ -2149,13 +2363,13 @@ mod tests {
             ┌──────▶│  B  │───────┐
   ┌─────┐   │       └─────┘       │  ┌─────┐
   │  A  │───┤        ▲            ├─▶│  D  │
-  └─────┘   │ ┌──────┘            │  └─────┘
-            │ │┌──────────────┐   │       └─┐
-            └─▶│ VeryLongName │───┘         │
-              │└──────────────┘             │
-              │                             │
-              │                             │
-              └─────────────────────────────┘
+  └─────┘   │┌───────┘            │  └─────┘
+            ││ ┌──────────────┐   │       └─┐
+            └┼▶│ VeryLongName │───┘         │
+             │ └──────────────┘             │
+             │                              │
+             │                              │
+             └──────────────────────────────┘
 
 "#,
         );
@@ -2178,11 +2392,11 @@ mod tests {
   │  A  │───┤            └─────┐  ├─▶│  D  │
   └─────┘   │                  │  │  └─────┘
    ▲        │  ┌──────────────┐│  │
- ┌─┘        └─▶│ VeryLongName │┼──┘
- │             └──────────────┘│
- │                             │
- │                             │
- └─────────────────────────────┘
+┌──┘        └─▶│ VeryLongName │┼──┘
+│              └──────────────┘│
+│                              │
+│                              │
+└──────────────────────────────┘
 
 "#,
         );
@@ -2251,13 +2465,13 @@ mod tests {
   │  S  │───┤       └──┐
   └─────┘   │          │
    ▲        │  ┌─────┐ │
- ┌─┘        └─▶│  B  │ │
- │             └─────┘ │
- │                  └─┐│
- │                    ││
- ├────────────────────┼┘
- │                    │
- └────────────────────┘
+┌──┘        └─▶│  B  │ │
+│              └─────┘ │
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
 
 "#,
         );
@@ -2323,10 +2537,10 @@ mod tests {
        │  ┌─────┐        │
        ▼  ▼     │        │
    ┌───────┐    │        │
-   │ Check │    │        │
+   │ Check │    │ again  │ retry
    └───────┘    │        │
        │        │        │
-       │        │ again  │ retry
+       │        │        │
        │        │        │
        ▼        │        │
    ┌──────┐     │        │
@@ -2356,10 +2570,10 @@ mod tests {
   │ Start │─────▶│ Check │─────▶│ Work │─────▶│ Done │
   └───────┘      └───────┘      └──────┘      └──────┘
    ▲              ▲                   └─┐           └─┐
- ┌─┘            ┌─┘                     │             │
- │              └─────────again─────────┘             │
- │                                                    │
- └───────────────────────retry────────────────────────┘
+┌──┘           ┌──┘                     │             │
+│              └─────────again──────────┘             │
+│                                                     │
+└────────────────────────retry────────────────────────┘
 
 "#,
         );
@@ -2378,8 +2592,8 @@ mod tests {
   │  A  │
   └─────┘
    ▲   └─┐
- ┌─┘     │
- └this i…┘
+┌──┘     │
+└this is…┘
 
 "#,
         );
@@ -2455,6 +2669,175 @@ mod tests {
     }
 
     #[test]
+    fn feedback_label_clears_an_outer_lane_top_down() {
+        // `back` belongs to the inner lane. Every gap row beside it carries the
+        // horizontal run of an outer lane, so the label sits on a node row.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> X\n    B --> Y\n    X --> Z\n    Y --> Z\n    Z -->|back| X\n    X --> A\n    Y --> A\n",
+            r#"
+              ┌──────────────────┬───┐
+              ▼                  │   │
+         ┌─────┐                 │   │
+         │  A  │                 │   │
+         └─────┘                 │   │
+            │                    │   │
+            │                    │   │
+            │                    │   │
+            ▼                    │   │
+         ┌─────┐                 │   │
+         │  B  │                 │   │
+         └─────┘                 │   │
+            │                    │   │
+            │                    │   │
+      ┌─────┴────┐               │   │
+      │ ┌────────┼───────┐       │   │
+      ▼ ▼        ▼       │       │   │
+   ┌─────┐    ┌─────┐    │       │   │
+   │  X  │    │  Y  │    │ back  │   │
+   └─────┘    └─────┘    │       │   │
+    │ │        │ │       │       │   │
+    │ │        └─┼───────┼───────┼───┘
+    └─┼──────────┼───────┼───────┘
+      │          │       │
+      └─────┬────┘       │
+            ▼            │
+         ┌─────┐         │
+         │  Z  │         │
+         └─────┘         │
+          │              │
+          └──────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_long_label_cannot_reach_the_gutter_lanes_top_down() {
+        // The label runs along the first gap row towards the gutter, where the
+        // lane of the back edge is. It is cut before it gets there.
+        assert_render(
+            "graph TD\n    A -->|a very long edge label| B\n    B --> A\n",
+            r#"
+        ┌─────┐
+        ▼     │
+   ┌─────┐    │
+   │  A  │    │
+   └─────┘    │
+      │ a ve… │
+      │       │
+      │       │
+      ▼       │
+   ┌─────┐    │
+   │  B  │    │
+   └─────┘    │
+    │         │
+    └─────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_long_label_stops_before_a_sibling_feedback_stem_top_down() {
+        // B's label runs right along the first gap row, which is the row C's
+        // feedback stem drops through.
+        assert_render(
+            "graph TD\n    A --> B\n    A --> C\n    B -->|a long label| D\n    C --> E\n    C --> A\n",
+            r#"
+              ┌──────────┐
+              ▼          │
+         ┌─────┐         │
+         │  A  │         │
+         └─────┘         │
+            │            │
+            │            │
+      ┌─────┴────┐       │
+      ▼          ▼       │
+   ┌─────┐    ┌─────┐    │
+   │  B  │    │  C  │    │
+   └─────┘    └─────┘    │
+      │ a long…│ │       │
+      │        └─┼───────┘
+      │          │
+      │          │
+      ▼          ▼
+   ┌─────┐    ┌─────┐
+   │  D  │    │  E  │
+   └─────┘    └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn bent_forward_label_clears_the_feedback_rise_left_right() {
+        // `no` would sit right of the bend, which is where the route into B
+        // rises. There is room left of the bend, so it goes there instead.
+        assert_render(
+            "graph LR\n    A --> B\n    A -->|no| C\n    B --> D\n    C --> D\n    D --> B\n",
+            r#"
+
+               ┌─────┐
+            ┌─▶│  B  │───┐
+  ┌─────┐   │  └─────┘   │  ┌─────┐
+  │  A  │───┤   ▲        ├─▶│  D  │
+  └─────┘ no│┌──┘        │  └─────┘
+            ││ ┌─────┐   │       └─┐
+            └┼▶│  C  │───┘         │
+             │ └─────┘             │
+             │                     │
+             │                     │
+             └─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn straight_forward_label_clears_the_feedback_drop_left_right() {
+        // Y's label starts two columns right of its box, which is the column X
+        // drops through on its way to the lane. It starts past the drops.
+        assert_render(
+            "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|lbl| Z2\n",
+            r#"
+
+               ┌─────┐      ┌─────┐
+            ┌─▶│  X  │─────▶│ Z1  │
+  ┌─────┐   │  └─────┘      └─────┘
+  │  S  │───┤       └──┐
+  └─────┘   │          │
+   ▲        │  ┌─────┐ │lbl ┌─────┐
+┌──┘        └─▶│  Y  │─┼───▶│ Z2  │
+│              └─────┘ │    └─────┘
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn lane_label_keeps_clear_of_a_crossing_left_right() {
+        // The outer lane drops through this lane's run. The label takes the
+        // longest unbroken stretch instead of covering the crossing.
+        assert_render(
+            "graph LR\n    A --> B\n    B --> C\n    C --> D\n    D -->|label here| B\n    C --> A\n",
+            r#"
+
+  ┌─────┐      ┌─────┐      ┌─────┐      ┌─────┐
+  │  A  │─────▶│  B  │─────▶│  C  │─────▶│  D  │
+  └─────┘      └─────┘      └─────┘      └─────┘
+   ▲            ▲                └─┐          └─┐
+┌──┘         ┌──┘                  │            │
+│            └─────label here──────┼────────────┘
+│                                  │
+└──────────────────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
     fn one_long_label_does_not_widen_every_lane() {
         let code = "graph TD\n    Start --> Check\n    Check --> Work\n    Work --> Done\n    Done -->|x| Start\n    Work -->|a very long label| Check\n";
         let text = render_text(code);
@@ -2476,10 +2859,10 @@ mod tests {
        │  ┌─────┐                    │
        ▼  ▼     │                    │
    ┌───────┐    │                    │
-   │ Check │    │                    │
+   │ Check │    │ a very long label  │ x
    └───────┘    │                    │
        │        │                    │
-       │        │ a very long label  │ x
+       │        │                    │
        │        │                    │
        ▼        │                    │
    ┌──────┐     │                    │
