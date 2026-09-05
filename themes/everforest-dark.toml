@@ -1,0 +1,70 @@
+# Everforest Dark (Medium Variant)
+bg = "2d353b"
+fg = "d3c6aa"
+
+# UI Elements
+border = "3d484d"
+title = "859289"
+position = "7fbbb3"
+help_hint = "7a8478"
+scrollbar_track = "232a2e"
+scrollbar_thumb = "475258"
+
+# Headings
+h1 = "e67e80"
+h2 = "7fbbb3"
+h3 = "dbbc7f"
+h4 = "a7c080"
+h5 = "d699b6"
+h6 = "9da9a0"
+heading_separator = "3d484d"
+
+# Code blocks & Inline code
+code_bg = "232a2e"
+code_border = "3d484d"
+code_label = "859289"
+inline_code_fg = "e69875"
+inline_code_bg = "3d484d"
+inline_code_tick = "475258"
+
+# Blockquote & Links
+blockquote_bar = "d699b6"
+link = "7fbbb3"
+link_url = "7a8478"
+
+# Lists & Tables
+bullet = "d699b6"
+task_done = "a7c080"
+task_pending = "7a8478"
+rule = "3d484d"
+table_border = "3d484d"
+table_header = "7fbbb3"
+
+# Search UI & Overlays
+search_prompt = "dbbc7f"
+search_match_bg = "475258"
+search_current_bg = "e67e80"
+search_current_fg = "2d353b"
+search_no_match = "e67e80"
+overlay_bg = "232a2e"
+overlay_border = "7fbbb3"
+overlay_selected_bg = "3d484d"
+overlay_selected_fg = "d3c6aa"
+overlay_text = "d3c6aa"
+overlay_muted = "7a8478"
+
+# Elements & Markdown syntax
+image_fg = "a7c080"
+slide_indicator = "dbbc7f"
+math_fg = "83c092"
+line_number = "475258"
+
+# JSON Syntax Highlighting
+json_key = "e67e80"
+json_string = "a7c080"
+json_number = "d699b6"
+json_bool = "e69875"
+json_null = "7a8478"
+json_bracket = "d3c6aa"
+json_path = "7fbbb3"
+json_focus_bg = "3d484d"

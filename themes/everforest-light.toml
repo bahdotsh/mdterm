@@ -1,0 +1,70 @@
+# Everforest Light (Medium Variant)
+bg = "fdf6e3"
+fg = "5c6a72"
+
+# UI Elements
+border = "e8e5d5"
+title = "939f91"
+position = "35a1c1"
+help_hint = "83c092"
+scrollbar_track = "f4edd8"
+scrollbar_thumb = "dfdac9"
+
+# Headings
+h1 = "f85552"
+h2 = "35a1c1"
+h3 = "dfa000"
+h4 = "8da101"
+h5 = "df69ba"
+h6 = "939f91"
+heading_separator = "e8e5d5"
+
+# Code blocks & Inline code
+code_bg = "f4edd8"
+code_border = "e8e5d5"
+code_label = "939f91"
+inline_code_fg = "f57d26"
+inline_code_bg = "e8e5d5"
+inline_code_tick = "dfdac9"
+
+# Blockquote & Links
+blockquote_bar = "df69ba"
+link = "35a1c1"
+link_url = "8da101"
+
+# Lists & Tables
+bullet = "df69ba"
+task_done = "8da101"
+task_pending = "939f91"
+rule = "e8e5d5"
+table_border = "e8e5d5"
+table_header = "35a1c1"
+
+# Search UI & Overlays
+search_prompt = "dfa000"
+search_match_bg = "dfdac9"
+search_current_bg = "f85552"
+search_current_fg = "fdf6e3"
+search_no_match = "f85552"
+overlay_bg = "f4edd8"
+overlay_border = "35a1c1"
+overlay_selected_bg = "e8e5d5"
+overlay_selected_fg = "5c6a72"
+overlay_text = "5c6a72"
+overlay_muted = "939f91"
+
+# Elements & Markdown syntax
+image_fg = "8da101"
+slide_indicator = "dfa000"
+math_fg = "3a94c5"
+line_number = "dfdac9"
+
+# JSON Syntax Highlighting
+json_key = "f85552"
+json_string = "8da101"
+json_number = "df69ba"
+json_bool = "f57d26"
+json_null = "939f91"
+json_bracket = "5c6a72"
+json_path = "35a1c1"
+json_focus_bg = "e8e5d5"

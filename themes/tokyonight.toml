@@ -1,0 +1,70 @@
+# Tokyo Night (Night Variant)
+bg = "1a1b26"
+fg = "a9b1d6"
+
+# UI Elements
+border = "24283b"
+title = "7aa2f7"
+position = "0db9d7"
+help_hint = "565f89"
+scrollbar_track = "16161e"
+scrollbar_thumb = "3b4261"
+
+# Headings
+h1 = "f7768e"
+h2 = "7aa2f7"
+h3 = "bb9af3"
+h4 = "9ece6a"
+h5 = "e0af68"
+h6 = "565f89"
+heading_separator = "24283b"
+
+# Code blocks & Inline code
+code_bg = "16161e"
+code_border = "24283b"
+code_label = "7aa2f7"
+inline_code_fg = "ff9e64"
+inline_code_bg = "24283b"
+inline_code_tick = "565f89"
+
+# Blockquote & Links
+blockquote_bar = "bb9af3"
+link = "7aa2f7"
+link_url = "565f89"
+
+# Lists & Tables
+bullet = "b4f9f8"
+task_done = "9ece6a"
+task_pending = "565f89"
+rule = "24283b"
+table_border = "24283b"
+table_header = "7aa2f7"
+
+# Search UI & Overlays
+search_prompt = "e0af68"
+search_match_bg = "3d59a1"
+search_current_bg = "ff9e64"
+search_current_fg = "16161e"
+search_no_match = "f7768e"
+overlay_bg = "16161e"
+overlay_border = "7aa2f7"
+overlay_selected_bg = "24283b"
+overlay_selected_fg = "a9b1d6"
+overlay_text = "a9b1d6"
+overlay_muted = "565f89"
+
+# Elements & Markdown syntax
+image_fg = "9ece6a"
+slide_indicator = "e0af68"
+math_fg = "7dcfff"
+line_number = "3b4261"
+
+# JSON Syntax Highlighting
+json_key = "7aa2f7"
+json_string = "9ece6a"
+json_number = "ff9e64"
+json_bool = "ff9e64"
+json_null = "565f89"
+json_bracket = "a9b1d6"
+json_path = "0db9d7"
+json_focus_bg = "24283b"

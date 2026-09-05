@@ -10,6 +10,9 @@ pub struct Config {
     pub line_numbers: bool,
     #[serde(default)]
     pub width: usize,
+
+    pub theme_dark: Option<String>,
+    pub theme_light: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -22,6 +25,8 @@ impl Default for Config {
             theme: default_theme(),
             line_numbers: false,
             width: 0,
+            theme_dark: None,
+            theme_light: None,
         }
     }
 }
