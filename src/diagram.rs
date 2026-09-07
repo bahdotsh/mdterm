@@ -704,19 +704,23 @@ pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
 /// Some routes have a fixed amount of room for their label (a left-right
 /// lane runs between two node columns), and a label that overran it used to
 /// paint over the route's own corner and off the edge of the canvas.
+///
+/// Below three columns there is no room for a cut label that still says
+/// anything: one character and an ellipsis reads as a different word, and a
+/// bare ellipsis says only that something was dropped. The label is left out
+/// altogether instead, which at least does not misname the edge.
 pub(crate) fn fit_label(label: &str, width: usize) -> String {
     if label.chars().count() <= width {
         return label.to_string();
     }
-    match width {
-        0 => String::new(),
-        1 => "\u{2026}".to_string(),
-        _ => label
-            .chars()
-            .take(width - 1)
-            .chain(std::iter::once('\u{2026}'))
-            .collect(),
+    if width < 3 {
+        return String::new();
     }
+    label
+        .chars()
+        .take(width - 1)
+        .chain(std::iter::once('\u{2026}'))
+        .collect()
 }
 
 // ───── Canvas ─────
@@ -849,6 +853,11 @@ impl Canvas {
     /// riding inline on that lane's plain horizontal run. The permission comes
     /// from the cell rather than from the caller, so what a label may cover is
     /// decided by what is actually on the canvas under it.
+    ///
+    /// Forward edges are deliberately outside this check. A label can still
+    /// land on a *different* forward edge's line in a dense diagram, which
+    /// predates the feedback routing and is not addressed here; a label
+    /// covering its own edge's line is checked in [`Canvas::draw_edge_lr`].
     fn set_label(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         #[cfg(test)]
         if y < self.height && x < self.width {
@@ -1292,15 +1301,35 @@ impl Canvas {
             // there is room for it, otherwise left of the bend, and cut when
             // neither side can hold it. Running past the free columns would
             // hide a feedback route or the destination box.
+            //
+            // The edge's own two horizontal runs are what the label row has to
+            // clear. One sits on `src_cy`, from the source out to the bend; the
+            // other on `dst_cy`, from the bend in to the destination. Any row
+            // strictly between them is clear of both, so that is where the
+            // label goes. Rows one apart leave no such row, and there the label
+            // takes whichever side of the bend the run on its own row does not
+            // reach.
             if let Some(text) = label {
-                let label_y = min_y + (max_y - min_y).saturating_sub(1) / 2;
+                let (label_y, allow_left, allow_right) = if max_y - min_y >= 2 {
+                    ((min_y + (max_y - min_y - 1) / 2).max(min_y + 1), true, true)
+                } else {
+                    (min_y, min_y != src_cy, min_y != dst_cy)
+                };
                 let len = text.chars().count();
                 let (label_x, room) = match label_bounds {
                     Some((lo, hi)) => {
                         let right_x = (mid_x + 2).max(lo);
-                        let right_room = (hi + 1).saturating_sub(right_x);
+                        let right_room = if allow_right {
+                            (hi + 1).saturating_sub(right_x)
+                        } else {
+                            0
+                        };
                         let left_hi = mid_x.saturating_sub(1).min(hi);
-                        let left_room = (left_hi + 1).saturating_sub(lo);
+                        let left_room = if allow_left {
+                            (left_hi + 1).saturating_sub(lo)
+                        } else {
+                            0
+                        };
                         if len <= right_room {
                             (right_x, right_room)
                         } else if len <= left_room {
@@ -1311,9 +1340,27 @@ impl Canvas {
                             (lo, left_room)
                         }
                     }
-                    None => (mid_x + 2, usize::MAX),
+                    None if allow_right => (mid_x + 2, usize::MAX),
+                    None => (mid_x.saturating_sub(1 + len), len),
                 };
-                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                let fitted = fit_label(text, room);
+                // Whichever side it took, the label has to clear this edge's
+                // own two horizontal runs: the one on `src_cy` reaching out to
+                // the bend, and the one on `dst_cy` coming back in from it. A
+                // label written over either erases the edge it names.
+                #[cfg(test)]
+                if !fitted.is_empty() {
+                    let clear = if label_x > mid_x {
+                        label_y != dst_cy
+                    } else {
+                        label_y != src_cy
+                    };
+                    assert!(
+                        clear,
+                        "label {fitted:?} sits on the edge's own run at ({label_x}, {label_y})"
+                    );
+                }
+                for (i, ch) in fitted.chars().enumerate() {
                     self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
@@ -1630,6 +1677,12 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             // Leave under the left border. A straight forward edge writes its
             // label two columns right of the box centre on the first gap row,
             // which is the row this stem drops through.
+            //
+            // The cost is a crossing: a source that also has forward children
+            // drops this stem across its own outgoing edge, drawn as `┼`. That
+            // is deliberate. A crossing reads as two edges that meet, which is
+            // what it is, whereas a label written over the stem would hide one
+            // of them entirely.
             exit_x: src.left_x() + 1,
             src_bottom_y: src.bottom_y(),
             exit_y: src.bottom_y() + 2 + plan.src_rank,
@@ -1780,6 +1833,26 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     let max_nodes_in_layer = layers.iter().map(|l| l.len()).max().unwrap_or(1);
 
+    // Longest forward-edge label that each gap has to hold. A label lives in
+    // the gap right of its source's column, whether the edge ends in the next
+    // column or a later one, so it is charged to that gap.
+    let mut label_room: Vec<usize> = vec![0; last_layer];
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if layout.feedback_set.contains(&idx) {
+            continue;
+        }
+        let (Some(text), Some(&(src_layer, _)), Some(&(dst_layer, _))) = (
+            edge.label.as_deref(),
+            layout.node_pos.get(&edge.from),
+            layout.node_pos.get(&edge.to),
+        ) else {
+            continue;
+        };
+        if src_layer < last_layer && dst_layer > src_layer {
+            label_room[src_layer] = label_room[src_layer].max(text.chars().count());
+        }
+    }
+
     // ── Column budget ──
     //
     // The gap right of column `k` carries the drop column of every feedback
@@ -1790,14 +1863,31 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     // every forward arrowhead into it lands; sharing it would overwrite the
     // junction. With no feedback edges the gap is the original six columns,
     // so acyclic diagrams are unaffected.
+    //
+    // A gap that carries a labelled forward edge also has to be wide enough
+    // for the label. A bent edge writes its label on one side of its bend,
+    // which sits at the middle of the gap, so it needs twice its own width
+    // past the drop columns; a straight edge writes along the gap, between the
+    // drops and the rises. Sizing for that is what keeps a label readable:
+    // with a fixed six-column gap anything longer than three characters was
+    // cut to an ellipsis, and the edge stopped saying what it meant.
     let gap_widths: Vec<usize> = (0..last_layer)
         .map(|k| {
             let exits = feedback.exits[k];
             let entries = feedback.entries[k + 1];
+            // A bent label is right-aligned against the bend, so it needs one
+            // column of padding as well; without it the text butts against the
+            // node border and reads as part of the box.
+            let bent = match label_room[k] {
+                0 => 0,
+                label => 2 * (label + exits + 1),
+            };
             node_h_gap
                 .max(exits + entries + 4)
                 .max(2 * exits)
                 .max(2 * entries + 3)
+                .max(bent)
+                .max(label_room[k] + entries + 2)
         })
         .collect();
     // Routes into the first column or out of the last one use the margins.
@@ -2230,14 +2320,14 @@ mod tests {
             "graph LR\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Action 1]\n    B -->|No| D[Do]\n    C --> E[End]\n    D --> E\n",
             r#"
 
-                                     ┌──────────┐
-                               Yes┌─▶│ Action 1 │───┐
-  ┌───────┐      ◆────────────◆   │  └──────────┘   │  ┌─────┐
-  │ Start │─────▶│  Decision  │───┤                 ├─▶│ End │
-  └───────┘      ◆────────────◆ No│                 │  └─────┘
-                                  │     ┌─────┐     │
-                                  └────▶│ Do  │─────┘
-                                        └─────┘
+                                       ┌──────────┐
+                                   ┌──▶│ Action 1 │───┐
+  ┌───────┐      ◆────────────◆ Yes│   └──────────┘   │  ┌─────┐
+  │ Start │─────▶│  Decision  │────┤                  ├─▶│ End │
+  └───────┘      ◆────────────◆  No│                  │  └─────┘
+                                   │      ┌─────┐     │
+                                   └─────▶│ Do  │─────┘
+                                          └─────┘
 
 "#,
         );
@@ -2829,14 +2919,14 @@ mod tests {
             "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|lbl| Z2\n",
             r#"
 
-               ┌─────┐      ┌─────┐
-            ┌─▶│  X  │─────▶│ Z1  │
-  ┌─────┐   │  └─────┘      └─────┘
+               ┌─────┐            ┌─────┐
+            ┌─▶│  X  │───────────▶│ Z1  │
+  ┌─────┐   │  └─────┘            └─────┘
   │  S  │───┤       └──┐
   └─────┘   │          │
-   ▲        │  ┌─────┐ │lbl ┌─────┐
-┌──┘        └─▶│  Y  │─┼───▶│ Z2  │
-│              └─────┘ │    └─────┘
+   ▲        │  ┌─────┐ │lbl       ┌─────┐
+┌──┘        └─▶│  Y  │─┼─────────▶│ Z2  │
+│              └─────┘ │          └─────┘
 │                   └─┐│
 │                     ││
 ├─────────────────────┼┘
@@ -2866,6 +2956,68 @@ mod tests {
 
 "#,
         );
+    }
+
+    #[test]
+    fn a_forward_label_is_not_cut_to_an_ellipsis_left_right() {
+        // The gap between two columns is sized for the label it has to carry.
+        // At a fixed six columns a bent label had three columns to sit in, so
+        // anything longer came out as two characters and an ellipsis and the
+        // edge stopped saying what it meant.
+        assert_render(
+            "graph LR\n    A[Start] --> B{Check}\n    B -->|success| C[Deploy]\n    B -->|failure| D[Rollback]\n",
+            r#"
+
+                                             ┌────────┐
+                                    ┌───────▶│ Deploy │
+  ┌───────┐      ◆─────────◆ success│        └────────┘
+  │ Start │─────▶│  Check  │────────┤
+  └───────┘      ◆─────────◆ failure│
+                                    │       ┌──────────┐
+                                    └──────▶│ Rollback │
+                                            └──────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn bent_forward_label_clears_the_edges_own_run_left_right() {
+        // A -> X rises by two rows, so the label row used to land on A's own
+        // horizontal run and paint over it: `│  A  │lbl┐`. It goes on the row
+        // between the two runs instead.
+        assert_render(
+            "graph LR\n    A -->|lbl| X\n    B --> X\n    B --> Y\n    C --> Y\n",
+            r#"
+
+  ┌─────┐
+  │  A  │────┐
+  └─────┘ lbl│   ┌─────┐
+             ├──▶│  X  │
+             │   └─────┘
+  ┌─────┐    │
+  │  B  │────┤
+  └─────┘    │   ┌─────┐
+             ├──▶│  Y  │
+             │   └─────┘
+  ┌─────┐    │
+  │  C  │────┘
+  └─────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn a_label_with_no_room_to_be_cut_is_dropped() {
+        assert_eq!(fit_label("retry", 5), "retry");
+        assert_eq!(fit_label("retry", 4), "ret\u{2026}");
+        assert_eq!(fit_label("retry", 3), "re\u{2026}");
+        // Below three columns a cut label names the edge something it is not,
+        // and a bare ellipsis says only that something was dropped.
+        assert_eq!(fit_label("retry", 2), "");
+        assert_eq!(fit_label("retry", 1), "");
+        assert_eq!(fit_label("retry", 0), "");
     }
 
     #[test]
