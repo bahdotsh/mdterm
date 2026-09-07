@@ -754,9 +754,12 @@ pub(crate) struct CanvasCell {
     pub(crate) bg: Option<Color>,
     pub(crate) is_node: bool,
     pub(crate) connects: u8,
-    /// Drawn by a feedback route. Labels go on last and overwrite whatever is
-    /// under them, so this is what [`Canvas::set_label`] checks against.
+    /// Drawn by a feedback route.
     is_feedback: bool,
+    /// Part of a left-right gutter lane's plain horizontal run. A lane carries
+    /// its own label inline, so this is the one kind of edge cell a label may
+    /// be written over.
+    is_lane: bool,
 }
 
 impl Default for CanvasCell {
@@ -768,6 +771,7 @@ impl Default for CanvasCell {
             is_node: false,
             connects: 0,
             is_feedback: false,
+            is_lane: false,
         }
     }
 }
@@ -818,45 +822,63 @@ impl Canvas {
     /// Draw one cell of a feedback route.
     ///
     /// Feedback routes are planned to run only through gap rows and gap
-    /// columns, which never contain nodes. `add_connection` would silently
-    /// skip a node cell and leave a route that looks like it stops at a box,
-    /// so under test a violation of that invariant fails instead.
+    /// columns, which never contain nodes. `add_connection` silently skips a
+    /// node cell, so a route drawn over a box leaves a line that stops dead at
+    /// the border rather than an error; the cell is marked either way and
+    /// [`Canvas::assert_invariants`] catches it after the render.
     fn connect_route(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
-        #[cfg(test)]
-        if y < self.height && x < self.width {
-            assert!(
-                !self.cells[y][x].is_node,
-                "feedback route runs through the node cell at ({x}, {y})"
-            );
-        }
         self.add_connection(x, y, dir, fg);
         if y < self.height && x < self.width {
             self.cells[y][x].is_feedback = true;
         }
     }
 
+    /// Mark a cell as part of a left-right gutter lane's plain horizontal run,
+    /// the one kind of edge cell that lane's own label may be written over.
+    fn mark_lane(&mut self, x: usize, y: usize) {
+        if y < self.height && x < self.width {
+            self.cells[y][x].is_lane = true;
+        }
+    }
+
     /// Write one character of a label.
     ///
-    /// Labels are drawn after the routes and overwrite whatever is under them,
-    /// so one placed badly hides a route instead of the other way round. Under
-    /// test the only cells a label may take are ones no feedback route drew,
-    /// plus, for a label riding inline on a left-right lane, that lane's own
-    /// plain horizontal run.
-    fn set_label(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>, on_lane: bool) {
-        // Only the assertion below reads `on_lane`, and it is test-only.
-        #[cfg(not(test))]
-        let _ = on_lane;
+    /// Labels overwrite whatever is under them, so one placed badly hides a
+    /// route instead of the other way round. Under test a label may not take a
+    /// feedback route's cell, the one exception being a lane's own label
+    /// riding inline on that lane's plain horizontal run. The permission comes
+    /// from the cell rather than from the caller, so what a label may cover is
+    /// decided by what is actually on the canvas under it.
+    fn set_label(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         #[cfg(test)]
         if y < self.height && x < self.width {
             let cell = &self.cells[y][x];
-            let allowed = !cell.is_feedback
-                || (on_lane && !cell.is_node && cell.connects == (CONN_LEFT | CONN_RIGHT));
             assert!(
-                allowed,
-                "label character {ch:?} lands on the feedback route cell at ({x}, {y})"
+                !cell.is_feedback || (cell.is_lane && cell.connects == (CONN_LEFT | CONN_RIGHT)),
+                "label {ch:?} hides the feedback route at ({x}, {y})"
             );
         }
         self.set(x, y, ch, fg);
+    }
+
+    /// Check, once a render is finished, that no feedback route was laid over
+    /// a box.
+    ///
+    /// `add_connection` silently skips a node cell, so a route planned through
+    /// a box does not fail: it renders as a line that stops dead at the border,
+    /// which reads as an edge the source never declared. `connect_route` marks
+    /// the cell whether or not the character landed, so the collision is still
+    /// here to be found afterwards.
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        for (y, row) in self.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                assert!(
+                    !(cell.is_feedback && cell.is_node),
+                    "feedback route runs through the node cell at ({x}, {y})"
+                );
+            }
+        }
     }
 
     /// True when the cell carries a plain horizontal run and nothing else, so
@@ -1118,7 +1140,7 @@ impl Canvas {
                 let label_x = src_cx + 2;
                 let room = label_max_x.map_or(usize::MAX, |hi| (hi + 1).saturating_sub(label_x));
                 for (i, ch) in fit_label(text, room).chars().enumerate() {
-                    self.set_label(label_x + i, label_y, ch, label_fg, false);
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         } else {
@@ -1171,7 +1193,7 @@ impl Canvas {
                 for (i, ch) in fit_label(text, room).chars().enumerate() {
                     let lx = label_start + i;
                     if lx < self.width {
-                        self.set_label(lx, label_y, ch, label_fg, false);
+                        self.set_label(lx, label_y, ch, label_fg);
                     }
                 }
             }
@@ -1223,7 +1245,7 @@ impl Canvas {
                     None => (src_right_x + 2, usize::MAX),
                 };
                 for (i, ch) in fit_label(text, room).chars().enumerate() {
-                    self.set_label(label_x + i, label_y, ch, label_fg, false);
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         } else {
@@ -1292,7 +1314,7 @@ impl Canvas {
                     None => (mid_x + 2, usize::MAX),
                 };
                 for (i, ch) in fit_label(text, room).chars().enumerate() {
-                    self.set_label(label_x + i, label_y, ch, label_fg, false);
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         }
@@ -1393,6 +1415,7 @@ impl Canvas {
         self.connect_route(r.exit_lane_x, r.lane_y, CONN_UP | CONN_LEFT, fg);
         for x in (r.entry_lane_x + 1)..r.exit_lane_x {
             self.connect_route(x, r.lane_y, CONN_LEFT | CONN_RIGHT, fg);
+            self.mark_lane(x, r.lane_y);
         }
         self.connect_route(r.entry_lane_x, r.lane_y, CONN_UP | CONN_RIGHT, fg);
 
@@ -1632,7 +1655,7 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     }
     for (x, y, text) in &labels {
         for (i, ch) in text.chars().enumerate() {
-            canvas.set_label(x + i, *y, ch, label_fg, false);
+            canvas.set_label(x + i, *y, ch, label_fg);
         }
     }
 
@@ -1713,6 +1736,9 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             );
         }
     }
+
+    #[cfg(test)]
+    canvas.assert_invariants();
 
     let rows = canvas.to_span_rows(theme);
     Some((rows, canvas_width))
@@ -1880,7 +1906,7 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         let text = fit_label(text, room);
         let x = start + room.saturating_sub(text.chars().count()) / 2;
         for (i, ch) in text.chars().enumerate() {
-            canvas.set_label(x + i, route.lane_y, ch, label_fg, true);
+            canvas.set_label(x + i, route.lane_y, ch, label_fg);
         }
     }
 
@@ -1950,6 +1976,9 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         }
     }
 
+    #[cfg(test)]
+    canvas.assert_invariants();
+
     let rows = canvas.to_span_rows(theme);
     Some((rows, canvas_width))
 }
@@ -2009,9 +2038,10 @@ mod tests {
     /// Compare a render against a snapshot written at column 0 inside a raw
     /// string literal (one leading newline, trailing blank rows ignored).
     ///
-    /// Every render also checks an invariant of its own: [`Canvas::connect_route`]
-    /// fails the test if a feedback route is laid over a node cell, which is
-    /// what a route that runs through a box looks like.
+    /// Every render also checks an invariant of its own:
+    /// [`Canvas::assert_invariants`] fails the test if a feedback route was
+    /// laid over a node cell, which is what a route that runs through a box
+    /// looks like.
     fn assert_render(code: &'static str, expected: &str) {
         let text = render_text_with_timeout(code);
         let expected = expected.strip_prefix('\n').unwrap_or(expected);
@@ -2061,7 +2091,8 @@ mod tests {
     }
 
     /// Render a deterministic spread of graph shapes and let
-    /// [`Canvas::connect_route`] check every feedback route against every box.
+    /// [`Canvas::assert_invariants`] check every feedback route against every
+    /// box.
     ///
     /// The shapes vary in node count, node width, edge count, direction and
     /// labelling, because a route only collides with a box that a *differently
