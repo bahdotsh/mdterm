@@ -858,6 +858,31 @@ impl Canvas {
         }
     }
 
+    /// Draw the arrowhead that ends a feedback route.
+    ///
+    /// The head is part of the route and is marked like every other cell of
+    /// one, so [`Canvas::assert_invariants`] sees it and [`Canvas::set_label`]
+    /// will not paint over it. `dir` records the direction the route runs
+    /// through the cell, so a forward edge crossing the head renders as a
+    /// junction rather than replacing it with a plain line that shows only the
+    /// forward edge.
+    fn route_arrow(&mut self, x: usize, y: usize, ch: char, dir: u8, fg: Option<Color>) {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+        let cell = &mut self.cells[y][x];
+        // Marked before the node test, not after: a head planned on top of a
+        // box is the collision `assert_invariants` reports, and painting it
+        // over the border would hide the very thing being looked for.
+        cell.is_feedback = true;
+        if cell.is_node {
+            return;
+        }
+        cell.connects |= dir;
+        cell.ch = ch;
+        cell.fg = fg;
+    }
+
     /// Mark a cell as part of a left-right gutter lane's plain horizontal run,
     /// the one kind of edge cell that lane's own label may be written over.
     fn mark_lane(&mut self, x: usize, y: usize) {
@@ -896,9 +921,9 @@ impl Canvas {
     ///
     /// `add_connection` silently skips a node cell, so a route planned through
     /// a box does not fail: it renders as a line that stops dead at the border,
-    /// which reads as an edge the source never declared. `connect_route` marks
-    /// the cell whether or not the character landed, so the collision is still
-    /// here to be found afterwards.
+    /// which reads as an edge the source never declared. `connect_route` and
+    /// `route_arrow` mark the cell whether or not the character landed, so the
+    /// collision is still here to be found afterwards.
     #[cfg(test)]
     fn assert_invariants(&self) {
         for (y, row) in self.cells.iter().enumerate() {
@@ -1441,7 +1466,7 @@ impl Canvas {
         for y in (r.entry_y + 1)..arrow_y {
             self.connect_route(r.entry_x, y, CONN_UP | CONN_DOWN, fg);
         }
-        self.set(r.entry_x, arrow_y, '▼', fg);
+        self.route_arrow(r.entry_x, arrow_y, '▼', CONN_UP | CONN_DOWN, fg);
     }
 
     /// Draw a feedback (back) edge in a left-right diagram.
@@ -1496,7 +1521,7 @@ impl Canvas {
             self.connect_route(x, entry_y, CONN_LEFT | CONN_RIGHT, fg);
         }
         self.connect_route(r.entry_x, entry_y, CONN_LEFT | CONN_UP, fg);
-        self.set(r.entry_x, r.dst_bottom_y + 1, '▲', fg);
+        self.route_arrow(r.entry_x, r.dst_bottom_y + 1, '▲', CONN_UP | CONN_DOWN, fg);
     }
 
     pub(crate) fn to_span_rows(&self, theme: &Theme) -> Vec<Vec<StyledSpan>> {
@@ -1750,13 +1775,26 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     // Every row a feedback route reserved, so that a forward edge whose span
     // no gap budget covers can be moved off one.
+    //
+    // A route holds more rows than the one its horizontal run sits on. Leaving
+    // a source it drops from the bottom border down to its run, and entering a
+    // destination it drops from its run to the arrowhead just above the top
+    // border, so the rows between are its as well. Reserving only the runs left
+    // the arrowhead row free, and a forward edge spanning several layers put
+    // its label there and erased the head of the edge arriving.
     let mut reserved_rows: HashSet<usize> = HashSet::new();
     for (k, &top) in layer_top.iter().enumerate() {
-        for r in 0..feedback.exits[k] {
-            reserved_rows.insert(top + 4 + r);
+        if feedback.exits[k] > 0 {
+            // Stem rows, then the run of the outermost rank.
+            for y in (top + 3)..=(top + 3 + feedback.exits[k]) {
+                reserved_rows.insert(y);
+            }
         }
-        for r in 0..feedback.entries[k] {
-            reserved_rows.insert(top.saturating_sub(2 + r));
+        if feedback.entries[k] > 0 {
+            // The run of the outermost rank, then down to the arrowhead.
+            for y in top.saturating_sub(1 + feedback.entries[k])..=top.saturating_sub(1) {
+                reserved_rows.insert(y);
+            }
         }
     }
 
@@ -2697,6 +2735,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_feedback_edges_from_one_source_share_one_stem() {
+        // Both back edges leave C. They are one endpoint, so they share a rank
+        // and leave on one stem, which splits at a junction into the two lanes
+        // rather than drawing a second stem over the first.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> C\n    C --> A\n    C --> B\n",
+            r#"
+        ┌─────────┐
+        ▼         │
+   ┌─────┐        │
+   │  A  │        │
+   └─────┘        │
+      │           │
+      │           │
+      │           │
+      │ ┌─────┐   │
+      ▼ ▼     │   │
+   ┌─────┐    │   │
+   │  B  │    │   │
+   └─────┘    │   │
+      │       │   │
+      │       │   │
+      │       │   │
+      ▼       │   │
+   ┌─────┐    │   │
+   │  C  │    │   │
+   └─────┘    │   │
+    │         │   │
+    └─────────┴───┘
+"#,
+        );
+    }
+
+    #[test]
+    fn two_feedback_edges_into_one_target_share_one_entry() {
+        // The mirror: both back edges end at A, so they come down one column
+        // into a single arrowhead instead of two heads on the same border.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> C\n    C --> A\n    B --> A\n",
+            r#"
+        ┌─────┬───┐
+        ▼     │   │
+   ┌─────┐    │   │
+   │  A  │    │   │
+   └─────┘    │   │
+      │       │   │
+      │       │   │
+      │       │   │
+      ▼       │   │
+   ┌─────┐    │   │
+   │  B  │    │   │
+   └─────┘    │   │
+    │ │       │   │
+    └─┼───────┘   │
+      │           │
+      │           │
+      ▼           │
+   ┌─────┐        │
+   │  C  │        │
+   └─────┘        │
+    │             │
+    └─────────────┘
+"#,
+        );
+    }
+
     // ── Labels ──
 
     #[test]
@@ -3156,6 +3261,33 @@ mod tests {
         assert_eq!(fit_label("retry", 2), "");
         assert_eq!(fit_label("retry", 1), "");
         assert_eq!(fit_label("retry", 0), "");
+    }
+
+    #[test]
+    fn a_forward_label_clears_a_feedback_arrowhead_top_down() {
+        // Reduced from a case the route/label property test above generates.
+        // A forward edge spanning several layers takes the midpoint of its own
+        // span, which no gap budget accounts for, and writes its label on the
+        // row above. That row is where a feedback route drops from its
+        // horizontal run to its arrowhead, and the reserved rows used to cover
+        // the run alone, so the label went over the head of the edge arriving:
+        // two boxes that nothing appeared to reach. Reserving the rows the
+        // whole route runs through is what keeps these seven heads; covering
+        // only the runs leaves five.
+        let text = render_text(
+            "graph TD
+    N8[x] --> N6[xxxxxxxxxxx]
+    N5[xxxxxx] --> N7[xxxxxxxxxxxxxxxx]
+    N1[xxxxxx] --> N3[xxxxxxxxxxxxxxxx]
+    N6[xxxxxxxxxxx] -->|LLLLLL| N5[xxxxxx]
+    N4[x] --> N8[x]
+    N9[xxxxxx] -->|LLLLLLL| N1[xxxxxx]
+    N7[xxxxxxxxxxxxxxxx] -->|LL| N1[xxxxxx]
+    N3[xxxxxxxxxxxxxxxx] -->|LLL| N5[xxxxxx]
+    N7[xxxxxxxxxxxxxxxx] --> N7[xxxxxxxxxxxxxxxx]
+",
+        );
+        assert_eq!(text.matches('\u{25bc}').count(), 7, "\n{text}");
     }
 
     #[test]
