@@ -1886,29 +1886,32 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     // so acyclic diagrams are unaffected.
     //
     // A gap that carries a labelled forward edge also has to be wide enough
-    // for the label. A bent edge writes its label on one side of its bend,
-    // which sits at the middle of the gap, so it needs twice its own width
-    // past the drop columns; a straight edge writes along the gap, between the
-    // drops and the rises. Sizing for that is what keeps a label readable:
-    // with a fixed six-column gap anything longer than three characters was
-    // cut to an ellipsis, and the edge stopped saying what it meant.
+    // for the label. Both a straight label and a bent one are written between
+    // the drop columns and the bend, so such a gap holds, left to right: the
+    // drop columns, one column of padding so the text does not butt against
+    // the node border, the label, the bend, one column of run, the rise
+    // columns, and the arrowhead column. Sizing for that is what keeps a label
+    // readable: with a fixed six-column gap anything longer than three
+    // characters was cut to an ellipsis, and the edge stopped saying what it
+    // meant.
+    //
+    // The bend moves right with the label rather than staying at the middle of
+    // the gap (see `bend_x` below). Holding it at the middle would cost twice
+    // the label's width, and a diagram wider than the terminal is word-wrapped
+    // into fragments, which is worse than the truncation it avoids.
     let gap_widths: Vec<usize> = (0..last_layer)
         .map(|k| {
             let exits = feedback.exits[k];
             let entries = feedback.entries[k + 1];
-            // A bent label is right-aligned against the bend, so it needs one
-            // column of padding as well; without it the text butts against the
-            // node border and reads as part of the box.
-            let bent = match label_room[k] {
+            let labelled = match label_room[k] {
                 0 => 0,
-                label => 2 * (label + exits + 1),
+                label => label + exits + entries + 4,
             };
             node_h_gap
                 .max(exits + entries + 4)
                 .max(2 * exits)
                 .max(2 * entries + 3)
-                .max(bent)
-                .max(label_room[k] + entries + 2)
+                .max(labelled)
         })
         .collect();
     // Routes into the first column or out of the last one use the margins.
@@ -2033,17 +2036,40 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         }
     }
 
+    // Bend column of each gap. Every forward edge between two adjacent columns
+    // turns here whatever the widths of the individual nodes, so their runs
+    // converge into one junction rather than fanning out. It sits at the
+    // middle of the gap, except that a gap carrying a label has to fit that
+    // label between its drop columns and the bend, which pushes the bend right
+    // by as much as the label needs and no further. `gap_widths` above is
+    // sized for exactly this placement, so the `min` never binds; it is there
+    // so that a future change to one of the two cannot silently walk the bend
+    // into the rise columns.
+    let bend_x: Vec<usize> = (0..last_layer)
+        .map(|k| {
+            let right = col_bounds[k].1;
+            let left = col_bounds[k + 1].0;
+            let centred = right + 1 + (left - right - 1) / 2;
+            let needed = match label_room[k] {
+                0 => 0,
+                label => right + 2 + feedback.exits[k] + label,
+            };
+            centred
+                .max(needed)
+                .min(left.saturating_sub(2 + feedback.entries[k + 1]))
+        })
+        .collect();
+
     // Forward edges
     for (idx, edge) in graph.edges.iter().enumerate() {
         if layout.feedback_set.contains(&idx) {
             continue;
         }
         if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
-            // Bend in the middle of the gap between the two columns, so that
-            // every edge between them turns in the same column no matter how
-            // wide the individual nodes are. Between adjacent columns the gap
-            // budget already keeps that column clear; an edge spanning further
-            // is nudged right off any column a route holds.
+            // Between adjacent columns the bend is the gap's own bend column,
+            // which the budget keeps clear of every drop and rise. An edge
+            // spanning further has no such column, so it takes the middle of
+            // its own span and is nudged right off any column a route holds.
             let (mid_x, label_bounds) = match (
                 layout.node_pos.get(&edge.from),
                 layout.node_pos.get(&edge.to),
@@ -2051,14 +2077,18 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                 (Some(&(src_layer, _)), Some(&(dst_layer, _))) => {
                     let src_right = col_bounds[src_layer].1;
                     let dst_left = col_bounds[dst_layer].0;
-                    let mid = (dst_left > src_right + 1)
-                        .then(|| src_right + 1 + (dst_left - src_right - 1) / 2)
-                        .map(|mut x| {
-                            while x + 1 < dst_left && reserved_cols.contains(&x) {
-                                x += 1;
-                            }
-                            x
-                        });
+                    let mid = if dst_layer == src_layer + 1 {
+                        bend_x.get(src_layer).copied()
+                    } else {
+                        (dst_left > src_right + 1)
+                            .then(|| src_right + 1 + (dst_left - src_right - 1) / 2)
+                            .map(|mut x| {
+                                while x + 1 < dst_left && reserved_cols.contains(&x) {
+                                    x += 1;
+                                }
+                                x
+                            })
+                    };
                     // Free columns for the label: right of this column's drops,
                     // left of the next column's rises, and clear of the
                     // arrowhead column just left of that column's boxes. An
@@ -2341,14 +2371,14 @@ mod tests {
             "graph LR\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Action 1]\n    B -->|No| D[Do]\n    C --> E[End]\n    D --> E\n",
             r#"
 
-                                       ┌──────────┐
-                                   ┌──▶│ Action 1 │───┐
-  ┌───────┐      ◆────────────◆ Yes│   └──────────┘   │  ┌─────┐
-  │ Start │─────▶│  Decision  │────┤                  ├─▶│ End │
-  └───────┘      ◆────────────◆  No│                  │  └─────┘
-                                   │      ┌─────┐     │
-                                   └─────▶│ Do  │─────┘
-                                          └─────┘
+                                      ┌──────────┐
+                                   ┌─▶│ Action 1 │───┐
+  ┌───────┐      ◆────────────◆ Yes│  └──────────┘   │  ┌─────┐
+  │ Start │─────▶│  Decision  │────┤                 ├─▶│ End │
+  └───────┘      ◆────────────◆  No│                 │  └─────┘
+                                   │     ┌─────┐     │
+                                   └────▶│ Do  │─────┘
+                                         └─────┘
 
 "#,
         );
@@ -2916,17 +2946,17 @@ mod tests {
             "graph LR\n    A --> B\n    A -->|no| C\n    B --> D\n    C --> D\n    D --> B\n",
             r#"
 
-               ┌─────┐
-            ┌─▶│  B  │───┐
-  ┌─────┐   │  └─────┘   │  ┌─────┐
-  │  A  │───┤   ▲        ├─▶│  D  │
-  └─────┘ no│┌──┘        │  └─────┘
-            ││ ┌─────┐   │       └─┐
-            └┼▶│  C  │───┘         │
-             │ └─────┘             │
-             │                     │
-             │                     │
-             └─────────────────────┘
+                ┌─────┐
+            ┌──▶│  B  │───┐
+  ┌─────┐   │   └─────┘   │  ┌─────┐
+  │  A  │───┤    ▲        ├─▶│  D  │
+  └─────┘ no│ ┌──┘        │  └─────┘
+            │ │ ┌─────┐   │       └─┐
+            └─┼▶│  C  │───┘         │
+              │ └─────┘             │
+              │                     │
+              │                     │
+              └─────────────────────┘
 
 "#,
         );
@@ -2940,14 +2970,14 @@ mod tests {
             "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|lbl| Z2\n",
             r#"
 
-               ┌─────┐            ┌─────┐
-            ┌─▶│  X  │───────────▶│ Z1  │
-  ┌─────┐   │  └─────┘            └─────┘
+               ┌─────┐         ┌─────┐
+            ┌─▶│  X  │────────▶│ Z1  │
+  ┌─────┐   │  └─────┘         └─────┘
   │  S  │───┤       └──┐
   └─────┘   │          │
-   ▲        │  ┌─────┐ │lbl       ┌─────┐
-┌──┘        └─▶│  Y  │─┼─────────▶│ Z2  │
-│              └─────┘ │          └─────┘
+   ▲        │  ┌─────┐ │lbl    ┌─────┐
+┌──┘        └─▶│  Y  │─┼──────▶│ Z2  │
+│              └─────┘ │       └─────┘
 │                   └─┐│
 │                     ││
 ├─────────────────────┼┘
@@ -2989,15 +3019,71 @@ mod tests {
             "graph LR\n    A[Start] --> B{Check}\n    B -->|success| C[Deploy]\n    B -->|failure| D[Rollback]\n",
             r#"
 
-                                             ┌────────┐
-                                    ┌───────▶│ Deploy │
-  ┌───────┐      ◆─────────◆ success│        └────────┘
+                                        ┌────────┐
+                                    ┌──▶│ Deploy │
+  ┌───────┐      ◆─────────◆ success│   └────────┘
   │ Start │─────▶│  Check  │────────┤
   └───────┘      ◆─────────◆ failure│
-                                    │       ┌──────────┐
-                                    └──────▶│ Rollback │
-                                            └──────────┘
+                                    │  ┌──────────┐
+                                    └─▶│ Rollback │
+                                       └──────────┘
 
+"#,
+        );
+    }
+
+    #[test]
+    fn straight_label_clears_two_feedback_drops_left_right() {
+        // Y's column holds two feedback sources, so the gap right of it opens
+        // with two drop columns and the label has to start past both. Sizing
+        // the gap for the label and the rises alone leaves it a column short
+        // per drop, and `committed` comes back as `committ…`.
+        assert_render(
+            "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|committed| Z2\n",
+            r#"
+
+               ┌─────┐               ┌─────┐
+            ┌─▶│  X  │──────────────▶│ Z1  │
+  ┌─────┐   │  └─────┘               └─────┘
+  │  S  │───┤       └──┐
+  └─────┘   │          │
+   ▲        │  ┌─────┐ │committed    ┌─────┐
+┌──┘        └─▶│  Y  │─┼────────────▶│ Z2  │
+│              └─────┘ │             └─────┘
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_bent_label_does_not_double_the_gap_left_right() {
+        // The bend moves right with the label instead of holding the middle of
+        // the gap. Sizing a centred bend to clear an 18-column label costs 38
+        // columns of gap against 22 here, and the viewer word-wraps a diagram
+        // wider than the terminal into fragments.
+        let code = "graph LR\n    A[Start] --> B{Check}\n    B -->|user clicks submit| C[Deploy]\n    B -->|failure| D[Rollback]\n    D --> B\n";
+        let text = render_text(code);
+        let width = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(width < 70, "diagram is {width} columns wide:\n{text}");
+        assert_render(
+            code,
+            r#"
+
+                                                   ┌────────┐
+                                               ┌──▶│ Deploy │
+  ┌───────┐      ◆─────────◆ user clicks submit│   └────────┘
+  │ Start │─────▶│  Check  │───────────────────┤
+  └───────┘      ◆─────────◆            failure│
+                  ▲                            │  ┌──────────┐
+               ┌──┘                            └─▶│ Rollback │
+               │                                  └──────────┘
+               │                                            └─┐
+               │                                              │
+               └──────────────────────────────────────────────┘
 "#,
         );
     }
@@ -3013,14 +3099,14 @@ mod tests {
 
   ┌─────┐
   │  A  │────┐
-  └─────┘ lbl│   ┌─────┐
-             ├──▶│  X  │
-             │   └─────┘
+  └─────┘ lbl│  ┌─────┐
+             ├─▶│  X  │
+             │  └─────┘
   ┌─────┐    │
   │  B  │────┤
-  └─────┘    │   ┌─────┐
-             ├──▶│  Y  │
-             │   └─────┘
+  └─────┘    │  ┌─────┐
+             ├─▶│  Y  │
+             │  └─────┘
   ┌─────┐    │
   │  C  │────┘
   └─────┘
