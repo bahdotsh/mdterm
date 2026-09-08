@@ -3116,6 +3116,31 @@ mod tests {
     }
 
     #[test]
+    fn a_label_overrunning_an_acyclic_canvas_is_cut_with_an_ellipsis_top_down() {
+        // A top-down canvas is sized for its boxes, not for its labels, so a
+        // long label runs out of room at the right edge whether or not the
+        // diagram has feedback edges. `main` let the write run off the canvas,
+        // where `set` dropped it, and the label ended mid-word with nothing to
+        // say it had been cut. This is the one way an acyclic top-down render
+        // differs from `main`.
+        assert_render(
+            "graph TD\n    A -->|this is an extremely long edge label| B\n",
+            r#"
+   ┌─────┐
+   │  A  │
+   └─────┘
+      │ this…
+      │
+      │
+      ▼
+   ┌─────┐
+   │  B  │
+   └─────┘
+"#,
+        );
+    }
+
+    #[test]
     fn a_label_with_no_room_to_be_cut_is_dropped() {
         assert_eq!(fit_label("retry", 5), "retry");
         assert_eq!(fit_label("retry", 4), "ret\u{2026}");
