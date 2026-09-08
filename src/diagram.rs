@@ -366,41 +366,62 @@ struct FeedbackPlans {
     entries: Vec<usize>,
 }
 
+/// A feedback edge whose two endpoints both landed in a layer, with where they
+/// landed. Planning resolves the endpoints once into this, so the per-layer
+/// endpoint counts that size the gaps and the ranks that place the routes are
+/// taken from the same set of edges the renderer goes on to draw.
+struct PlacedFeedback {
+    /// Index into `graph.edges`.
+    edge: usize,
+    src_layer: usize,
+    src_pos: usize,
+    dst_layer: usize,
+    dst_pos: usize,
+}
+
 fn plan_feedback(graph: &Graph, layout: &Layout) -> FeedbackPlans {
     let layer_count = layout.layers.len();
-    let mut sources: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
-    let mut targets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
-    for &idx in &layout.feedback {
-        let edge = &graph.edges[idx];
-        if let Some(&(layer, pos)) = layout.node_pos.get(&edge.from) {
-            sources[layer].insert(pos);
-        }
-        if let Some(&(layer, pos)) = layout.node_pos.get(&edge.to) {
-            targets[layer].insert(pos);
-        }
-    }
-    // Rank counts the endpoints between this one and the gutter.
-    let rank = |positions: &BTreeSet<usize>, pos: usize| positions.range(pos + 1..).count();
-
-    let mut plans: Vec<FeedbackPlan> = layout
+    // Resolve every feedback edge to its endpoints first. An edge whose
+    // endpoints are not both placed is dropped here, so the per-layer counts
+    // below are taken from the routes that are actually drawn: the gap budget
+    // and the ranks can never be sized for a route the renderer skips.
+    let placed: Vec<PlacedFeedback> = layout
         .feedback
         .iter()
         .filter_map(|&idx| {
             let edge = &graph.edges[idx];
             let &(src_layer, src_pos) = layout.node_pos.get(&edge.from)?;
             let &(dst_layer, dst_pos) = layout.node_pos.get(&edge.to)?;
-            Some(FeedbackPlan {
+            Some(PlacedFeedback {
                 edge: idx,
-                lane: 0,
-                src_rank: rank(&sources[src_layer], src_pos),
-                dst_rank: rank(&targets[dst_layer], dst_pos),
+                src_layer,
+                src_pos,
+                dst_layer,
+                dst_pos,
             })
         })
         .collect();
-    // Lanes are numbered over the edges that survived, so they stay contiguous.
-    for (lane, plan) in plans.iter_mut().enumerate() {
-        plan.lane = lane;
+
+    let mut sources: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
+    let mut targets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
+    for p in &placed {
+        sources[p.src_layer].insert(p.src_pos);
+        targets[p.dst_layer].insert(p.dst_pos);
     }
+    // Rank counts the endpoints between this one and the gutter.
+    let rank = |positions: &BTreeSet<usize>, pos: usize| positions.range(pos + 1..).count();
+
+    // Lanes are numbered over the edges that survived, so they stay contiguous.
+    let plans: Vec<FeedbackPlan> = placed
+        .iter()
+        .enumerate()
+        .map(|(lane, p)| FeedbackPlan {
+            edge: p.edge,
+            lane,
+            src_rank: rank(&sources[p.src_layer], p.src_pos),
+            dst_rank: rank(&targets[p.dst_layer], p.dst_pos),
+        })
+        .collect();
 
     FeedbackPlans {
         plans,
