@@ -32,6 +32,11 @@ pub enum LineMeta {
     },
     CodeContent {
         block_id: usize,
+        /// A row of a rendered diagram rather than of a code block. A diagram
+        /// is 2D art on a fixed grid: word-wrapping a row moves its overflow
+        /// onto a row of its own, where it reads as a second broken diagram
+        /// instead of a continuation, so an over-wide row is clipped instead.
+        diagram: bool,
     },
     ListItem {
         list_id: usize,
@@ -94,6 +99,8 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
     for line in lines {
         if line.spans.is_empty() || line.display_width() <= width {
             result.push(line.clone());
+        } else if matches!(line.meta, LineMeta::CodeContent { diagram: true, .. }) {
+            result.push(clip_line(line, width));
         } else if line
             .spans
             .first()
@@ -142,6 +149,48 @@ pub fn wrap_lines(lines: &[Line], width: usize) -> Vec<Line> {
         }
     }
     result
+}
+
+/// Cut `line` down to `width` display columns, dropping the overflow.
+///
+/// Used for rows that are laid out on a fixed grid rather than written as
+/// prose. Wrapping such a row would reflow it into a shape that no longer
+/// lines up with the rows above and below it, and the viewer paints a line in
+/// full whatever its width, so leaving it long would run it past the border
+/// and shift every row after it.
+fn clip_line(line: &Line, width: usize) -> Line {
+    let mut spans: Vec<StyledSpan> = Vec::new();
+    let mut col = 0;
+    for span in &line.spans {
+        let span_width = UnicodeWidthStr::width(span.text.as_str());
+        if col + span_width <= width {
+            col += span_width;
+            spans.push(span.clone());
+            continue;
+        }
+        // The span that straddles the edge is cut at a character boundary and
+        // everything past it is dropped.
+        let mut text = String::new();
+        for ch in span.text.chars() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col + ch_width > width {
+                break;
+            }
+            col += ch_width;
+            text.push(ch);
+        }
+        if !text.is_empty() {
+            spans.push(StyledSpan {
+                text,
+                style: span.style.clone(),
+            });
+        }
+        break;
+    }
+    Line {
+        spans,
+        meta: line.meta.clone(),
+    }
 }
 
 fn word_wrap(line: &Line, width: usize) -> Vec<Line> {
@@ -349,16 +398,73 @@ mod tests {
     #[test]
     fn code_meta_propagated_to_first_wrapped_line_only() {
         let mut line = plain_line("some very long code line content here");
-        line.meta = LineMeta::CodeContent { block_id: 5 };
+        line.meta = LineMeta::CodeContent {
+            block_id: 5,
+            diagram: false,
+        };
         let wrapped = wrap_lines(&[line], 10);
         assert!(wrapped.len() >= 2);
         assert!(matches!(
             wrapped[0].meta,
-            LineMeta::CodeContent { block_id: 5 }
+            LineMeta::CodeContent { block_id: 5, .. }
         ));
         for l in &wrapped[1..] {
             assert!(matches!(l.meta, LineMeta::None));
         }
+    }
+
+    #[test]
+    fn diagram_row_is_clipped_rather_than_wrapped() {
+        let mut line = plain_line("┌────────┐ and a tail that does not fit");
+        line.meta = LineMeta::CodeContent {
+            block_id: 1,
+            diagram: true,
+        };
+        let wrapped = wrap_lines(&[line], 10);
+        assert_eq!(wrapped.len(), 1, "a diagram row must stay on one row");
+        assert_eq!(line_text(&wrapped[0]), "┌────────┐");
+    }
+
+    #[test]
+    fn clipped_diagram_row_keeps_its_meta() {
+        let mut line = plain_line("┌────────┐ and a tail that does not fit");
+        line.meta = LineMeta::CodeContent {
+            block_id: 7,
+            diagram: true,
+        };
+        let wrapped = wrap_lines(&[line], 10);
+        assert!(matches!(
+            wrapped[0].meta,
+            LineMeta::CodeContent {
+                block_id: 7,
+                diagram: true
+            }
+        ));
+    }
+
+    #[test]
+    fn diagram_row_that_fits_is_untouched() {
+        let mut line = plain_line("┌──────┐");
+        line.meta = LineMeta::CodeContent {
+            block_id: 1,
+            diagram: true,
+        };
+        let wrapped = wrap_lines(&[line], 40);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(line_text(&wrapped[0]), "┌──────┐");
+    }
+
+    #[test]
+    fn code_rows_still_wrap() {
+        // Only diagrams are clipped. A code block is text, and its long lines
+        // wrap as they always did.
+        let mut line = plain_line("some very long code line content here");
+        line.meta = LineMeta::CodeContent {
+            block_id: 2,
+            diagram: false,
+        };
+        let wrapped = wrap_lines(&[line], 10);
+        assert!(wrapped.len() >= 2);
     }
 
     #[test]
