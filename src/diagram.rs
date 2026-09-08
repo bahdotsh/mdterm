@@ -2275,9 +2275,15 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(20)) {
                 Ok(true) => {}
                 Ok(false) => panic!("case {case} did not render:\n{code}"),
-                Err(err) => {
-                    let _ = handle.join();
-                    panic!("case {case} failed ({err:?}) for:\n{code}");
+                // Neither arm joins the render thread. On a timeout it is
+                // still running, so waiting for it would hang the test rather
+                // than fail it, which is the failure this timeout exists to
+                // report. The thread is detached instead.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("case {case} panicked while rendering:\n{code}")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("case {case} did not finish within 20 seconds:\n{code}")
                 }
             }
             handle.join().unwrap();
