@@ -154,14 +154,14 @@ graph TD
 - [x] Heading outline / TOC (`o` key)
 - [x] Follow mode (`--follow`)
 - [x] Stdin support (`cat file | mdterm`)
-- [ ] Image placeholders
+- [x] Image placeholders
 - [x] Heading jumps (`[` / `]`)
 - [x] Link picker (`f` key)
 - [x] Copy to clipboard (`y` / `Y` / `c`)
 - [x] Multiple files (`Tab` / `Shift+Tab`)
-- [ ] CLI flags (`--help`, `--version`, etc.)
+- [x] CLI flags (`--help`, `--version`, etc.)
 - [x] Config file (`~/.config/mdterm/config.toml`)
-- [ ] Line numbers (`l` key or `--line-numbers`)
+- [x] Line numbers (`l` key or `--line-numbers`)
 - [x] Code block copy (`c` key)
 - [x] Regex search (`/` with patterns)
 - [x] Scrollbar
