@@ -785,6 +785,19 @@ struct CanvasCell {
     /// its own label inline, so this is the one kind of edge cell a label may
     /// be written over.
     is_lane: bool,
+    /// Set when the cell holds an edge's arrowhead, to the directions the
+    /// edge itself runs through the cell.
+    ///
+    /// The head is the one cell of an edge that says which of the two nodes it
+    /// joins is the destination, and it is a single cell, so a line drawn
+    /// across it does not clutter the edge, it deletes the edge's direction
+    /// outright. [`Canvas::add_connection`] therefore records a crossing here
+    /// without repainting the glyph, and
+    /// [`Canvas::assert_no_crossed_arrowheads`] reports any connection across
+    /// the head's own axis: the head survives the crossing, but the line doing
+    /// the crossing is drawn with a break in it and should have been routed
+    /// elsewhere.
+    arrow_axis: Option<u8>,
 }
 
 impl Default for CanvasCell {
@@ -797,6 +810,7 @@ impl Default for CanvasCell {
             connects: 0,
             is_feedback: false,
             is_lane: false,
+            arrow_axis: None,
         }
     }
 }
@@ -820,6 +834,20 @@ impl Canvas {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
+            // Whatever was here has been replaced, so a cell that held an
+            // arrowhead no longer does and must not go on being protected as
+            // though it did.
+            self.cells[y][x].arrow_axis = None;
+        }
+    }
+
+    /// Write the arrowhead that ends a forward edge, marking the cell so that
+    /// a later crossing cannot paint the head away. `axis` is the direction
+    /// the edge runs through the cell. See [`CanvasCell::arrow_axis`].
+    fn set_arrow(&mut self, x: usize, y: usize, ch: char, axis: u8, fg: Option<Color>) {
+        self.set(x, y, ch, fg);
+        if y < self.height && x < self.width {
+            self.cells[y][x].arrow_axis = Some(axis);
         }
     }
 
@@ -834,8 +862,16 @@ impl Canvas {
     fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
         if y < self.height && x < self.width {
             let cell = &mut self.cells[y][x];
-            if !cell.is_node {
-                cell.connects |= dir;
+            if cell.is_node {
+                return;
+            }
+            cell.connects |= dir;
+            // An arrowhead keeps its glyph and its colour. The direction is
+            // still recorded, so a route drawn through here later joins up
+            // with the crossing, but repainting the cell as a junction would
+            // delete the only mark that says where the edge ends, leaving two
+            // boxes joined by a line that points at neither.
+            if cell.arrow_axis.is_none() {
                 cell.ch = junction_char(cell.connects);
                 if fg.is_some() {
                     cell.fg = fg;
@@ -862,10 +898,10 @@ impl Canvas {
     ///
     /// The head is part of the route and is marked like every other cell of
     /// one, so [`Canvas::assert_invariants`] sees it and [`Canvas::set_label`]
-    /// will not paint over it. `dir` records the direction the route runs
-    /// through the cell, so a forward edge crossing the head renders as a
-    /// junction rather than replacing it with a plain line that shows only the
-    /// forward edge.
+    /// will not paint over it. `dir` is the direction the route runs through
+    /// the cell, and doubles as the head's own axis, so a line crossing it
+    /// keeps off the glyph and is reported by
+    /// [`Canvas::assert_no_crossed_arrowheads`].
     fn route_arrow(&mut self, x: usize, y: usize, ch: char, dir: u8, fg: Option<Color>) {
         if y >= self.height || x >= self.width {
             return;
@@ -881,6 +917,7 @@ impl Canvas {
         cell.connects |= dir;
         cell.ch = ch;
         cell.fg = fg;
+        cell.arrow_axis = Some(dir);
     }
 
     /// Mark a cell as part of a left-right gutter lane's plain horizontal run,
@@ -932,6 +969,37 @@ impl Canvas {
                     !(cell.is_feedback && cell.is_node),
                     "feedback route runs through the node cell at ({x}, {y})"
                 );
+            }
+        }
+    }
+
+    /// Check, once a top-down render is finished, that no line was drawn
+    /// across an arrowhead.
+    ///
+    /// An arrowhead keeps its glyph against a crossing, so the head itself is
+    /// never lost; what is lost is a cell of the line that crossed it, and a
+    /// bus that has to break over a row of heads belongs on another row. Every
+    /// gap is budgeted for one.
+    ///
+    /// Top-down only. In a left-right diagram each column is centred in the
+    /// canvas on its own, so a box's rows line up with nothing in particular
+    /// in the column beside it, and a forward edge running in to its own
+    /// destination can meet a feedback arrowhead belonging to a box in another
+    /// column. That is the same class as a label landing on an unrelated
+    /// edge's line, which predates this branch and `main` has too: it wants a
+    /// placement pass that draws every line before deciding where the rest
+    /// goes, not a special case here.
+    #[cfg(test)]
+    fn assert_no_crossed_arrowheads(&self) {
+        for (y, row) in self.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                if let Some(axis) = cell.arrow_axis {
+                    assert_eq!(
+                        cell.connects & !axis,
+                        0,
+                        "an edge crosses the arrowhead at ({x}, {y})"
+                    );
+                }
             }
         }
     }
@@ -1187,7 +1255,7 @@ impl Canvas {
                 self.add_connection(src_cx, y, CONN_UP | CONN_DOWN, edge_fg);
             }
             // Arrow replaces last segment
-            self.set(dst_cx, dst_top_y - 1, '▼', edge_fg);
+            self.set_arrow(dst_cx, dst_top_y - 1, '▼', CONN_UP | CONN_DOWN, edge_fg);
 
             // Place label beside the vertical line
             if let Some(text) = label {
@@ -1236,7 +1304,7 @@ impl Canvas {
             }
 
             // Arrow
-            self.set(dst_cx, dst_top_y - 1, '▼', edge_fg);
+            self.set_arrow(dst_cx, dst_top_y - 1, '▼', CONN_UP | CONN_DOWN, edge_fg);
 
             // Place label above horizontal segment
             if let Some(text) = label {
@@ -1287,7 +1355,7 @@ impl Canvas {
                 self.add_connection(x, src_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
             }
             // Arrow replaces last segment
-            self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
+            self.set_arrow(dst_left_x - 1, dst_cy, '▶', CONN_LEFT | CONN_RIGHT, edge_fg);
 
             // Label above the horizontal line, held inside the free columns.
             if let Some(text) = label {
@@ -1341,7 +1409,7 @@ impl Canvas {
             }
 
             // Arrow
-            self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
+            self.set_arrow(dst_left_x - 1, dst_cy, '▶', CONN_LEFT | CONN_RIGHT, edge_fg);
 
             // Label beside the vertical segment: right of the bend where
             // there is room for it, otherwise left of the bend, and cut when
@@ -1797,6 +1865,16 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             }
         }
     }
+    // Every layer's arrowhead row as well, feedback or not. The rows above
+    // cover a layer that feedback edges enter; a layer they do not enter
+    // leaves its arrowhead row free, and a spanning bus settling there runs
+    // the length of the diagram across the head of every forward edge
+    // arriving at that layer. The heads survive it now (see
+    // `CanvasCell::arrow_axis`), but the bus is drawn with a break at each one
+    // and reads as several lines rather than one.
+    for &top in layer_top.iter().skip(1) {
+        reserved_rows.insert(top - 1);
+    }
 
     // Forward edges
     for (idx, edge) in graph.edges.iter().enumerate() {
@@ -1864,6 +1942,8 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     #[cfg(test)]
     canvas.assert_invariants();
+    #[cfg(test)]
+    canvas.assert_no_crossed_arrowheads();
 
     let rows = canvas.to_span_rows(theme);
     Some((rows, canvas_width))
@@ -2085,6 +2165,11 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         for r in 0..feedback.entries[k] {
             reserved_cols.insert(left.saturating_sub(2 + r));
         }
+        // The column immediately left of a box is where every forward
+        // arrowhead into that column lands. A bend there runs down the heads
+        // of all of them, which the rises are already kept clear of for the
+        // same reason.
+        reserved_cols.insert(left.saturating_sub(1));
     }
 
     // Bend column of each gap. Every forward edge between two adjacent columns
@@ -2131,14 +2216,22 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                     let mid = if dst_layer == src_layer + 1 {
                         bend_x.get(src_layer).copied()
                     } else {
-                        (dst_left > src_right + 1)
-                            .then(|| src_right + 1 + (dst_left - src_right - 1) / 2)
-                            .map(|mut x| {
-                                while x + 1 < dst_left && reserved_cols.contains(&x) {
-                                    x += 1;
-                                }
-                                x
-                            })
+                        (dst_left > src_right + 1).then(|| {
+                            // Search right from the midpoint, then back left.
+                            // Rightward alone has a wall: the rise columns of
+                            // the destination run unbroken up to the arrowhead
+                            // column beside its boxes, so a midpoint inside
+                            // that block has nothing free to its right, and
+                            // stopping at the wall put the bend on the very
+                            // column those heads occupy.
+                            let lo = src_right + 1;
+                            let mid = lo + (dst_left - lo) / 2;
+                            let free = |x: &usize| !reserved_cols.contains(x);
+                            (mid..dst_left)
+                                .find(free)
+                                .or_else(|| (lo..mid).rev().find(free))
+                                .unwrap_or(mid)
+                        })
                     };
                     // Free columns for the label: right of this column's drops,
                     // left of the next column's rises, and clear of the
@@ -2194,9 +2287,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn render_text(code: &str) -> String {
-        let theme = Theme::dark();
-        let (rows, _) = render_mermaid(code, &theme).expect("diagram should render");
+    fn rows_to_text(rows: Vec<Vec<StyledSpan>>) -> String {
         rows.into_iter()
             .map(|row| {
                 row.into_iter()
@@ -2207,6 +2298,61 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_text(code: &str) -> String {
+        let theme = Theme::dark();
+        let (rows, _) = render_mermaid(code, &theme).expect("diagram should render");
+        rows_to_text(rows)
+    }
+
+    /// How many arrowheads a graph's shape calls for, as
+    /// `(forward, feedback)`.
+    ///
+    /// Every edge ends in a head, but edges sharing a destination share the
+    /// head they end at: forward edges all arrive at one cell of the
+    /// destination's border, and so, separately, do the back edges. So the
+    /// count is the number of distinct destinations of each kind, and a head
+    /// missing from a render is an edge whose direction the reader cannot
+    /// recover.
+    fn expected_arrowheads(code: &str) -> (usize, usize) {
+        let graph = parse_mermaid(code).expect("diagram should parse");
+        let feedback = classify_feedback_edges(&graph);
+        let mut forward: HashSet<&str> = HashSet::new();
+        let mut back: HashSet<&str> = HashSet::new();
+        for (idx, edge) in graph.edges.iter().enumerate() {
+            if feedback.contains(&idx) {
+                back.insert(edge.to.as_str());
+            } else {
+                forward.insert(edge.to.as_str());
+            }
+        }
+        (forward.len(), back.len())
+    }
+
+    /// Check a render against the heads its graph calls for. Top-down draws
+    /// both kinds with the same glyph, so there the two are checked as one
+    /// total.
+    fn assert_arrowheads(code: &str, text: &str, lr: bool) {
+        let (forward, back) = expected_arrowheads(code);
+        if lr {
+            assert_eq!(
+                text.matches('\u{25b6}').count(),
+                forward,
+                "forward arrowheads\n{code}\n{text}"
+            );
+            assert_eq!(
+                text.matches('\u{25b2}').count(),
+                back,
+                "feedback arrowheads\n{code}\n{text}"
+            );
+        } else {
+            assert_eq!(
+                text.matches('\u{25bc}').count(),
+                forward + back,
+                "arrowheads\n{code}\n{text}"
+            );
+        }
     }
 
     /// Render on a helper thread so that a layout that never terminates fails
@@ -2288,15 +2434,23 @@ mod tests {
         }
     }
 
-    /// Render a deterministic spread of graph shapes and let
-    /// [`Canvas::assert_invariants`] check every feedback route against every
-    /// box.
+    /// Render a deterministic spread of graph shapes and check three things
+    /// on every one: that no feedback route was laid over a box
+    /// ([`Canvas::assert_invariants`]), that no label was written over a route
+    /// ([`Canvas::set_label`]), and that every edge still ends in an arrowhead.
     ///
     /// The shapes vary in node count, node width, edge count, direction and
     /// labelling, because a route only collides with a box that a *differently
     /// sized* neighbour widened the column for.
+    ///
+    /// The head count is the check with the widest reach. Nothing else objects
+    /// when a line is drawn across an arrowhead: the junction left behind is a
+    /// legitimate character in a legitimate place, and the only sign that
+    /// anything is wrong is that an edge no longer says which way it runs.
+    /// Before arrowhead cells were protected, 926 of these 2000 cases lost at
+    /// least one head.
     #[test]
-    fn feedback_routes_never_run_through_a_node_box() {
+    fn feedback_routes_and_arrowheads_survive_random_graphs() {
         // xorshift with a fixed seed, so a failure is always reproducible.
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = move || {
@@ -2327,15 +2481,19 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             let handle = thread::spawn(move || {
                 let theme = Theme::dark();
-                let _ = tx.send(render_mermaid(&source, &theme).is_some());
+                let _ =
+                    tx.send(render_mermaid(&source, &theme).map(|(rows, _)| rows_to_text(rows)));
             });
             match rx.recv_timeout(Duration::from_secs(20)) {
-                Ok(true) => {}
-                Ok(false) => panic!("case {case} did not render:\n{code}"),
-                // Neither arm joins the render thread. On a timeout it is
-                // still running, so waiting for it would hang the test rather
-                // than fail it, which is the failure this timeout exists to
-                // report. The thread is detached instead.
+                Ok(Some(text)) => {
+                    // Only this arm joins. On a timeout the thread is still
+                    // rendering, so waiting for it would hang the test rather
+                    // than fail it, which is the failure the timeout exists to
+                    // report; those arms leave it detached.
+                    handle.join().unwrap();
+                    assert_arrowheads(&code, &text, lr);
+                }
+                Ok(None) => panic!("case {case} did not render:\n{code}"),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("case {case} panicked while rendering:\n{code}")
                 }
@@ -2343,7 +2501,6 @@ mod tests {
                     panic!("case {case} did not finish within 20 seconds:\n{code}")
                 }
             }
-            handle.join().unwrap();
         }
     }
 
@@ -2415,6 +2572,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A layer whose arrowhead row a spanning forward edge's bus can land on.
+    ///
+    /// `Q` is reached by a source that also feeds `R` two layers down, so the
+    /// `S -> R` bus crosses the whole gap around `Q`. Every sibling of `S`
+    /// carries a self-loop, which fills the gap below their layer with
+    /// feedback rows and walks the bus's midpoint down onto the one row it
+    /// must not have: the row every arrowhead into `Q` sits on. The rows a
+    /// feedback route reserves cover a layer that back edges *enter*, and
+    /// nothing enters `Q`, so before every layer's arrowhead row was reserved
+    /// the search settled there and drew the bus across those heads.
+    fn arrowhead_row_source(siblings: usize) -> String {
+        let mut code = String::from("graph TD\n    S --> Q\n    Q --> R\n    S --> R\n");
+        for i in 1..=siblings {
+            code.push_str(&format!("    P{i} --> Q\n"));
+            code.push_str(&format!("    P{i} --> P{i}\n"));
+        }
+        code
+    }
+
+    #[test]
+    fn a_spanning_bus_clears_an_arrowhead_row_top_down() {
+        for siblings in 1..=8usize {
+            let code = arrowhead_row_source(siblings);
+            let text = render_text_with_timeout(code.clone());
+            // Heads at Q and R, then one per self-loop.
+            assert_arrowheads(&code, &text, false);
+            assert_eq!(
+                text.matches('\u{25bc}').count(),
+                2 + siblings,
+                "\n{code}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spanning_bend_clears_an_arrowhead_column_left_right() {
+        // The mirror in left-right. `A -> C3` spans two columns, so it bends
+        // at the middle of its own span rather than at a gap's bend column.
+        // The middle column holds three feedback targets, whose rise columns
+        // run unbroken up to the column beside their boxes, and the search
+        // used to walk right until it ran out of rises and stop on exactly
+        // that column: the one every forward arrowhead into the column lands
+        // on. It searches both ways now, and treats an arrowhead column as
+        // taken.
+        //
+        // `A`'s label is what pushes the bend into the block, by widening the
+        // gap that the midpoint is measured across.
+        let code = "graph LR
+    A -->|xxxxxxxxxxxxx| B
+    A --> C3
+    A2 --> B2
+    A2 --> B3
+    B --> C
+    B2 --> C2
+    B3 --> C3
+    C --> B
+    C2 --> B2
+    C3 --> B3
+";
+        let text = render_text_with_timeout(code);
+        assert_arrowheads(code, &text, true);
+        // Pinned in full, because a head that survives a crossing is not the
+        // whole of it: the line that crossed it is drawn with a break, and
+        // only the picture shows that.
+        assert_render(
+            code,
+            r#"
+
+                             ┌─────┐      ┌─────┐
+                       ┌────▶│  B  │─────▶│  C  │
+  ┌─────┐ xxxxxxxxxxxxx│     └─────┘      └─────┘
+  │  A  │──────────────┤      ▲                └───┐
+  └─────┘              │ ┌────┘                    │
+                       │ │   ┌─────┐      ┌─────┐  │
+                       └─┼──▶│ C3  │─────▶│ B3  │  │
+  ┌─────┐                │   └─────┘      └─────┘  │
+  │ A2  │──────────────┬─┼───┘▲                └──┐│
+  └─────┘              │ │┌───┘                   ││
+                       │ ││  ┌─────┐      ┌─────┐ ││
+                       └─┼┼─▶│ B2  │─────▶│ C2  │ ││
+                         ││  └─────┘      └─────┘ ││
+                         ││   ▲                └─┐││
+                         ││┌──┘                  │││
+                         │└┼─────────────────────┼┘│
+                         │ │                     │ │
+                         └─┼─────────────────────┼─┘
+                           │                     │
+                           └─────────────────────┘
+"#,
+        );
     }
 
     // ── Cycle classification ──
@@ -3360,11 +3609,14 @@ mod tests {
         // row above. That row is where a feedback route drops from its
         // horizontal run to its arrowhead, and the reserved rows used to cover
         // the run alone, so the label went over the head of the edge arriving:
-        // two boxes that nothing appeared to reach. Reserving the rows the
-        // whole route runs through is what keeps these seven heads; covering
-        // only the runs leaves five.
-        let text = render_text(
-            "graph TD
+        // two boxes that nothing appeared to reach. Covering the rows the
+        // whole route runs through is what stopped that; before it, this shape
+        // came out with five heads.
+        //
+        // The eighth head is the one a crossing forward run used to repaint as
+        // a junction, kept now that an arrowhead cell holds its glyph against
+        // [`Canvas::add_connection`].
+        let code = "graph TD
     N8[x] --> N6[xxxxxxxxxxx]
     N5[xxxxxx] --> N7[xxxxxxxxxxxxxxxx]
     N1[xxxxxx] --> N3[xxxxxxxxxxxxxxxx]
@@ -3374,9 +3626,10 @@ mod tests {
     N7[xxxxxxxxxxxxxxxx] -->|LL| N1[xxxxxx]
     N3[xxxxxxxxxxxxxxxx] -->|LLL| N5[xxxxxx]
     N7[xxxxxxxxxxxxxxxx] --> N7[xxxxxxxxxxxxxxxx]
-",
-        );
-        assert_eq!(text.matches('\u{25bc}').count(), 7, "\n{text}");
+";
+        let text = render_text(code);
+        assert_arrowheads(code, &text, false);
+        assert_eq!(text.matches('\u{25bc}').count(), 8, "\n{text}");
     }
 
     #[test]
