@@ -1808,8 +1808,8 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             // and above its entry rows, so neither it nor the label on the row
             // above it can land on a feedback route. An edge spanning more
             // than one layer keeps the midpoint of its own span, which no gap
-            // budget accounts for, so it is pushed down off any reserved row
-            // it or its label would otherwise land on.
+            // budget accounts for, so it is moved off any reserved row it or
+            // its label would otherwise land on.
             let bus_y = match (
                 layout.node_pos.get(&edge.from),
                 layout.node_pos.get(&edge.to),
@@ -1817,14 +1817,27 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
                 (Some(&(from, _)), Some(&(to, _))) if to == from + 1 => {
                     Some(src.bottom_y() + 3 + feedback.exits[from])
                 }
-                _ if dst.top_y > src.bottom_y() + 1 => {
-                    let mut y = src.bottom_y() + 1 + (dst.top_y - src.bottom_y() - 1) / 2;
-                    while y + 1 < dst.top_y
-                        && (reserved_rows.contains(&y) || reserved_rows.contains(&(y - 1)))
-                    {
-                        y += 1;
-                    }
-                    Some(y)
+                _ if dst.top_y > src.bottom_y() + 2 => {
+                    // Search down from the midpoint, then back up. Downward
+                    // alone has a floor, and the rows just above it are the
+                    // ones a destination's feedback entries hold: they run
+                    // unbroken from the outermost entry's own row down to the
+                    // arrowhead row. A midpoint landing inside that block has
+                    // nothing free below it, and stopping at the floor put the
+                    // bus across the heads of the arriving edges and the label
+                    // on an entry's horizontal run.
+                    //
+                    // Somewhere to go always exists: a span of more than one
+                    // layer covers a whole gap, and every gap is budgeted for
+                    // a bus row with a label row above it that no route uses.
+                    let lo = src.bottom_y() + 2;
+                    let mid = (src.bottom_y() + 1 + (dst.top_y - src.bottom_y() - 1) / 2)
+                        .clamp(lo, dst.top_y - 1);
+                    let free =
+                        |y: &usize| !reserved_rows.contains(y) && !reserved_rows.contains(&(y - 1));
+                    let below = (mid..dst.top_y).find(free);
+                    let above = (lo..mid).rev().find(free);
+                    Some(below.or(above).unwrap_or(mid))
                 }
                 _ => None,
             };
@@ -2198,18 +2211,24 @@ mod tests {
 
     /// Render on a helper thread so that a layout that never terminates fails
     /// the test instead of hanging the whole test binary.
-    fn render_text_with_timeout(code: &'static str) -> String {
+    fn render_text_with_timeout(code: impl Into<String>) -> String {
+        let code = code.into();
+        let source = code.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(render_text(code));
+            let _ = tx.send(render_text(&code));
         });
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(text) => text,
             // The sender is dropped as soon as the render thread unwinds, so a
-            // panic there arrives here as a disconnect, not as a timeout.
-            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the render thread panicked"),
+            // panic there arrives here as a disconnect, not as a timeout. The
+            // panic itself is on the other thread's output, which says nothing
+            // about which diagram provoked it, so name it here.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the render thread panicked on:\n{source}")
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("rendering did not finish within 10 seconds")
+                panic!("rendering did not finish within 10 seconds:\n{source}")
             }
         }
     }
@@ -2325,6 +2344,76 @@ mod tests {
                 }
             }
             handle.join().unwrap();
+        }
+    }
+
+    /// One layer of `targets` nodes, each with its own descendant and its own
+    /// back edge, optionally with a labelled forward edge spanning two layers
+    /// into the `label_into`-th of them.
+    ///
+    /// The random generator above cannot reach this shape. It caps a case at
+    /// 15 nodes and 30 edges, and nine targets carrying their own descendants
+    /// and back edges needs twenty of each. A wide layer is where the row
+    /// budget is under the most pressure: every feedback target in a layer
+    /// claims a row of the gap above it, while the midpoint of a forward edge
+    /// crossing that gap moves by only half a row per row added.
+    ///
+    /// `A` shares its layer with `Z` so that it is off the centre line the
+    /// lone node below it sits on. A spanning edge drawn straight down that
+    /// centre line runs through the box in between and overwrites the
+    /// arrowhead entering it, which is a separate and older fault than the one
+    /// under test here; standing `A` to one side keeps it out of the way.
+    fn wide_layer_source(dir: &str, targets: usize, label_into: Option<usize>) -> String {
+        let mut code = format!("graph {dir}\n    A --> M\n    Z --> M\n");
+        for i in 1..=targets {
+            code.push_str(&format!("    M --> T{i}\n"));
+            code.push_str(&format!("    T{i} --> U{i}\n"));
+            code.push_str(&format!("    U{i} --> T{i}\n"));
+        }
+        if let Some(i) = label_into {
+            code.push_str(&format!("    A -->|lbl| T{i}\n"));
+        }
+        code
+    }
+
+    /// Every render checks [`Canvas::assert_invariants`] and every label goes
+    /// through [`Canvas::set_label`], so rendering a shape is itself one
+    /// assertion: a route laid over a box or a label laid over a route fails
+    /// here rather than coming out as a break in the picture.
+    ///
+    /// Arrowheads are the other. Nothing objects when a forward edge's own
+    /// horizontal run crosses a feedback arrowhead — `add_connection` turns
+    /// the head into a junction, which is a legitimate character in a
+    /// legitimate place — so the only way to see that the head is gone is to
+    /// count the heads. Every edge here ends at a cell of its own, bar the
+    /// spanning edge that shares a destination border with `M -> T`, so the
+    /// count is fixed by the shape: one head per node reached, plus one per
+    /// back edge.
+    #[test]
+    fn a_wide_layer_of_feedback_targets_keeps_every_route_clear() {
+        for targets in 2..=12usize {
+            for dir in ["TD", "LR"] {
+                for label_into in [None, Some(1), Some(targets.div_ceil(2)), Some(targets)] {
+                    let code = wide_layer_source(dir, targets, label_into);
+                    let text = render_text_with_timeout(code.clone());
+                    // One head at M, one at every T and one at every U. The
+                    // spanning edge adds none: it shares a destination border
+                    // with `M -> T`. Every back edge then adds one of its own,
+                    // entering T through a border the forward edges do not use.
+                    let forward = 2 * targets + 1;
+                    let back = targets;
+                    if dir == "TD" {
+                        // Both kinds of head are the same glyph here.
+                        let heads = text.matches('\u{25bc}').count();
+                        assert_eq!(heads, forward + back, "\n{code}\n{text}");
+                    } else {
+                        let out = text.matches('\u{25b6}').count();
+                        let into = text.matches('\u{25b2}').count();
+                        assert_eq!(out, forward, "\n{code}\n{text}");
+                        assert_eq!(into, back, "\n{code}\n{text}");
+                    }
+                }
+            }
         }
     }
 
