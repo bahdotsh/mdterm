@@ -8,7 +8,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 |---|---|
 | ![Demo](screenshots/demo.png) | ![Light Theme](screenshots/light.png) |
 | ![Math Rendering](screenshots/math.png) | ![Mermaid Diagrams](screenshots/mermaid.png) |
-| ![Search](screenshots/search.png) | |
+| ![Search](screenshots/search.png) | ![File Picker](screenshots/file-picker.png) |
 
 ## Features
 
@@ -19,6 +19,7 @@ A terminal-based Markdown viewer written in Rust. Renders Markdown files with sy
 - **Clickable links** — OSC 8 hyperlinks in supporting terminals
 - **In-document search** — `/` to search with regex support, `n`/`N` to jump between matches
 - **Table of contents** — Press `o` to browse and jump to any heading
+- **File picker** — Start in a directory, search all nested `.md` files, and reopen it with `p`
 - **Fuzzy heading search** — Press `:` to filter headings by name
 - **Heading jumps** — `[` / `]` to jump between sections
 - **Local file links** — Click or select relative markdown links to navigate between files, with `Backspace` to go back
@@ -49,7 +50,9 @@ cargo install --path .
 ## Usage
 
 ```bash
+mdterm                              # pick a Markdown file from the current directory
 mdterm README.md                    # view a file
+mdterm docs/                        # pick a Markdown file from a directory
 mdterm a.md b.md                    # multiple files (Tab to switch)
 mdterm data.json                    # view a JSON file
 cat README.md | mdterm              # read from stdin
@@ -96,6 +99,7 @@ mdterm README.md | less -R
 | Key | Action |
 |-----|--------|
 | `o` | Table of contents overlay |
+| `p` | File picker |
 | `:` | Fuzzy heading search |
 | `f` | Link picker (open URLs / follow local links) |
 | `t` | Toggle dark/light theme |
@@ -108,6 +112,20 @@ mdterm README.md | less -R
 | `Tab` / `Shift+Tab` | Switch between files |
 | `h` / `?` / `F1` | Help screen |
 | `q` / `Ctrl+C` | Quit |
+
+### File Picker
+
+When launched without file arguments, mdterm opens a file picker rooted at the current directory. Passing a directory path opens the picker at that directory. Type to search across all nested `.md` paths; the query is matched as a fuzzy subsequence, so a path like `hello/world/a.md` can be found with `hellrlda.md`.
+
+| Key | Action |
+|-----|--------|
+| Type text | Search Markdown files |
+| `Up` / `Down` | Select previous / next file |
+| `Page Up` / `Page Down` | Move by page |
+| `Home` / `End` | Jump to first / last result |
+| `Enter` | Open selected file |
+| `F5` | Refresh file list |
+| `p` / `Esc` | Close picker after a file is open |
 
 ### Slide Mode (`--slides`)
 
@@ -136,7 +154,7 @@ CLI flags override config file settings.
 mdterm [OPTIONS] [FILES]...
 
 Arguments:
-  [FILES]...               Markdown file(s) to view
+  [FILES]...               Markdown file(s) to view, or a directory to pick from
 
 Options:
   -T, --theme <THEME>      Theme: dark or light
