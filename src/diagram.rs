@@ -1,7 +1,7 @@
 use crate::style::{Style, StyledSpan};
 use crate::theme::Theme;
 use crossterm::style::Color;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 // ───── Data types ─────
 
@@ -12,7 +12,7 @@ enum Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum NodeShape {
+enum NodeShape {
     Rectangle,
     Rounded,
     Diamond,
@@ -270,10 +270,207 @@ fn parse_arrow(s: &str) -> Option<(Option<String>, &str)> {
 // ───── Layout ─────
 
 #[derive(Clone)]
-pub(crate) struct NodeLayout {
-    pub(crate) center_x: usize,
-    pub(crate) top_y: usize,
-    pub(crate) width: usize,
+struct NodeLayout {
+    center_x: usize,
+    top_y: usize,
+    width: usize,
+}
+
+impl NodeLayout {
+    /// Column of the left border character.
+    fn left_x(&self) -> usize {
+        self.center_x.saturating_sub(self.width / 2)
+    }
+
+    /// Column of the right border character.
+    fn right_x(&self) -> usize {
+        self.left_x() + self.width.saturating_sub(1)
+    }
+
+    /// Row of the bottom border character.
+    fn bottom_y(&self) -> usize {
+        self.top_y + 2
+    }
+}
+
+/// Output of the layering phase, shared by both renderers.
+struct Layout {
+    /// Nodes grouped by layer; each layer is ordered left-to-right (TD) or
+    /// top-to-bottom (LR).
+    layers: Vec<Vec<String>>,
+    /// `(layer index, position within layer)` for every node.
+    node_pos: HashMap<String, (usize, usize)>,
+    /// Indices into `graph.edges` of the feedback (back) edges, sorted by the
+    /// number of layers they span, shortest first. Gutter lane `k` carries
+    /// `feedback[k]`, so the shortest edge sits innermost and longer edges wrap
+    /// around it instead of crossing it.
+    feedback: Vec<usize>,
+    /// The same indices as a set, for the renderers' "is this edge routed as
+    /// feedback?" test.
+    feedback_set: HashSet<usize>,
+}
+
+fn layout(graph: &Graph) -> Layout {
+    let feedback_set = classify_feedback_edges(graph);
+    let mut layers = assign_layers(graph, &feedback_set);
+    order_within_layers(&mut layers, graph, &feedback_set);
+
+    let mut node_pos: HashMap<String, (usize, usize)> = HashMap::new();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        for (pos, id) in layer.iter().enumerate() {
+            node_pos.insert(id.clone(), (layer_idx, pos));
+        }
+    }
+
+    let span = |idx: usize| {
+        let edge = &graph.edges[idx];
+        match (node_pos.get(&edge.from), node_pos.get(&edge.to)) {
+            (Some(&(from, _)), Some(&(to, _))) => from.abs_diff(to),
+            _ => 0,
+        }
+    };
+    let mut feedback: Vec<usize> = feedback_set.iter().copied().collect();
+    feedback.sort_by_key(|&idx| (span(idx), idx));
+
+    Layout {
+        layers,
+        node_pos,
+        feedback,
+        feedback_set,
+    }
+}
+
+/// Routing decisions for one feedback edge.
+struct FeedbackPlan {
+    /// Index into `graph.edges`.
+    edge: usize,
+    /// Gutter lane, 0 = innermost.
+    lane: usize,
+    /// Rank of the source among the feedback sources in its layer, counted
+    /// from the gutter side (0 = nearest the gutter). Every rank gets its own
+    /// row (TD) or gap column (LR), so routes that share a layer neither merge
+    /// nor cross.
+    src_rank: usize,
+    /// Same for the destination among the feedback targets in its layer.
+    dst_rank: usize,
+}
+
+/// Routing decisions for all the feedback edges of one diagram.
+struct FeedbackPlans {
+    plans: Vec<FeedbackPlan>,
+    /// Number of distinct feedback sources in each layer. The gap after a
+    /// layer has to hold one row (TD) or column (LR) per source.
+    exits: Vec<usize>,
+    /// Number of distinct feedback targets in each layer, likewise budgeted in
+    /// the gap before it.
+    entries: Vec<usize>,
+}
+
+/// A feedback edge whose two endpoints both landed in a layer, with where they
+/// landed. Planning resolves the endpoints once into this, so the per-layer
+/// endpoint counts that size the gaps and the ranks that place the routes are
+/// taken from the same set of edges the renderer goes on to draw.
+struct PlacedFeedback {
+    /// Index into `graph.edges`.
+    edge: usize,
+    src_layer: usize,
+    src_pos: usize,
+    dst_layer: usize,
+    dst_pos: usize,
+}
+
+fn plan_feedback(graph: &Graph, layout: &Layout) -> FeedbackPlans {
+    let layer_count = layout.layers.len();
+    // Resolve every feedback edge to its endpoints first. An edge whose
+    // endpoints are not both placed is dropped here, so the per-layer counts
+    // below are taken from the routes that are actually drawn: the gap budget
+    // and the ranks can never be sized for a route the renderer skips.
+    let placed: Vec<PlacedFeedback> = layout
+        .feedback
+        .iter()
+        .filter_map(|&idx| {
+            let edge = &graph.edges[idx];
+            let &(src_layer, src_pos) = layout.node_pos.get(&edge.from)?;
+            let &(dst_layer, dst_pos) = layout.node_pos.get(&edge.to)?;
+            Some(PlacedFeedback {
+                edge: idx,
+                src_layer,
+                src_pos,
+                dst_layer,
+                dst_pos,
+            })
+        })
+        .collect();
+
+    let mut sources: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
+    let mut targets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); layer_count];
+    for p in &placed {
+        sources[p.src_layer].insert(p.src_pos);
+        targets[p.dst_layer].insert(p.dst_pos);
+    }
+    // Rank counts the endpoints between this one and the gutter.
+    let rank = |positions: &BTreeSet<usize>, pos: usize| positions.range(pos + 1..).count();
+
+    // Lanes are numbered over the edges that survived, so they stay contiguous.
+    let plans: Vec<FeedbackPlan> = placed
+        .iter()
+        .enumerate()
+        .map(|(lane, p)| FeedbackPlan {
+            edge: p.edge,
+            lane,
+            src_rank: rank(&sources[p.src_layer], p.src_pos),
+            dst_rank: rank(&targets[p.dst_layer], p.dst_pos),
+        })
+        .collect();
+
+    FeedbackPlans {
+        plans,
+        exits: sources.iter().map(BTreeSet::len).collect(),
+        entries: targets.iter().map(BTreeSet::len).collect(),
+    }
+}
+
+/// Geometry of one feedback edge route in a top-down diagram.
+/// See [`Canvas::draw_feedback_edge_td`].
+struct FeedbackRouteTd {
+    /// Column where the route leaves the source's bottom border.
+    exit_x: usize,
+    /// Row of the source's bottom border.
+    src_bottom_y: usize,
+    /// Gap row of the horizontal run below the source.
+    exit_y: usize,
+    /// Column where the arrowhead enters the destination's top border.
+    entry_x: usize,
+    /// Row of the destination's top border.
+    dst_top_y: usize,
+    /// Gap row of the horizontal run above the destination.
+    entry_y: usize,
+    /// Column of the vertical lane in the gutter right of the diagram.
+    lane_x: usize,
+}
+
+/// Geometry of one feedback edge route in a left-right diagram.
+/// See [`Canvas::draw_feedback_edge_lr`].
+struct FeedbackRouteLr {
+    /// Column where the route leaves the source's bottom border.
+    exit_x: usize,
+    /// Row of the source's bottom border.
+    src_bottom_y: usize,
+    /// Gap column right of the source's *column* that carries the drop to the
+    /// lane. Boxes are centred in a column sized by its widest node, so a
+    /// column edge is the only place guaranteed to be clear of every box.
+    exit_lane_x: usize,
+    /// Column where the arrowhead enters the destination's bottom border.
+    entry_x: usize,
+    /// Row of the destination's bottom border.
+    dst_bottom_y: usize,
+    /// Gap column left of the destination's column that carries the rise from
+    /// the lane, two columns clear of it rather than one: the column
+    /// immediately left of a box is where every forward arrowhead into it
+    /// lands, and sharing it would overwrite the junction.
+    entry_lane_x: usize,
+    /// Row of the horizontal lane in the gutter below the diagram.
+    lane_y: usize,
 }
 
 fn assign_layers(graph: &Graph, feedback_edges: &HashSet<usize>) -> Vec<Vec<String>> {
@@ -325,7 +522,9 @@ fn assign_layers(graph: &Graph, feedback_edges: &HashSet<usize>) -> Vec<Vec<Stri
         }
     }
 
-    // Add any remaining nodes (from cycles)
+    // Safety net. With a valid feedback-edge set the graph above is a DAG and
+    // Kahn's sort has already visited every node; if that invariant were ever
+    // broken, append the stragglers so they are drawn rather than dropped.
     for &id in &node_ids {
         if !processed.contains(id) {
             topo_order.push(id);
@@ -356,7 +555,6 @@ fn assign_layers(graph: &Graph, feedback_edges: &HashSet<usize>) -> Vec<Vec<Stri
     let mut layers: Vec<Vec<String>> = vec![Vec::new(); max_layer + 1];
     for &node in &topo_order {
         let layer = node_layer[node];
-        // Return owned IDs to keep the original layout helper signature.
         layers[layer].push(node.to_string());
     }
     layers.retain(|l| !l.is_empty());
@@ -440,6 +638,13 @@ fn graph_node_ids(graph: &Graph) -> Vec<&str> {
     ids
 }
 
+/// Find the edges that must be set aside to make the graph acyclic.
+///
+/// Runs a depth-first search from every node in declaration order and reports
+/// each edge that points at a node still on the search path (a back edge),
+/// plus every self-loop. Removing those edges leaves a DAG, which is what the
+/// layer assignment needs. The search keeps its own explicit stack so that a
+/// long chain of nodes cannot overflow the native call stack.
 fn classify_feedback_edges(graph: &Graph) -> HashSet<usize> {
     #[derive(Clone, Copy)]
     enum VisitState {
@@ -447,36 +652,9 @@ fn classify_feedback_edges(graph: &Graph) -> HashSet<usize> {
         Visited,
     }
 
-    fn visit<'a>(
-        node: &'a str,
-        adj: &HashMap<&'a str, Vec<(usize, &'a str)>>,
-        visit_set: &mut HashMap<&'a str, VisitState>,
-        feedback: &mut HashSet<usize>,
-    ) {
-        visit_set.insert(node, VisitState::Visiting);
-
-        for &(edge_idx, to) in adj.get(node).into_iter().flatten() {
-            if to == node {
-                // Self-loops are feedback edges and cannot participate in DAG layering.
-                feedback.insert(edge_idx);
-                continue;
-            }
-
-            match visit_set.get(to).copied() {
-                None => visit(to, adj, visit_set, feedback),
-                Some(VisitState::Visiting) => {
-                    // Edges to nodes still on the DFS stack are feedback edges.
-                    feedback.insert(edge_idx);
-                }
-                Some(VisitState::Visited) => {}
-            }
-        }
-
-        visit_set.insert(node, VisitState::Visited);
-    }
-
+    let node_ids = graph_node_ids(graph);
     let mut adj: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
-    for id in graph_node_ids(graph) {
+    for &id in &node_ids {
         adj.entry(id).or_default();
     }
     for (idx, edge) in graph.edges.iter().enumerate() {
@@ -486,49 +664,54 @@ fn classify_feedback_edges(graph: &Graph) -> HashSet<usize> {
         adj.entry(edge.to.as_str()).or_default();
     }
 
-    let mut visit_set: HashMap<&str, VisitState> = HashMap::new();
+    let mut state: HashMap<&str, VisitState> = HashMap::new();
     let mut feedback = HashSet::new();
-    for id in graph_node_ids(graph) {
-        if !visit_set.contains_key(id) {
-            visit(id, &adj, &mut visit_set, &mut feedback);
+    // Each frame holds a node and the index of its next unexplored out-edge.
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+
+    for &root in &node_ids {
+        if state.contains_key(root) {
+            continue;
+        }
+        state.insert(root, VisitState::Visiting);
+        stack.push((root, 0));
+
+        while let Some(frame) = stack.last_mut() {
+            let (node, next) = *frame;
+            let edges = &adj[node];
+            if next >= edges.len() {
+                state.insert(node, VisitState::Visited);
+                stack.pop();
+                continue;
+            }
+            frame.1 += 1;
+
+            let (edge_idx, to) = edges[next];
+            if to == node {
+                feedback.insert(edge_idx);
+                continue;
+            }
+            match state.get(to) {
+                None => {
+                    state.insert(to, VisitState::Visiting);
+                    stack.push((to, 0));
+                }
+                Some(VisitState::Visiting) => {
+                    feedback.insert(edge_idx);
+                }
+                Some(VisitState::Visited) => {}
+            }
         }
     }
 
     feedback
 }
 
-fn edge_layer_feedback_indices(
-    graph: &Graph,
-    layers: &[Vec<String>],
-    feedback_edges: &HashSet<usize>,
-) -> Vec<usize> {
-    let mut node_layer: HashMap<&str, usize> = HashMap::new();
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        for id in layer {
-            node_layer.insert(id.as_str(), layer_idx);
-        }
-    }
-
-    graph
-        .edges
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, edge)| {
-            let is_feedback = feedback_edges.contains(&idx)
-                || node_layer
-                    .get(edge.from.as_str())
-                    .zip(node_layer.get(edge.to.as_str()))
-                    .is_some_and(|(from, to)| from >= to);
-            is_feedback.then_some(idx)
-        })
-        .collect()
-}
-
 fn node_box_width(node: &Node) -> usize {
     label_box_width(&node.label, node.shape)
 }
 
-pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
+fn label_box_width(label: &str, shape: NodeShape) -> usize {
     let label_width = label.chars().count();
     let width = match shape {
         NodeShape::Diamond => label_width + 6,
@@ -537,14 +720,38 @@ pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
     width.max(7)
 }
 
+/// Fit `label` into `width` columns, marking a cut with an ellipsis.
+///
+/// Some routes have a fixed amount of room for their label (a left-right
+/// lane runs between two node columns), and a label that overran it used to
+/// paint over the route's own corner and off the edge of the canvas.
+///
+/// Below three columns there is no room for a cut label that still says
+/// anything: one character and an ellipsis reads as a different word, and a
+/// bare ellipsis says only that something was dropped. The label is left out
+/// altogether instead, which at least does not misname the edge.
+fn fit_label(label: &str, width: usize) -> String {
+    if label.chars().count() <= width {
+        return label.to_string();
+    }
+    if width < 3 {
+        return String::new();
+    }
+    label
+        .chars()
+        .take(width - 1)
+        .chain(std::iter::once('\u{2026}'))
+        .collect()
+}
+
 // ───── Canvas ─────
 
-pub(crate) const CONN_UP: u8 = 1;
-pub(crate) const CONN_DOWN: u8 = 2;
-pub(crate) const CONN_LEFT: u8 = 4;
-pub(crate) const CONN_RIGHT: u8 = 8;
+const CONN_UP: u8 = 1;
+const CONN_DOWN: u8 = 2;
+const CONN_LEFT: u8 = 4;
+const CONN_RIGHT: u8 = 8;
 
-pub(crate) fn junction_char(connects: u8) -> char {
+fn junction_char(connects: u8) -> char {
     match connects {
         c if c == CONN_UP | CONN_DOWN => '│',
         c if c == CONN_LEFT | CONN_RIGHT => '─',
@@ -566,12 +773,31 @@ pub(crate) fn junction_char(connects: u8) -> char {
 }
 
 #[derive(Clone)]
-pub(crate) struct CanvasCell {
-    pub(crate) ch: char,
-    pub(crate) fg: Option<Color>,
-    pub(crate) bg: Option<Color>,
-    pub(crate) is_node: bool,
-    pub(crate) connects: u8,
+struct CanvasCell {
+    ch: char,
+    fg: Option<Color>,
+    bg: Option<Color>,
+    is_node: bool,
+    connects: u8,
+    /// Drawn by a feedback route.
+    is_feedback: bool,
+    /// Part of a left-right gutter lane's plain horizontal run. A lane carries
+    /// its own label inline, so this is the one kind of edge cell a label may
+    /// be written over.
+    is_lane: bool,
+    /// Set when the cell holds an edge's arrowhead, to the directions the
+    /// edge itself runs through the cell.
+    ///
+    /// The head is the one cell of an edge that says which of the two nodes it
+    /// joins is the destination, and it is a single cell, so a line drawn
+    /// across it does not clutter the edge, it deletes the edge's direction
+    /// outright. [`Canvas::add_connection`] therefore records a crossing here
+    /// without repainting the glyph, and
+    /// [`Canvas::assert_no_crossed_arrowheads`] reports any connection across
+    /// the head's own axis: the head survives the crossing, but the line doing
+    /// the crossing is drawn with a break in it and should have been routed
+    /// elsewhere.
+    arrow_axis: Option<u8>,
 }
 
 impl Default for CanvasCell {
@@ -582,13 +808,16 @@ impl Default for CanvasCell {
             bg: None,
             is_node: false,
             connects: 0,
+            is_feedback: false,
+            is_lane: false,
+            arrow_axis: None,
         }
     }
 }
 
 pub(crate) struct Canvas {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
+    width: usize,
+    height: usize,
     cells: Vec<Vec<CanvasCell>>,
 }
 
@@ -601,14 +830,28 @@ impl Canvas {
         }
     }
 
-    pub(crate) fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
+            // Whatever was here has been replaced, so a cell that held an
+            // arrowhead no longer does and must not go on being protected as
+            // though it did.
+            self.cells[y][x].arrow_axis = None;
         }
     }
 
-    pub(crate) fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    /// Write the arrowhead that ends a forward edge, marking the cell so that
+    /// a later crossing cannot paint the head away. `axis` is the direction
+    /// the edge runs through the cell. See [`CanvasCell::arrow_axis`].
+    fn set_arrow(&mut self, x: usize, y: usize, ch: char, axis: u8, fg: Option<Color>) {
+        self.set(x, y, ch, fg);
+        if y < self.height && x < self.width {
+            self.cells[y][x].arrow_axis = Some(axis);
+        }
+    }
+
+    fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
@@ -616,11 +859,19 @@ impl Canvas {
         }
     }
 
-    pub(crate) fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
+    fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
         if y < self.height && x < self.width {
             let cell = &mut self.cells[y][x];
-            if !cell.is_node {
-                cell.connects |= dir;
+            if cell.is_node {
+                return;
+            }
+            cell.connects |= dir;
+            // An arrowhead keeps its glyph and its colour. The direction is
+            // still recorded, so a route drawn through here later joins up
+            // with the crossing, but repainting the cell as a junction would
+            // delete the only mark that says where the edge ends, leaving two
+            // boxes joined by a line that points at neither.
+            if cell.arrow_axis.is_none() {
                 cell.ch = junction_char(cell.connects);
                 if fg.is_some() {
                     cell.fg = fg;
@@ -629,8 +880,167 @@ impl Canvas {
         }
     }
 
+    /// Draw one cell of a feedback route.
+    ///
+    /// Feedback routes are planned to run only through gap rows and gap
+    /// columns, which never contain nodes. `add_connection` silently skips a
+    /// node cell, so a route drawn over a box leaves a line that stops dead at
+    /// the border rather than an error; the cell is marked either way and
+    /// [`Canvas::assert_invariants`] catches it after the render.
+    fn connect_route(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
+        self.add_connection(x, y, dir, fg);
+        if y < self.height && x < self.width {
+            self.cells[y][x].is_feedback = true;
+        }
+    }
+
+    /// Draw the arrowhead that ends a feedback route.
+    ///
+    /// The head is part of the route and is marked like every other cell of
+    /// one, so [`Canvas::assert_invariants`] sees it and [`Canvas::set_label`]
+    /// will not paint over it. `dir` is the direction the route runs through
+    /// the cell, and doubles as the head's own axis, so a line crossing it
+    /// keeps off the glyph and is reported by
+    /// [`Canvas::assert_no_crossed_arrowheads`].
+    fn route_arrow(&mut self, x: usize, y: usize, ch: char, dir: u8, fg: Option<Color>) {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+        let cell = &mut self.cells[y][x];
+        // Marked before the node test, not after: a head planned on top of a
+        // box is the collision `assert_invariants` reports, and painting it
+        // over the border would hide the very thing being looked for.
+        cell.is_feedback = true;
+        if cell.is_node {
+            return;
+        }
+        cell.connects |= dir;
+        cell.ch = ch;
+        cell.fg = fg;
+        cell.arrow_axis = Some(dir);
+    }
+
+    /// Mark a cell as part of a left-right gutter lane's plain horizontal run,
+    /// the one kind of edge cell that lane's own label may be written over.
+    fn mark_lane(&mut self, x: usize, y: usize) {
+        if y < self.height && x < self.width {
+            self.cells[y][x].is_lane = true;
+        }
+    }
+
+    /// Write one character of a label.
+    ///
+    /// Labels overwrite whatever is under them, so one placed badly hides a
+    /// route instead of the other way round. Under test a label may not take a
+    /// feedback route's cell, the one exception being a lane's own label
+    /// riding inline on that lane's plain horizontal run. The permission comes
+    /// from the cell rather than from the caller, so what a label may cover is
+    /// decided by what is actually on the canvas under it.
+    ///
+    /// Forward edges are deliberately outside this check. A label can still
+    /// land on a *different* forward edge's line in a dense diagram, which
+    /// predates the feedback routing and is not addressed here; a label
+    /// covering its own edge's line is checked in [`Canvas::draw_edge_lr`].
+    fn set_label(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+        #[cfg(test)]
+        if y < self.height && x < self.width {
+            let cell = &self.cells[y][x];
+            assert!(
+                !cell.is_feedback || (cell.is_lane && cell.connects == (CONN_LEFT | CONN_RIGHT)),
+                "label {ch:?} hides the feedback route at ({x}, {y})"
+            );
+        }
+        self.set(x, y, ch, fg);
+    }
+
+    /// Check, once a render is finished, that no feedback route was laid over
+    /// a box.
+    ///
+    /// `add_connection` silently skips a node cell, so a route planned through
+    /// a box does not fail: it renders as a line that stops dead at the border,
+    /// which reads as an edge the source never declared. `connect_route` and
+    /// `route_arrow` mark the cell whether or not the character landed, so the
+    /// collision is still here to be found afterwards.
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        for (y, row) in self.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                assert!(
+                    !(cell.is_feedback && cell.is_node),
+                    "feedback route runs through the node cell at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// Check, once a top-down render is finished, that no line was drawn
+    /// across an arrowhead.
+    ///
+    /// An arrowhead keeps its glyph against a crossing, so the head itself is
+    /// never lost; what is lost is a cell of the line that crossed it, and a
+    /// bus that has to break over a row of heads belongs on another row. Every
+    /// gap is budgeted for one.
+    ///
+    /// Top-down only. In a left-right diagram each column is centred in the
+    /// canvas on its own, so a box's rows line up with nothing in particular
+    /// in the column beside it, and a forward edge running in to its own
+    /// destination can meet a feedback arrowhead belonging to a box in another
+    /// column. That is the same class as a label landing on an unrelated
+    /// edge's line, which predates this branch and `main` has too: it wants a
+    /// placement pass that draws every line before deciding where the rest
+    /// goes, not a special case here.
+    #[cfg(test)]
+    fn assert_no_crossed_arrowheads(&self) {
+        for (y, row) in self.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                if let Some(axis) = cell.arrow_axis {
+                    assert_eq!(
+                        cell.connects & !axis,
+                        0,
+                        "an edge crosses the arrowhead at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// True when the cell carries a plain horizontal run and nothing else, so
+    /// a label may be written over it without hiding a corner, a crossing or
+    /// a box.
+    fn is_plain_horizontal(&self, x: usize, y: usize) -> bool {
+        y < self.height && x < self.width && {
+            let cell = &self.cells[y][x];
+            !cell.is_node && cell.connects == (CONN_LEFT | CONN_RIGHT)
+        }
+    }
+
+    /// Longest stretch of plain horizontal run in `lo..=hi` on row `y`,
+    /// as `(start, length)`. Length is zero when there is no such stretch.
+    fn longest_plain_run(&self, y: usize, lo: usize, hi: usize) -> (usize, usize) {
+        if hi < lo {
+            return (lo, 0);
+        }
+        let (mut best_start, mut best_len) = (lo, 0);
+        let (mut start, mut len) = (lo, 0);
+        for x in lo..=hi {
+            if !self.is_plain_horizontal(x, y) {
+                len = 0;
+                continue;
+            }
+            if len == 0 {
+                start = x;
+            }
+            len += 1;
+            if len > best_len {
+                best_len = len;
+                best_start = start;
+            }
+        }
+        (best_start, best_len)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_node(
+    fn draw_node(
         &mut self,
         cx: usize,
         y: usize,
@@ -812,8 +1222,11 @@ impl Canvas {
         row_ys
     }
 
+    /// `label_max_x` is the last column a label may use. The gutter lanes sit
+    /// right of the diagram on every row, so a label long enough to reach them
+    /// would cut a feedback route; it is truncated instead.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_edge_td(
+    fn draw_edge_td(
         &mut self,
         src_cx: usize,
         src_bottom_y: usize,
@@ -822,12 +1235,19 @@ impl Canvas {
         label: Option<&str>,
         edge_fg: Option<Color>,
         label_fg: Option<Color>,
+        bus_y_override: Option<usize>,
+        label_max_x: Option<usize>,
     ) {
         if src_bottom_y + 1 >= dst_top_y {
             return;
         }
 
-        let mid_y = src_bottom_y + 1 + (dst_top_y - src_bottom_y - 1) / 2;
+        // A bent edge draws its horizontal run on `mid_y` and its label on the
+        // row above. The caller overrides both when the gap also carries
+        // feedback routes, so that neither lands on a reserved row.
+        let mid_y = bus_y_override
+            .filter(|&y| y > src_bottom_y && y < dst_top_y)
+            .unwrap_or(src_bottom_y + 1 + (dst_top_y - src_bottom_y - 1) / 2);
 
         if src_cx == dst_cx {
             // Straight down
@@ -835,13 +1255,15 @@ impl Canvas {
                 self.add_connection(src_cx, y, CONN_UP | CONN_DOWN, edge_fg);
             }
             // Arrow replaces last segment
-            self.set(dst_cx, dst_top_y - 1, '▼', edge_fg);
+            self.set_arrow(dst_cx, dst_top_y - 1, '▼', CONN_UP | CONN_DOWN, edge_fg);
 
             // Place label beside the vertical line
             if let Some(text) = label {
                 let label_y = src_bottom_y + 1;
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(src_cx + 2 + i, label_y, ch, label_fg);
+                let label_x = src_cx + 2;
+                let room = label_max_x.map_or(usize::MAX, |hi| (hi + 1).saturating_sub(label_x));
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         } else {
@@ -882,27 +1304,34 @@ impl Canvas {
             }
 
             // Arrow
-            self.set(dst_cx, dst_top_y - 1, '▼', edge_fg);
+            self.set_arrow(dst_cx, dst_top_y - 1, '▼', CONN_UP | CONN_DOWN, edge_fg);
 
             // Place label above horizontal segment
             if let Some(text) = label {
                 let label_len = text.chars().count();
                 let label_start = min_x + (max_x - min_x).saturating_sub(label_len) / 2;
                 let label_y = if mid_y > 0 { mid_y - 1 } else { mid_y };
-                for (i, ch) in text.chars().enumerate() {
+                let room =
+                    label_max_x.map_or(usize::MAX, |hi| (hi + 1).saturating_sub(label_start));
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
                     let lx = label_start + i;
                     if lx < self.width {
-                        self.set(lx, label_y, ch, label_fg);
+                        self.set_label(lx, label_y, ch, label_fg);
                     }
                 }
             }
         }
     }
 
+    /// `label_bounds` is the inclusive range of columns a label may occupy.
+    /// The gap between two node columns also carries the drop and rise
+    /// columns of the feedback routes, and a label written over one of those
+    /// hides the route instead of the other way round, so the renderer passes
+    /// the columns that are free and a label too long for them is cut.
+    /// `None` leaves the label unbounded.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_edge_lr(
         &mut self,
-        _src_cx: usize,
         src_right_x: usize,
         src_cy: usize,
         dst_left_x: usize,
@@ -911,6 +1340,7 @@ impl Canvas {
         edge_fg: Option<Color>,
         label_fg: Option<Color>,
         mid_x_override: Option<usize>,
+        label_bounds: Option<(usize, usize)>,
     ) {
         if src_right_x + 1 >= dst_left_x {
             return;
@@ -925,14 +1355,20 @@ impl Canvas {
                 self.add_connection(x, src_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
             }
             // Arrow replaces last segment
-            self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
+            self.set_arrow(dst_left_x - 1, dst_cy, '▶', CONN_LEFT | CONN_RIGHT, edge_fg);
 
-            // Label above the horizontal line
+            // Label above the horizontal line, held inside the free columns.
             if let Some(text) = label {
-                let label_x = src_right_x + 2;
                 let label_y = if src_cy > 0 { src_cy - 1 } else { 0 };
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(label_x + i, label_y, ch, label_fg);
+                let (label_x, room) = match label_bounds {
+                    Some((lo, hi)) => {
+                        let x = (src_right_x + 2).max(lo);
+                        (x, (hi + 1).saturating_sub(x))
+                    }
+                    None => (src_right_x + 2, usize::MAX),
+                };
+                for (i, ch) in fit_label(text, room).chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         } else {
@@ -973,153 +1409,187 @@ impl Canvas {
             }
 
             // Arrow
-            self.set(dst_left_x - 1, dst_cy, '▶', edge_fg);
+            self.set_arrow(dst_left_x - 1, dst_cy, '▶', CONN_LEFT | CONN_RIGHT, edge_fg);
 
-            // Label near the vertical segment
+            // Label beside the vertical segment: right of the bend where
+            // there is room for it, otherwise left of the bend, and cut when
+            // neither side can hold it. Running past the free columns would
+            // hide a feedback route or the destination box.
+            //
+            // The edge's own two horizontal runs are what the label row has to
+            // clear. One sits on `src_cy`, from the source out to the bend; the
+            // other on `dst_cy`, from the bend in to the destination. Any row
+            // strictly between them is clear of both, so that is where the
+            // label goes. Rows one apart leave no such row, and there the label
+            // takes whichever side of the bend the run on its own row does not
+            // reach.
             if let Some(text) = label {
-                let label_y = min_y + (max_y - min_y).saturating_sub(1) / 2;
-                for (i, ch) in text.chars().enumerate() {
-                    self.set(mid_x + 2 + i, label_y, ch, label_fg);
+                let (label_y, allow_left, allow_right) = if max_y - min_y >= 2 {
+                    ((min_y + (max_y - min_y - 1) / 2).max(min_y + 1), true, true)
+                } else {
+                    (min_y, min_y != src_cy, min_y != dst_cy)
+                };
+                let len = text.chars().count();
+                let (label_x, room) = match label_bounds {
+                    Some((lo, hi)) => {
+                        let right_x = (mid_x + 2).max(lo);
+                        let right_room = if allow_right {
+                            (hi + 1).saturating_sub(right_x)
+                        } else {
+                            0
+                        };
+                        let left_hi = mid_x.saturating_sub(1).min(hi);
+                        let left_room = if allow_left {
+                            (left_hi + 1).saturating_sub(lo)
+                        } else {
+                            0
+                        };
+                        if len <= right_room {
+                            (right_x, right_room)
+                        } else if len <= left_room {
+                            (left_hi + 1 - len, left_room)
+                        } else if right_room >= left_room {
+                            (right_x, right_room)
+                        } else {
+                            (lo, left_room)
+                        }
+                    }
+                    None if allow_right => (mid_x + 2, usize::MAX),
+                    None => (mid_x.saturating_sub(1 + len), len),
+                };
+                let fitted = fit_label(text, room);
+                // Whichever side it took, the label has to clear this edge's
+                // own two horizontal runs: the one on `src_cy` reaching out to
+                // the bend, and the one on `dst_cy` coming back in from it. A
+                // label written over either erases the edge it names.
+                #[cfg(test)]
+                if !fitted.is_empty() {
+                    let clear = if label_x > mid_x {
+                        label_y != dst_cy
+                    } else {
+                        label_y != src_cy
+                    };
+                    assert!(
+                        clear,
+                        "label {fitted:?} sits on the edge's own run at ({label_x}, {label_y})"
+                    );
+                }
+                for (i, ch) in fitted.chars().enumerate() {
+                    self.set_label(label_x + i, label_y, ch, label_fg);
                 }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_feedback_edge_td(
-        &mut self,
-        src_right_x: usize,
-        src_cy: usize,
-        dst_right_x: usize,
-        dst_cy: usize,
-        lane_x: usize,
-        label: Option<&str>,
-        edge_fg: Option<Color>,
-        label_fg: Option<Color>,
-    ) {
-        if lane_x >= self.width || src_cy >= self.height || dst_cy >= self.height {
-            return;
+    /// Draw a feedback (back) edge in a top-down diagram.
+    ///
+    /// The route leaves the source through its bottom border, runs right along
+    /// a gap row into a vertical lane beside the diagram, comes back along a
+    /// gap row above the destination and enters it through its top border:
+    ///
+    /// ```text
+    ///          ┌───────┐
+    ///          │       │
+    ///          ▼       │
+    ///     ┌────────┐   │
+    ///     │  Dst   │   │
+    ///     └────────┘   │
+    ///          │       │
+    ///          ▼       │
+    ///     ┌────────┐   │
+    ///     │  Src   │   │
+    ///     └────────┘   │
+    ///            │     │
+    ///            └─────┘
+    /// ```
+    ///
+    /// Gap rows never contain nodes, so the route cannot pass through a
+    /// sibling of either endpoint. Forward edges it crosses render as
+    /// junctions.
+    fn draw_feedback_edge_td(&mut self, route: &FeedbackRouteTd, fg: Option<Color>) {
+        let r = route;
+
+        // Leave the source: stem down to the gap row, turn, run right to the lane.
+        for y in (r.src_bottom_y + 1)..r.exit_y {
+            self.connect_route(r.exit_x, y, CONN_UP | CONN_DOWN, fg);
+        }
+        self.connect_route(r.exit_x, r.exit_y, CONN_UP | CONN_RIGHT, fg);
+        for x in (r.exit_x + 1)..r.lane_x {
+            self.connect_route(x, r.exit_y, CONN_LEFT | CONN_RIGHT, fg);
+        }
+        self.connect_route(r.lane_x, r.exit_y, CONN_LEFT | CONN_UP, fg);
+
+        // Up the lane.
+        for y in (r.entry_y + 1)..r.exit_y {
+            self.connect_route(r.lane_x, y, CONN_UP | CONN_DOWN, fg);
         }
 
-        let src_start_x = src_right_x + 1;
-        let arrow_x = dst_right_x + 1;
-        if src_start_x >= self.width || arrow_x >= self.width {
-            return;
+        // Back across the gap row above the destination, then down into it.
+        self.connect_route(r.lane_x, r.entry_y, CONN_DOWN | CONN_LEFT, fg);
+        for x in (r.entry_x + 1)..r.lane_x {
+            self.connect_route(x, r.entry_y, CONN_LEFT | CONN_RIGHT, fg);
         }
-
-        for x in src_start_x..lane_x {
-            self.add_connection(x, src_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
+        self.connect_route(r.entry_x, r.entry_y, CONN_RIGHT | CONN_DOWN, fg);
+        let arrow_y = r.dst_top_y.saturating_sub(1);
+        for y in (r.entry_y + 1)..arrow_y {
+            self.connect_route(r.entry_x, y, CONN_UP | CONN_DOWN, fg);
         }
-
-        let (min_y, max_y) = if src_cy < dst_cy {
-            (src_cy, dst_cy)
-        } else {
-            (dst_cy, src_cy)
-        };
-        for y in (min_y + 1)..max_y {
-            self.add_connection(lane_x, y, CONN_UP | CONN_DOWN, edge_fg);
-        }
-
-        if src_cy == dst_cy {
-            self.add_connection(lane_x, src_cy, CONN_LEFT, edge_fg);
-        } else {
-            let src_turn = if dst_cy < src_cy {
-                CONN_LEFT | CONN_UP
-            } else {
-                CONN_LEFT | CONN_DOWN
-            };
-            let dst_turn = if dst_cy < src_cy {
-                CONN_LEFT | CONN_DOWN
-            } else {
-                CONN_LEFT | CONN_UP
-            };
-            self.add_connection(lane_x, src_cy, src_turn, edge_fg);
-            self.add_connection(lane_x, dst_cy, dst_turn, edge_fg);
-        }
-
-        if arrow_x + 1 < lane_x {
-            for x in (arrow_x + 1)..lane_x {
-                self.add_connection(x, dst_cy, CONN_LEFT | CONN_RIGHT, edge_fg);
-            }
-        }
-        self.set(arrow_x, dst_cy, '◀', edge_fg);
-
-        if let Some(text) = label {
-            let label_y = min_y + (max_y - min_y) / 2;
-            for (i, ch) in text.chars().enumerate() {
-                self.set(lane_x + 2 + i, label_y, ch, label_fg);
-            }
-        }
+        self.route_arrow(r.entry_x, arrow_y, '▼', CONN_UP | CONN_DOWN, fg);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_feedback_edge_lr(
-        &mut self,
-        src_cx: usize,
-        src_bottom_y: usize,
-        dst_cx: usize,
-        dst_bottom_y: usize,
-        lane_y: usize,
-        label: Option<&str>,
-        edge_fg: Option<Color>,
-        label_fg: Option<Color>,
-    ) {
-        if lane_y >= self.height || src_cx >= self.width || dst_cx >= self.width {
-            return;
+    /// Draw a feedback (back) edge in a left-right diagram.
+    ///
+    /// The route leaves the source through its bottom border, drops down the
+    /// gap column right of it into a horizontal lane below the diagram, runs
+    /// left, rises up the gap column left of the destination and enters it
+    /// through its bottom border:
+    ///
+    /// ```text
+    ///     ┌───────┐      ┌───────┐
+    ///     │  Dst  │─────▶│  Src  │
+    ///     └───────┘      └───────┘
+    ///       ▲                  └─┐
+    ///     ┌─┘                    │
+    ///     └──────────────────────┘
+    /// ```
+    ///
+    /// The drop and the rise use the gap columns beside the node's *column*,
+    /// not beside its box. Boxes are centred in a column as wide as its widest
+    /// node, so only a column edge is guaranteed clear of every box; a margin
+    /// measured from a narrow box can sit inside a wider neighbour.
+    fn draw_feedback_edge_lr(&mut self, route: &FeedbackRouteLr, fg: Option<Color>) {
+        let r = route;
+        let exit_y = r.src_bottom_y + 1;
+        let entry_y = r.dst_bottom_y + 2;
+
+        // Leave the source: turn under its bottom border, run right, drop.
+        self.connect_route(r.exit_x, exit_y, CONN_UP | CONN_RIGHT, fg);
+        for x in (r.exit_x + 1)..r.exit_lane_x {
+            self.connect_route(x, exit_y, CONN_LEFT | CONN_RIGHT, fg);
+        }
+        self.connect_route(r.exit_lane_x, exit_y, CONN_LEFT | CONN_DOWN, fg);
+        for y in (exit_y + 1)..r.lane_y {
+            self.connect_route(r.exit_lane_x, y, CONN_UP | CONN_DOWN, fg);
         }
 
-        let arrow_y = dst_bottom_y + 1;
-        if arrow_y >= self.height {
-            return;
+        // Along the lane.
+        self.connect_route(r.exit_lane_x, r.lane_y, CONN_UP | CONN_LEFT, fg);
+        for x in (r.entry_lane_x + 1)..r.exit_lane_x {
+            self.connect_route(x, r.lane_y, CONN_LEFT | CONN_RIGHT, fg);
+            self.mark_lane(x, r.lane_y);
         }
+        self.connect_route(r.entry_lane_x, r.lane_y, CONN_UP | CONN_RIGHT, fg);
 
-        for y in (src_bottom_y + 1)..lane_y {
-            self.add_connection(src_cx, y, CONN_UP | CONN_DOWN, edge_fg);
+        // Rise beside the destination, run right under it, then up into it.
+        for y in (entry_y + 1)..r.lane_y {
+            self.connect_route(r.entry_lane_x, y, CONN_UP | CONN_DOWN, fg);
         }
-
-        if src_cx == dst_cx {
-            self.add_connection(src_cx, lane_y, CONN_UP, edge_fg);
-        } else {
-            let (min_x, max_x) = if src_cx < dst_cx {
-                (src_cx, dst_cx)
-            } else {
-                (dst_cx, src_cx)
-            };
-            for x in (min_x + 1)..max_x {
-                self.add_connection(x, lane_y, CONN_LEFT | CONN_RIGHT, edge_fg);
-            }
-
-            let src_turn = if dst_cx < src_cx {
-                CONN_UP | CONN_LEFT
-            } else {
-                CONN_UP | CONN_RIGHT
-            };
-            let dst_turn = if dst_cx < src_cx {
-                CONN_UP | CONN_RIGHT
-            } else {
-                CONN_UP | CONN_LEFT
-            };
-            self.add_connection(src_cx, lane_y, src_turn, edge_fg);
-            self.add_connection(dst_cx, lane_y, dst_turn, edge_fg);
+        self.connect_route(r.entry_lane_x, entry_y, CONN_DOWN | CONN_RIGHT, fg);
+        for x in (r.entry_lane_x + 1)..r.entry_x {
+            self.connect_route(x, entry_y, CONN_LEFT | CONN_RIGHT, fg);
         }
-
-        for y in (arrow_y + 1)..lane_y {
-            self.add_connection(dst_cx, y, CONN_UP | CONN_DOWN, edge_fg);
-        }
-        self.set(dst_cx, arrow_y, '▲', edge_fg);
-
-        if let Some(text) = label {
-            let (min_x, max_x) = if src_cx < dst_cx {
-                (src_cx, dst_cx)
-            } else {
-                (dst_cx, src_cx)
-            };
-            let label_x = min_x + (max_x - min_x).saturating_sub(text.chars().count()) / 2;
-            let label_y = lane_y.saturating_sub(1);
-            for (i, ch) in text.chars().enumerate() {
-                self.set(label_x + i, label_y, ch, label_fg);
-            }
-        }
+        self.connect_route(r.entry_x, entry_y, CONN_LEFT | CONN_UP, fg);
+        self.route_arrow(r.entry_x, r.dst_bottom_y + 1, '▲', CONN_UP | CONN_DOWN, fg);
     }
 
     pub(crate) fn to_span_rows(&self, theme: &Theme) -> Vec<Vec<StyledSpan>> {
@@ -1164,17 +1634,13 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let edge_gap: usize = 4;
     let h_gap: usize = 4;
 
-    let feedback_edges = classify_feedback_edges(graph);
-    let mut layers = assign_layers(graph, &feedback_edges);
-    order_within_layers(&mut layers, graph, &feedback_edges);
-    let routed_feedback_edges = edge_layer_feedback_indices(graph, &layers, &feedback_edges);
-    let routed_feedback_set: HashSet<usize> = routed_feedback_edges.iter().copied().collect();
-    let max_feedback_label_width = routed_feedback_edges
-        .iter()
-        .filter_map(|idx| graph.edges[*idx].label.as_ref())
-        .map(|label| label.chars().count())
-        .max()
-        .unwrap_or(0);
+    let layout = layout(graph);
+    let layers = &layout.layers;
+    if layers.is_empty() {
+        return None;
+    }
+    let feedback = plan_feedback(graph, &layout);
+    let last_layer = layers.len() - 1;
 
     // Calculate node widths
     let mut widths: HashMap<String, usize> = HashMap::new();
@@ -1184,7 +1650,7 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     // Find widest layer to determine canvas width
     let mut max_layer_width: usize = 0;
-    for layer in &layers {
+    for layer in layers {
         let w: usize = layer
             .iter()
             .map(|id| widths.get(id).copied().unwrap_or(7))
@@ -1192,19 +1658,63 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             + layer.len().saturating_sub(1) * h_gap;
         max_layer_width = max_layer_width.max(w);
     }
+    let core_width = max_layer_width + 6; // margin on each side
 
-    let core_canvas_width = max_layer_width + 6; // margin on each side
-    let feedback_gutter_width = if routed_feedback_edges.is_empty() {
-        0
-    } else {
-        routed_feedback_edges.len() * 4 + max_feedback_label_width + 4
-    };
-    let canvas_width = core_canvas_width + feedback_gutter_width;
-    let canvas_height = layers.len() * (node_height + edge_gap) - edge_gap;
+    // ── Row budget ──
+    //
+    // The gap under layer `k` holds, from the top:
+    //
+    //   1 row                a straight forward edge's label,
+    //   `exits[k]` rows      one per feedback source in layer k,
+    //   2 rows               a bent forward edge's label, then its bus,
+    //   `entries[k+1]` rows  one per feedback target in layer k+1,
+    //   1 row                the forward arrowhead.
+    //
+    // So every feedback endpoint in the gap owns a row that no other route and
+    // no label writes to: two routes can neither merge into one ambiguous line
+    // nor be painted over. With no feedback edges this is the original
+    // four-row gap, and acyclic diagrams render exactly as they did before.
+    let gap_rows: Vec<usize> = (0..last_layer)
+        .map(|k| edge_gap + feedback.exits[k] + feedback.entries[k + 1])
+        .collect();
+    // A route into the first layer or out of the last one needs rows outside
+    // the diagram: one per rank, plus one for the arrowhead or the stem.
+    let margin = |count: usize| if count == 0 { 0 } else { count + 1 };
+    let top_margin = margin(feedback.entries[0]);
+    let bottom_margin = margin(feedback.exits[last_layer]);
 
-    if canvas_height == 0 {
-        return None;
+    // `gap_rows` has one entry per gap, so one fewer than there are layers.
+    let mut layer_top: Vec<usize> = Vec::with_capacity(layers.len());
+    let mut next_y = top_margin;
+    for gap in &gap_rows {
+        layer_top.push(next_y);
+        next_y += node_height + gap;
     }
+    layer_top.push(next_y);
+    let canvas_height = next_y + node_height + bottom_margin;
+
+    // ── Gutter ──
+    //
+    // Lanes sit four columns apart, and a labelled lane additionally reserves
+    // the columns its own label occupies, so one long label no longer widens
+    // every other lane.
+    let label_width = |plan: &FeedbackPlan| {
+        graph.edges[plan.edge]
+            .label
+            .as_ref()
+            .map_or(0, |label| label.chars().count())
+    };
+    let mut lane_xs: Vec<usize> = Vec::with_capacity(feedback.plans.len());
+    let mut gutter_x = core_width + 1;
+    for plan in &feedback.plans {
+        lane_xs.push(gutter_x);
+        gutter_x += 4 + label_width(plan);
+    }
+    let canvas_width = if feedback.plans.is_empty() {
+        core_width
+    } else {
+        gutter_x
+    };
 
     let mut canvas = Canvas::new(canvas_width, canvas_height);
 
@@ -1215,10 +1725,10 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     // First pass: calculate centers for the widest layer
     // Then align single-node layers to the canvas center
-    let canvas_center = core_canvas_width / 2;
+    let canvas_center = core_width / 2;
 
     for (layer_idx, layer) in layers.iter().enumerate() {
-        let y = layer_idx * (node_height + edge_gap);
+        let y = layer_top[layer_idx];
 
         // Compute node centers relative to layer, then offset to center in canvas
         let node_widths_in_layer: Vec<usize> = layer
@@ -1260,41 +1770,180 @@ fn render_td(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
         }
     }
 
-    // Draw edges
     let edge_fg = Some(theme.code_border);
     let label_fg = Some(theme.h3); // Use a distinct color for edge labels
 
-    let mut feedback_lane = 0usize;
-    for (idx, edge) in graph.edges.iter().enumerate() {
-        if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
-            if routed_feedback_set.contains(&idx) {
-                let lane_x = core_canvas_width + 1 + feedback_lane * 4;
-                feedback_lane += 1;
-                canvas.draw_feedback_edge_td(
-                    src.center_x + src.width / 2,
-                    src.top_y + 1,
-                    dst.center_x + dst.width / 2,
-                    dst.top_y + 1,
-                    lane_x,
-                    edge.label.as_deref(),
-                    edge_fg,
-                    label_fg,
-                );
-            } else {
-                let src_bottom = src.top_y + 2;
-                let dst_top = dst.top_y;
-                canvas.draw_edge_td(
-                    src.center_x,
-                    src_bottom,
-                    dst.center_x,
-                    dst_top,
-                    edge.label.as_deref(),
-                    edge_fg,
-                    label_fg,
-                );
+    // Feedback edges go first so that forward-edge arrowheads, which overwrite
+    // cells, end up on top of any route they cross.
+    let mut labels: Vec<(usize, usize, String)> = Vec::new();
+    for plan in &feedback.plans {
+        let edge = &graph.edges[plan.edge];
+        let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) else {
+            continue;
+        };
+        let (Some(&(src_layer, _)), Some(&(dst_layer, _))) = (
+            layout.node_pos.get(&edge.from),
+            layout.node_pos.get(&edge.to),
+        ) else {
+            continue;
+        };
+        let route = FeedbackRouteTd {
+            // Leave under the left border. A straight forward edge writes its
+            // label two columns right of the box centre on the first gap row,
+            // which is the row this stem drops through.
+            //
+            // The cost is a crossing: a source that also has forward children
+            // drops this stem across its own outgoing edge, drawn as `┼`. That
+            // is deliberate. A crossing reads as two edges that meet, which is
+            // what it is, whereas a label written over the stem would hide one
+            // of them entirely.
+            exit_x: src.left_x() + 1,
+            src_bottom_y: src.bottom_y(),
+            exit_y: src.bottom_y() + 2 + plan.src_rank,
+            entry_x: dst.right_x().saturating_sub(1),
+            dst_top_y: dst.top_y,
+            entry_y: dst.top_y.saturating_sub(2 + plan.dst_rank),
+            lane_x: lane_xs[plan.lane],
+        };
+        canvas.draw_feedback_edge_td(&route, edge_fg);
+
+        if let Some(text) = edge.label.as_deref() {
+            // Beside this edge's lane, on the middle row of whichever box the
+            // lane passes closest to its centre. Only node rows will do: every
+            // gap row in the gutter can carry the horizontal run of an outer
+            // lane, and a label there would cut another edge's route.
+            let middle = (route.entry_y + route.exit_y) / 2;
+            let y = (src_layer.min(dst_layer)..=src_layer.max(dst_layer))
+                .map(|l| layer_top[l] + 1)
+                .min_by_key(|&row| row.abs_diff(middle))
+                .unwrap_or(middle);
+            labels.push((route.lane_x + 2, y, text.to_string()));
+        }
+    }
+    for (x, y, text) in &labels {
+        for (i, ch) in text.chars().enumerate() {
+            canvas.set_label(x + i, *y, ch, label_fg);
+        }
+    }
+
+    // Columns where a feedback stem drops out of each layer. A straight
+    // forward edge writes its label along the first gap row, which is the row
+    // those stems drop through, so the label stops before the nearest one.
+    let mut stem_cols: Vec<Vec<usize>> = vec![Vec::new(); layers.len()];
+    for plan in &feedback.plans {
+        let from = &graph.edges[plan.edge].from;
+        if let (Some(src), Some(&(layer, _))) = (positions.get(from), layout.node_pos.get(from)) {
+            stem_cols[layer].push(src.left_x() + 1);
+        }
+    }
+    for cols in &mut stem_cols {
+        cols.sort_unstable();
+        cols.dedup();
+    }
+
+    // Every row a feedback route reserved, so that a forward edge whose span
+    // no gap budget covers can be moved off one.
+    //
+    // A route holds more rows than the one its horizontal run sits on. Leaving
+    // a source it drops from the bottom border down to its run, and entering a
+    // destination it drops from its run to the arrowhead just above the top
+    // border, so the rows between are its as well. Reserving only the runs left
+    // the arrowhead row free, and a forward edge spanning several layers put
+    // its label there and erased the head of the edge arriving.
+    let mut reserved_rows: HashSet<usize> = HashSet::new();
+    for (k, &top) in layer_top.iter().enumerate() {
+        if feedback.exits[k] > 0 {
+            // Stem rows, then the run of the outermost rank.
+            for y in (top + 3)..=(top + 3 + feedback.exits[k]) {
+                reserved_rows.insert(y);
+            }
+        }
+        if feedback.entries[k] > 0 {
+            // The run of the outermost rank, then down to the arrowhead.
+            for y in top.saturating_sub(1 + feedback.entries[k])..=top.saturating_sub(1) {
+                reserved_rows.insert(y);
             }
         }
     }
+    // Every layer's arrowhead row as well, feedback or not. The rows above
+    // cover a layer that feedback edges enter; a layer they do not enter
+    // leaves its arrowhead row free, and a spanning bus settling there runs
+    // the length of the diagram across the head of every forward edge
+    // arriving at that layer. The heads survive it now (see
+    // `CanvasCell::arrow_axis`), but the bus is drawn with a break at each one
+    // and reads as several lines rather than one.
+    for &top in layer_top.iter().skip(1) {
+        reserved_rows.insert(top - 1);
+    }
+
+    // Forward edges
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if layout.feedback_set.contains(&idx) {
+            continue;
+        }
+        if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
+            // Between adjacent layers the bus sits below the gap's exit rows
+            // and above its entry rows, so neither it nor the label on the row
+            // above it can land on a feedback route. An edge spanning more
+            // than one layer keeps the midpoint of its own span, which no gap
+            // budget accounts for, so it is moved off any reserved row it or
+            // its label would otherwise land on.
+            let bus_y = match (
+                layout.node_pos.get(&edge.from),
+                layout.node_pos.get(&edge.to),
+            ) {
+                (Some(&(from, _)), Some(&(to, _))) if to == from + 1 => {
+                    Some(src.bottom_y() + 3 + feedback.exits[from])
+                }
+                _ if dst.top_y > src.bottom_y() + 2 => {
+                    // Search down from the midpoint, then back up. Downward
+                    // alone has a floor, and the rows just above it are the
+                    // ones a destination's feedback entries hold: they run
+                    // unbroken from the outermost entry's own row down to the
+                    // arrowhead row. A midpoint landing inside that block has
+                    // nothing free below it, and stopping at the floor put the
+                    // bus across the heads of the arriving edges and the label
+                    // on an entry's horizontal run.
+                    //
+                    // Somewhere to go always exists: a span of more than one
+                    // layer covers a whole gap, and every gap is budgeted for
+                    // a bus row with a label row above it that no route uses.
+                    let lo = src.bottom_y() + 2;
+                    let mid = (src.bottom_y() + 1 + (dst.top_y - src.bottom_y() - 1) / 2)
+                        .clamp(lo, dst.top_y - 1);
+                    let free =
+                        |y: &usize| !reserved_rows.contains(y) && !reserved_rows.contains(&(y - 1));
+                    let below = (mid..dst.top_y).find(free);
+                    let above = (lo..mid).rev().find(free);
+                    Some(below.or(above).unwrap_or(mid))
+                }
+                _ => None,
+            };
+            let mut label_max_x = core_width.saturating_sub(1);
+            if src.center_x == dst.center_x
+                && let Some(&(from, _)) = layout.node_pos.get(&edge.from)
+                && let Some(&stem) = stem_cols[from].iter().find(|&&x| x >= src.center_x + 2)
+            {
+                label_max_x = label_max_x.min(stem.saturating_sub(1));
+            }
+            canvas.draw_edge_td(
+                src.center_x,
+                src.bottom_y(),
+                dst.center_x,
+                dst.top_y,
+                edge.label.as_deref(),
+                edge_fg,
+                label_fg,
+                bus_y,
+                Some(label_max_x),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    canvas.assert_invariants();
+    #[cfg(test)]
+    canvas.assert_no_crossed_arrowheads();
 
     let rows = canvas.to_span_rows(theme);
     Some((rows, canvas_width))
@@ -1306,12 +1955,15 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let node_height: usize = 3;
     let node_h_gap: usize = 6; // horizontal gap between columns for edge routing
     let v_gap: usize = 2; // vertical gap between nodes in same column
+    let lane_gap: usize = 2; // rows between gutter lanes
 
-    let feedback_edges = classify_feedback_edges(graph);
-    let mut layers = assign_layers(graph, &feedback_edges);
-    order_within_layers(&mut layers, graph, &feedback_edges);
-    let routed_feedback_edges = edge_layer_feedback_indices(graph, &layers, &feedback_edges);
-    let routed_feedback_set: HashSet<usize> = routed_feedback_edges.iter().copied().collect();
+    let layout = layout(graph);
+    let layers = &layout.layers;
+    if layers.is_empty() {
+        return None;
+    }
+    let feedback = plan_feedback(graph, &layout);
+    let last_layer = layers.len() - 1;
 
     // Calculate node widths
     let mut widths: HashMap<String, usize> = HashMap::new();
@@ -1333,19 +1985,82 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
 
     let max_nodes_in_layer = layers.iter().map(|l| l.len()).max().unwrap_or(1);
 
-    let canvas_width: usize =
-        col_widths.iter().sum::<usize>() + (layers.len().saturating_sub(1)) * node_h_gap + 4;
-    let core_canvas_height = max_nodes_in_layer * (node_height + v_gap) - v_gap + 2;
-    let feedback_gutter_height = if routed_feedback_edges.is_empty() {
+    // Longest forward-edge label that each gap has to hold. A label lives in
+    // the gap right of its source's column, whether the edge ends in the next
+    // column or a later one, so it is charged to that gap.
+    let mut label_room: Vec<usize> = vec![0; last_layer];
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if layout.feedback_set.contains(&idx) {
+            continue;
+        }
+        let (Some(text), Some(&(src_layer, _)), Some(&(dst_layer, _))) = (
+            edge.label.as_deref(),
+            layout.node_pos.get(&edge.from),
+            layout.node_pos.get(&edge.to),
+        ) else {
+            continue;
+        };
+        if src_layer < last_layer && dst_layer > src_layer {
+            label_room[src_layer] = label_room[src_layer].max(text.chars().count());
+        }
+    }
+
+    // ── Column budget ──
+    //
+    // The gap right of column `k` carries the drop column of every feedback
+    // source in column k and the rise column of every feedback target in
+    // column k+1, and still has to leave the forward edges' bend column clear
+    // between them. The rises start two columns left of their own column
+    // rather than one, because the column immediately left of a box is where
+    // every forward arrowhead into it lands; sharing it would overwrite the
+    // junction. With no feedback edges the gap is the original six columns,
+    // so acyclic diagrams are unaffected.
+    //
+    // A gap that carries a labelled forward edge also has to be wide enough
+    // for the label. Both a straight label and a bent one are written between
+    // the drop columns and the bend, so such a gap holds, left to right: the
+    // drop columns, one column of padding so the text does not butt against
+    // the node border, the label, the bend, one column of run, the rise
+    // columns, and the arrowhead column. Sizing for that is what keeps a label
+    // readable: with a fixed six-column gap anything longer than three
+    // characters was cut to an ellipsis, and the edge stopped saying what it
+    // meant.
+    //
+    // The bend moves right with the label rather than staying at the middle of
+    // the gap (see `bend_x` below). Holding it at the middle would cost twice
+    // the label's width, and a diagram wider than the terminal is word-wrapped
+    // into fragments, which is worse than the truncation it avoids.
+    let gap_widths: Vec<usize> = (0..last_layer)
+        .map(|k| {
+            let exits = feedback.exits[k];
+            let entries = feedback.entries[k + 1];
+            let labelled = match label_room[k] {
+                0 => 0,
+                label => label + exits + entries + 4,
+            };
+            node_h_gap
+                .max(exits + entries + 4)
+                .max(2 * exits)
+                .max(2 * entries + 3)
+                .max(labelled)
+        })
+        .collect();
+    // Routes into the first column or out of the last one use the margins.
+    let left_margin = 2.max(feedback.entries[0] + 1);
+    let right_margin = 2.max(feedback.exits[last_layer]);
+
+    let canvas_width: usize = left_margin
+        + col_widths.iter().sum::<usize>()
+        + gap_widths.iter().sum::<usize>()
+        + right_margin;
+    let core_height = max_nodes_in_layer * (node_height + v_gap) - v_gap + 2;
+    // One spare row under the diagram, then a lane every `lane_gap` rows.
+    let gutter_height = if feedback.plans.is_empty() {
         0
     } else {
-        routed_feedback_edges.len() * 2 + 2
+        lane_gap * feedback.plans.len() + 1
     };
-    let canvas_height = core_canvas_height + feedback_gutter_height;
-
-    if canvas_height == 0 {
-        return None;
-    }
+    let canvas_height = core_height + gutter_height;
 
     let mut canvas = Canvas::new(canvas_width, canvas_height);
 
@@ -1353,12 +2068,15 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
     let border_fg = Some(theme.code_border);
     let text_fg = Some(theme.fg);
 
-    let mut col_x = 2; // starting x with margin
+    // (left, right) border columns of each layer's column.
+    let mut col_bounds: Vec<(usize, usize)> = Vec::with_capacity(layers.len());
+    let mut col_x = left_margin;
     for (layer_idx, layer) in layers.iter().enumerate() {
         let col_w = col_widths[layer_idx];
+        col_bounds.push((col_x, col_x + col_w - 1));
 
         let total_layer_height = layer.len() * node_height + layer.len().saturating_sub(1) * v_gap;
-        let start_y = (core_canvas_height.saturating_sub(total_layer_height)) / 2;
+        let start_y = (core_height.saturating_sub(total_layer_height)) / 2;
 
         for (node_idx, id) in layer.iter().enumerate() {
             let w = widths.get(id).copied().unwrap_or(7);
@@ -1379,49 +2097,172 @@ fn render_lr(graph: &Graph, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>, usiz
             );
         }
 
-        col_x += col_w + node_h_gap;
+        col_x += col_w + gap_widths.get(layer_idx).copied().unwrap_or(0);
     }
 
-    // Draw edges
     let edge_fg = Some(theme.code_border);
     let label_fg = Some(theme.h3);
 
-    let mut feedback_lane = 0usize;
-    for (idx, edge) in graph.edges.iter().enumerate() {
-        if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
-            if routed_feedback_set.contains(&idx) {
-                let lane_y = core_canvas_height + 1 + feedback_lane * 2;
-                feedback_lane += 1;
-                canvas.draw_feedback_edge_lr(
-                    src.center_x,
-                    src.top_y + 2,
-                    dst.center_x,
-                    dst.top_y + 2,
-                    lane_y,
-                    edge.label.as_deref(),
-                    edge_fg,
-                    label_fg,
-                );
-            } else {
-                let src_right_x = src.center_x + src.width / 2;
-                let src_cy = src.top_y + 1;
-                let dst_left_x = dst.center_x.saturating_sub(dst.width / 2);
-                let dst_cy = dst.top_y + 1;
+    // Feedback edges go first so that forward-edge arrowheads, which overwrite
+    // cells, end up on top of any route they cross.
+    let lane_y = |lane: usize| core_height + 1 + lane * lane_gap;
+    let mut lane_labels: Vec<(FeedbackRouteLr, String)> = Vec::new();
+    for plan in &feedback.plans {
+        let edge = &graph.edges[plan.edge];
+        let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) else {
+            continue;
+        };
+        let (Some(&(src_layer, _)), Some(&(dst_layer, _))) = (
+            layout.node_pos.get(&edge.from),
+            layout.node_pos.get(&edge.to),
+        ) else {
+            continue;
+        };
+        // Drop and rise beside the node's column rather than beside its box: a
+        // narrow box's own margin can sit inside a wider box stacked with it,
+        // and a route through a box is drawn as if it were not there at all.
+        // One column per rank keeps stacked endpoints on separate routes.
+        let route = FeedbackRouteLr {
+            exit_x: src.right_x().saturating_sub(1),
+            src_bottom_y: src.bottom_y(),
+            exit_lane_x: col_bounds[src_layer].1 + 1 + plan.src_rank,
+            entry_x: dst.left_x() + 1,
+            dst_bottom_y: dst.bottom_y(),
+            entry_lane_x: col_bounds[dst_layer].0.saturating_sub(2 + plan.dst_rank),
+            lane_y: lane_y(plan.lane),
+        };
+        canvas.draw_feedback_edge_lr(&route, edge_fg);
 
-                canvas.draw_edge_lr(
-                    src.center_x,
-                    src_right_x,
-                    src_cy,
-                    dst_left_x,
-                    dst_cy,
-                    edge.label.as_deref(),
-                    edge_fg,
-                    label_fg,
-                    None,
-                );
-            }
+        if let Some(text) = edge.label.as_deref() {
+            lane_labels.push((route, text.to_string()));
         }
     }
+    // Lane labels go on once every route is on the canvas. An outer lane drops
+    // through this lane's row on its way past, and a label centred across that
+    // crossing would hide it, so the label takes the longest unbroken stretch
+    // of its own run. That stretch is all the room there is, and a longer
+    // label is cut rather than written over the route's own corner.
+    for (route, text) in &lane_labels {
+        let (start, room) = canvas.longest_plain_run(
+            route.lane_y,
+            route.entry_lane_x + 1,
+            route.exit_lane_x.saturating_sub(1),
+        );
+        let text = fit_label(text, room);
+        let x = start + room.saturating_sub(text.chars().count()) / 2;
+        for (i, ch) in text.chars().enumerate() {
+            canvas.set_label(x + i, route.lane_y, ch, label_fg);
+        }
+    }
+
+    // Every column a feedback route reserved, so that a forward edge spanning
+    // more than one gap can bend clear of one.
+    let mut reserved_cols: HashSet<usize> = HashSet::new();
+    for (k, &(left, right)) in col_bounds.iter().enumerate() {
+        for r in 0..feedback.exits[k] {
+            reserved_cols.insert(right + 1 + r);
+        }
+        for r in 0..feedback.entries[k] {
+            reserved_cols.insert(left.saturating_sub(2 + r));
+        }
+        // The column immediately left of a box is where every forward
+        // arrowhead into that column lands. A bend there runs down the heads
+        // of all of them, which the rises are already kept clear of for the
+        // same reason.
+        reserved_cols.insert(left.saturating_sub(1));
+    }
+
+    // Bend column of each gap. Every forward edge between two adjacent columns
+    // turns here whatever the widths of the individual nodes, so their runs
+    // converge into one junction rather than fanning out. It sits at the
+    // middle of the gap, except that a gap carrying a label has to fit that
+    // label between its drop columns and the bend, which pushes the bend right
+    // by as much as the label needs and no further. `gap_widths` above is
+    // sized for exactly this placement, so the `min` never binds; it is there
+    // so that a future change to one of the two cannot silently walk the bend
+    // into the rise columns.
+    let bend_x: Vec<usize> = (0..last_layer)
+        .map(|k| {
+            let right = col_bounds[k].1;
+            let left = col_bounds[k + 1].0;
+            let centred = right + 1 + (left - right - 1) / 2;
+            let needed = match label_room[k] {
+                0 => 0,
+                label => right + 2 + feedback.exits[k] + label,
+            };
+            centred
+                .max(needed)
+                .min(left.saturating_sub(2 + feedback.entries[k + 1]))
+        })
+        .collect();
+
+    // Forward edges
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if layout.feedback_set.contains(&idx) {
+            continue;
+        }
+        if let (Some(src), Some(dst)) = (positions.get(&edge.from), positions.get(&edge.to)) {
+            // Between adjacent columns the bend is the gap's own bend column,
+            // which the budget keeps clear of every drop and rise. An edge
+            // spanning further has no such column, so it takes the middle of
+            // its own span and is nudged right off any column a route holds.
+            let (mid_x, label_bounds) = match (
+                layout.node_pos.get(&edge.from),
+                layout.node_pos.get(&edge.to),
+            ) {
+                (Some(&(src_layer, _)), Some(&(dst_layer, _))) => {
+                    let src_right = col_bounds[src_layer].1;
+                    let dst_left = col_bounds[dst_layer].0;
+                    let mid = if dst_layer == src_layer + 1 {
+                        bend_x.get(src_layer).copied()
+                    } else {
+                        (dst_left > src_right + 1).then(|| {
+                            // Search right from the midpoint, then back left.
+                            // Rightward alone has a wall: the rise columns of
+                            // the destination run unbroken up to the arrowhead
+                            // column beside its boxes, so a midpoint inside
+                            // that block has nothing free to its right, and
+                            // stopping at the wall put the bend on the very
+                            // column those heads occupy.
+                            let lo = src_right + 1;
+                            let mid = lo + (dst_left - lo) / 2;
+                            let free = |x: &usize| !reserved_cols.contains(x);
+                            (mid..dst_left)
+                                .find(free)
+                                .or_else(|| (lo..mid).rev().find(free))
+                                .unwrap_or(mid)
+                        })
+                    };
+                    // Free columns for the label: right of this column's drops,
+                    // left of the next column's rises, and clear of the
+                    // arrowhead column just left of that column's boxes. An
+                    // edge that spans further keeps to this first gap, because
+                    // past it lie other columns' boxes and routes.
+                    let next = (src_layer + 1).min(dst_layer);
+                    let lo = src_right + 1 + feedback.exits[src_layer];
+                    let hi = col_bounds[next]
+                        .0
+                        .saturating_sub(2 + feedback.entries[next]);
+                    (mid, (hi >= lo).then_some((lo, hi)))
+                }
+                _ => (None, None),
+            };
+            canvas.draw_edge_lr(
+                src.right_x(),
+                src.top_y + 1,
+                dst.left_x(),
+                dst.top_y + 1,
+                edge.label.as_deref(),
+                edge_fg,
+                label_fg,
+                mid_x,
+                label_bounds,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    canvas.assert_invariants();
 
     let rows = canvas.to_span_rows(theme);
     Some((rows, canvas_width))
@@ -1442,60 +2283,1397 @@ pub fn render_mermaid(code: &str, theme: &Theme) -> Option<(Vec<Vec<StyledSpan>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    fn render_text(code: &str) -> String {
-        let theme = Theme::dark();
-        let (rows, _) = render_mermaid(code, &theme).expect("diagram should render");
+    fn rows_to_text(rows: Vec<Vec<StyledSpan>>) -> String {
         rows.into_iter()
-            .map(|row| row.into_iter().map(|span| span.text).collect::<String>())
+            .map(|row| {
+                row.into_iter()
+                    .map(|span| span.text)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    #[test]
-    fn renders_top_down_cycle_with_feedback_edge() {
-        let text = render_text(
-            r#"
-graph TB
-    Loop --> Execute
-    Execute --> Repeat
-    Repeat --> Loop
-"#,
-        );
+    fn render_text(code: &str) -> String {
+        let theme = Theme::dark();
+        let (rows, _) = render_mermaid(code, &theme).expect("diagram should render");
+        rows_to_text(rows)
+    }
 
-        assert!(text.contains("Loop"));
-        assert!(text.contains("Execute"));
-        assert!(text.contains("Repeat"));
-        assert!(text.contains('▼'));
-        assert!(text.contains('◀'));
+    /// How many arrowheads a graph's shape calls for, as
+    /// `(forward, feedback)`.
+    ///
+    /// Every edge ends in a head, but edges sharing a destination share the
+    /// head they end at: forward edges all arrive at one cell of the
+    /// destination's border, and so, separately, do the back edges. So the
+    /// count is the number of distinct destinations of each kind, and a head
+    /// missing from a render is an edge whose direction the reader cannot
+    /// recover.
+    fn expected_arrowheads(code: &str) -> (usize, usize) {
+        let graph = parse_mermaid(code).expect("diagram should parse");
+        let feedback = classify_feedback_edges(&graph);
+        let mut forward: HashSet<&str> = HashSet::new();
+        let mut back: HashSet<&str> = HashSet::new();
+        for (idx, edge) in graph.edges.iter().enumerate() {
+            if feedback.contains(&idx) {
+                back.insert(edge.to.as_str());
+            } else {
+                forward.insert(edge.to.as_str());
+            }
+        }
+        (forward.len(), back.len())
+    }
+
+    /// Check a render against the heads its graph calls for. Top-down draws
+    /// both kinds with the same glyph, so there the two are checked as one
+    /// total.
+    fn assert_arrowheads(code: &str, text: &str, lr: bool) {
+        let (forward, back) = expected_arrowheads(code);
+        if lr {
+            assert_eq!(
+                text.matches('\u{25b6}').count(),
+                forward,
+                "forward arrowheads\n{code}\n{text}"
+            );
+            assert_eq!(
+                text.matches('\u{25b2}').count(),
+                back,
+                "feedback arrowheads\n{code}\n{text}"
+            );
+        } else {
+            assert_eq!(
+                text.matches('\u{25bc}').count(),
+                forward + back,
+                "arrowheads\n{code}\n{text}"
+            );
+        }
+    }
+
+    /// Render on a helper thread so that a layout that never terminates fails
+    /// the test instead of hanging the whole test binary.
+    fn render_text_with_timeout(code: impl Into<String>) -> String {
+        let code = code.into();
+        let source = code.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(render_text(&code));
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(text) => text,
+            // The sender is dropped as soon as the render thread unwinds, so a
+            // panic there arrives here as a disconnect, not as a timeout. The
+            // panic itself is on the other thread's output, which says nothing
+            // about which diagram provoked it, so name it here.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the render thread panicked on:\n{source}")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("rendering did not finish within 10 seconds:\n{source}")
+            }
+        }
+    }
+
+    /// Compare a render against a snapshot written at column 0 inside a raw
+    /// string literal (one leading newline, trailing blank rows ignored).
+    ///
+    /// Every render also checks an invariant of its own:
+    /// [`Canvas::assert_invariants`] fails the test if a feedback route was
+    /// laid over a node cell, which is what a route that runs through a box
+    /// looks like.
+    fn assert_render(code: &'static str, expected: &str) {
+        let text = render_text_with_timeout(code);
+        let expected = expected.strip_prefix('\n').unwrap_or(expected);
+        assert_eq!(
+            text.trim_end(),
+            expected.trim_end(),
+            "\n--- rendered ---\n{text}\n--- expected ---\n{expected}"
+        );
+    }
+
+    /// A linear chain N0 -> N1 -> ... -> N{n-1}, optionally closed into a cycle.
+    fn chain_graph(n: usize, close_cycle: bool) -> Graph {
+        let ids: Vec<String> = (0..n).map(|i| format!("N{i}")).collect();
+        let nodes = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    Node {
+                        label: id.clone(),
+                        shape: NodeShape::Rectangle,
+                    },
+                )
+            })
+            .collect();
+        let mut edges: Vec<Edge> = ids
+            .windows(2)
+            .map(|pair| Edge {
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                label: None,
+            })
+            .collect();
+        if close_cycle {
+            edges.push(Edge {
+                from: ids[n - 1].clone(),
+                to: ids[0].clone(),
+                label: None,
+            });
+        }
+        Graph {
+            direction: Direction::TopDown,
+            nodes,
+            edges,
+            node_order: ids,
+        }
+    }
+
+    /// Render a deterministic spread of graph shapes and check three things
+    /// on every one: that no feedback route was laid over a box
+    /// ([`Canvas::assert_invariants`]), that no label was written over a route
+    /// ([`Canvas::set_label`]), and that every edge still ends in an arrowhead.
+    ///
+    /// The shapes vary in node count, node width, edge count, direction and
+    /// labelling, because a route only collides with a box that a *differently
+    /// sized* neighbour widened the column for.
+    ///
+    /// The head count is the check with the widest reach. Nothing else objects
+    /// when a line is drawn across an arrowhead: the junction left behind is a
+    /// legitimate character in a legitimate place, and the only sign that
+    /// anything is wrong is that an edge no longer says which way it runs.
+    /// Before arrowhead cells were protected, 926 of these 2000 cases lost at
+    /// least one head.
+    #[test]
+    fn feedback_routes_and_arrowheads_survive_random_graphs() {
+        // xorshift with a fixed seed, so a failure is always reproducible.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..2000u32 {
+            let n = 2 + (next() % 14) as usize;
+            let lr = next() % 2 == 0;
+            let mut code = String::from(if lr { "graph LR\n" } else { "graph TD\n" });
+            let names: Vec<String> = (0..n)
+                .map(|i| format!("N{i}[{}]", "x".repeat(1 + (i % 4) * 5)))
+                .collect();
+            for _ in 0..1 + (next() % 30) {
+                let a = (next() % n as u64) as usize;
+                let b = (next() % n as u64) as usize;
+                if next() % 3 == 0 {
+                    let label = "L".repeat(1 + (next() % 12) as usize);
+                    code.push_str(&format!("  {} -->|{label}| {}\n", names[a], names[b]));
+                } else {
+                    code.push_str(&format!("  {} --> {}\n", names[a], names[b]));
+                }
+            }
+
+            let source = code.clone();
+            let (tx, rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let theme = Theme::dark();
+                let _ =
+                    tx.send(render_mermaid(&source, &theme).map(|(rows, _)| rows_to_text(rows)));
+            });
+            match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(Some(text)) => {
+                    // Only this arm joins. On a timeout the thread is still
+                    // rendering, so waiting for it would hang the test rather
+                    // than fail it, which is the failure the timeout exists to
+                    // report; those arms leave it detached.
+                    handle.join().unwrap();
+                    assert_arrowheads(&code, &text, lr);
+                }
+                Ok(None) => panic!("case {case} did not render:\n{code}"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("case {case} panicked while rendering:\n{code}")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("case {case} did not finish within 20 seconds:\n{code}")
+                }
+            }
+        }
+    }
+
+    /// One layer of `targets` nodes, each with its own descendant and its own
+    /// back edge, optionally with a labelled forward edge spanning two layers
+    /// into the `label_into`-th of them.
+    ///
+    /// The random generator above cannot reach this shape. It caps a case at
+    /// 15 nodes and 30 edges, and nine targets carrying their own descendants
+    /// and back edges needs twenty of each. A wide layer is where the row
+    /// budget is under the most pressure: every feedback target in a layer
+    /// claims a row of the gap above it, while the midpoint of a forward edge
+    /// crossing that gap moves by only half a row per row added.
+    ///
+    /// `A` shares its layer with `Z` so that it is off the centre line the
+    /// lone node below it sits on. A spanning edge drawn straight down that
+    /// centre line runs through the box in between and overwrites the
+    /// arrowhead entering it, which is a separate and older fault than the one
+    /// under test here; standing `A` to one side keeps it out of the way.
+    fn wide_layer_source(dir: &str, targets: usize, label_into: Option<usize>) -> String {
+        let mut code = format!("graph {dir}\n    A --> M\n    Z --> M\n");
+        for i in 1..=targets {
+            code.push_str(&format!("    M --> T{i}\n"));
+            code.push_str(&format!("    T{i} --> U{i}\n"));
+            code.push_str(&format!("    U{i} --> T{i}\n"));
+        }
+        if let Some(i) = label_into {
+            code.push_str(&format!("    A -->|lbl| T{i}\n"));
+        }
+        code
+    }
+
+    /// Every render checks [`Canvas::assert_invariants`] and every label goes
+    /// through [`Canvas::set_label`], so rendering a shape is itself one
+    /// assertion: a route laid over a box or a label laid over a route fails
+    /// here rather than coming out as a break in the picture.
+    ///
+    /// Arrowheads are the other. Nothing objects when a forward edge's own
+    /// horizontal run crosses a feedback arrowhead — `add_connection` turns
+    /// the head into a junction, which is a legitimate character in a
+    /// legitimate place — so the only way to see that the head is gone is to
+    /// count the heads. Every edge here ends at a cell of its own, bar the
+    /// spanning edge that shares a destination border with `M -> T`, so the
+    /// count is fixed by the shape: one head per node reached, plus one per
+    /// back edge.
+    #[test]
+    fn a_wide_layer_of_feedback_targets_keeps_every_route_clear() {
+        for targets in 2..=12usize {
+            for dir in ["TD", "LR"] {
+                for label_into in [None, Some(1), Some(targets.div_ceil(2)), Some(targets)] {
+                    let code = wide_layer_source(dir, targets, label_into);
+                    let text = render_text_with_timeout(code.clone());
+                    // One head at M, one at every T and one at every U. The
+                    // spanning edge adds none: it shares a destination border
+                    // with `M -> T`. Every back edge then adds one of its own,
+                    // entering T through a border the forward edges do not use.
+                    let forward = 2 * targets + 1;
+                    let back = targets;
+                    if dir == "TD" {
+                        // Both kinds of head are the same glyph here.
+                        let heads = text.matches('\u{25bc}').count();
+                        assert_eq!(heads, forward + back, "\n{code}\n{text}");
+                    } else {
+                        let out = text.matches('\u{25b6}').count();
+                        let into = text.matches('\u{25b2}').count();
+                        assert_eq!(out, forward, "\n{code}\n{text}");
+                        assert_eq!(into, back, "\n{code}\n{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A layer whose arrowhead row a spanning forward edge's bus can land on.
+    ///
+    /// `Q` is reached by a source that also feeds `R` two layers down, so the
+    /// `S -> R` bus crosses the whole gap around `Q`. Every sibling of `S`
+    /// carries a self-loop, which fills the gap below their layer with
+    /// feedback rows and walks the bus's midpoint down onto the one row it
+    /// must not have: the row every arrowhead into `Q` sits on. The rows a
+    /// feedback route reserves cover a layer that back edges *enter*, and
+    /// nothing enters `Q`, so before every layer's arrowhead row was reserved
+    /// the search settled there and drew the bus across those heads.
+    fn arrowhead_row_source(siblings: usize) -> String {
+        let mut code = String::from("graph TD\n    S --> Q\n    Q --> R\n    S --> R\n");
+        for i in 1..=siblings {
+            code.push_str(&format!("    P{i} --> Q\n"));
+            code.push_str(&format!("    P{i} --> P{i}\n"));
+        }
+        code
     }
 
     #[test]
-    fn renders_self_loop_without_hanging() {
-        let text = render_text(
-            r#"
-graph TD
-    A[Self] --> A
-"#,
-        );
-
-        assert!(text.contains("Self"));
-        assert!(text.contains('◀'));
+    fn a_spanning_bus_clears_an_arrowhead_row_top_down() {
+        for siblings in 1..=8usize {
+            let code = arrowhead_row_source(siblings);
+            let text = render_text_with_timeout(code.clone());
+            // Heads at Q and R, then one per self-loop.
+            assert_arrowheads(&code, &text, false);
+            assert_eq!(
+                text.matches('\u{25bc}').count(),
+                2 + siblings,
+                "\n{code}\n{text}"
+            );
+        }
     }
 
     #[test]
-    fn renders_left_right_cycle_with_feedback_edge() {
-        let text = render_text(
+    fn a_spanning_bend_clears_an_arrowhead_column_left_right() {
+        // The mirror in left-right. `A -> C3` spans two columns, so it bends
+        // at the middle of its own span rather than at a gap's bend column.
+        // The middle column holds three feedback targets, whose rise columns
+        // run unbroken up to the column beside their boxes, and the search
+        // used to walk right until it ran out of rises and stop on exactly
+        // that column: the one every forward arrowhead into the column lands
+        // on. It searches both ways now, and treats an arrowhead column as
+        // taken.
+        //
+        // `A`'s label is what pushes the bend into the block, by widening the
+        // gap that the midpoint is measured across.
+        let code = "graph LR
+    A -->|xxxxxxxxxxxxx| B
+    A --> C3
+    A2 --> B2
+    A2 --> B3
+    B --> C
+    B2 --> C2
+    B3 --> C3
+    C --> B
+    C2 --> B2
+    C3 --> B3
+";
+        let text = render_text_with_timeout(code);
+        assert_arrowheads(code, &text, true);
+        // Pinned in full, because a head that survives a crossing is not the
+        // whole of it: the line that crossed it is drawn with a break, and
+        // only the picture shows that.
+        assert_render(
+            code,
             r#"
-graph LR
-    A[Start] --> B[End]
-    B --> A
+
+                             ┌─────┐      ┌─────┐
+                       ┌────▶│  B  │─────▶│  C  │
+  ┌─────┐ xxxxxxxxxxxxx│     └─────┘      └─────┘
+  │  A  │──────────────┤      ▲                └───┐
+  └─────┘              │ ┌────┘                    │
+                       │ │   ┌─────┐      ┌─────┐  │
+                       └─┼──▶│ C3  │─────▶│ B3  │  │
+  ┌─────┐                │   └─────┘      └─────┘  │
+  │ A2  │──────────────┬─┼───┘▲                └──┐│
+  └─────┘              │ │┌───┘                   ││
+                       │ ││  ┌─────┐      ┌─────┐ ││
+                       └─┼┼─▶│ B2  │─────▶│ C2  │ ││
+                         ││  └─────┘      └─────┘ ││
+                         ││   ▲                └─┐││
+                         ││┌──┘                  │││
+                         │└┼─────────────────────┼┘│
+                         │ │                     │ │
+                         └─┼─────────────────────┼─┘
+                           │                     │
+                           └─────────────────────┘
 "#,
         );
+    }
 
-        assert!(text.contains("Start"));
-        assert!(text.contains("End"));
-        assert!(text.contains('▶'));
-        assert!(text.contains('▲'));
+    // ── Cycle classification ──
+
+    #[test]
+    fn closing_edge_of_a_declared_cycle_is_the_feedback_edge() {
+        let graph = parse_mermaid("graph TD\n    A --> B\n    B --> C\n    C --> A\n").unwrap();
+        let feedback = classify_feedback_edges(&graph);
+        assert_eq!(feedback.into_iter().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn deep_chain_does_not_overflow_the_stack() {
+        let acyclic = chain_graph(200_000, false);
+        assert!(classify_feedback_edges(&acyclic).is_empty());
+
+        let cyclic = chain_graph(200_000, true);
+        let feedback = classify_feedback_edges(&cyclic);
+        assert_eq!(feedback.len(), 1);
+        assert!(feedback.contains(&(cyclic.edges.len() - 1)));
+    }
+
+    #[test]
+    fn longer_feedback_edges_take_outer_lanes() {
+        let graph = parse_mermaid(
+            "graph TD\n    Start --> Check\n    Check --> Work\n    Work --> Done\n    Done --> Start\n    Work --> Check\n",
+        )
+        .unwrap();
+        let layout = layout(&graph);
+        // Work -> Check spans one layer, Done -> Start spans three.
+        assert_eq!(layout.feedback, vec![4, 3]);
+    }
+
+    #[test]
+    fn feedback_endpoints_are_counted_per_layer() {
+        let graph = parse_mermaid("graph TD\n    S --> A\n    S --> B\n    A --> S\n    B --> S\n")
+            .unwrap();
+        let layout = layout(&graph);
+        let feedback = plan_feedback(&graph, &layout);
+        // Both back edges leave the second layer and enter the first.
+        assert_eq!(feedback.exits, vec![0, 2]);
+        assert_eq!(feedback.entries, vec![1, 0]);
+        // Two sources in one layer get distinct ranks.
+        let mut ranks: Vec<usize> = feedback.plans.iter().map(|p| p.src_rank).collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, vec![0, 1]);
+    }
+
+    // ── Acyclic rendering must not change ──
+
+    #[test]
+    fn acyclic_top_down_diagram() {
+        assert_render(
+            "graph TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Action 1]\n    B -->|No| D[Action 2]\n    C --> E[End]\n    D --> E\n",
+            r#"
+             ┌───────┐
+             │ Start │
+             └───────┘
+                 │
+                 │
+                 │
+                 ▼
+          ◆────────────◆
+          │  Decision  │
+          ◆────────────◆
+                 │
+           Yes   │  No
+         ┌───────┴───────┐
+         ▼               ▼
+   ┌──────────┐    ┌──────────┐
+   │ Action 1 │    │ Action 2 │
+   └──────────┘    └──────────┘
+         │               │
+         │               │
+         └───────┬───────┘
+                 ▼
+              ┌─────┐
+              │ End │
+              └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn acyclic_left_right_diagram() {
+        assert_render(
+            "graph LR\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Action 1]\n    B -->|No| D[Do]\n    C --> E[End]\n    D --> E\n",
+            r#"
+
+                                      ┌──────────┐
+                                   ┌─▶│ Action 1 │───┐
+  ┌───────┐      ◆────────────◆ Yes│  └──────────┘   │  ┌─────┐
+  │ Start │─────▶│  Decision  │────┤                 ├─▶│ End │
+  └───────┘      ◆────────────◆  No│                 │  └─────┘
+                                   │     ┌─────┐     │
+                                   └────▶│ Do  │─────┘
+                                         └─────┘
+
+"#,
+        );
+    }
+
+    // ── Cycles ──
+
+    #[test]
+    fn top_down_cycle_wraps_around_the_right() {
+        assert_render(
+            "graph TB\n    Loop --> Execute\n    Execute --> Repeat\n    Repeat --> Loop\n",
+            r#"
+          ┌───────┐
+          ▼       │
+    ┌──────┐      │
+    │ Loop │      │
+    └──────┘      │
+        │         │
+        │         │
+        │         │
+        ▼         │
+   ┌─────────┐    │
+   │ Execute │    │
+   └─────────┘    │
+        │         │
+        │         │
+        │         │
+        ▼         │
+   ┌────────┐     │
+   │ Repeat │     │
+   └────────┘     │
+    │             │
+    └─────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn left_right_cycle_wraps_underneath() {
+        assert_render(
+            "graph LR\n    A[Start] --> B[End]\n    B --> A\n",
+            r#"
+
+  ┌───────┐      ┌─────┐
+  │ Start │─────▶│ End │
+  └───────┘      └─────┘
+   ▲                  └─┐
+┌──┘                    │
+└───────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn self_loop_top_down_is_a_closed_loop() {
+        assert_render(
+            "graph TD\n    A[Self] --> A\n",
+            r#"
+         ┌─────┐
+         ▼     │
+   ┌──────┐    │
+   │ Self │    │
+   └──────┘    │
+    │          │
+    └──────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn self_loop_left_right_is_a_closed_loop() {
+        assert_render(
+            "graph LR\n    A[Self] --> A\n",
+            r#"
+
+  ┌──────┐
+  │ Self │
+  └──────┘
+   ▲    └─┐
+┌──┘      │
+└─────────┘
+
+"#,
+        );
+    }
+
+    // ── Routes must not pass through other nodes ──
+
+    #[test]
+    fn feedback_edge_avoids_sibling_nodes_top_down() {
+        // The back edge into B leaves D, wraps around the gutter and comes back
+        // through a gap row. It never touches the row C is drawn on.
+        assert_render(
+            "graph TD\n    A --> B\n    A --> C\n    B --> D\n    C --> D\n    D --> B\n",
+            r#"
+         ┌─────┐
+         │  A  │
+         └─────┘
+            │
+            │
+      ┌─────┴────┐
+      │ ┌────────┼───────┐
+      ▼ ▼        ▼       │
+   ┌─────┐    ┌─────┐    │
+   │  B  │    │  C  │    │
+   └─────┘    └─────┘    │
+      │          │       │
+      │          │       │
+      └─────┬────┘       │
+            ▼            │
+         ┌─────┐         │
+         │  D  │         │
+         └─────┘         │
+          │              │
+          └──────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn feedback_edge_avoids_stacked_nodes_left_right() {
+        // C sits directly below B; the route into B rises beside their column.
+        assert_render(
+            "graph LR\n    A --> B\n    A --> C\n    B --> D\n    C --> D\n    D --> B\n",
+            r#"
+
+               ┌─────┐
+            ┌─▶│  B  │───┐
+  ┌─────┐   │  └─────┘   │  ┌─────┐
+  │  A  │───┤   ▲        ├─▶│  D  │
+  └─────┘   │┌──┘        │  └─────┘
+            ││ ┌─────┐   │       └─┐
+            └┼▶│  C  │───┘         │
+             │ └─────┘             │
+             │                     │
+             │                     │
+             └─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn feedback_route_clears_a_wider_stacked_node_left_right() {
+        // B is narrower than the node stacked under it. Its own right margin is
+        // inside that wider box, so the route has to use the column edge; drawing
+        // it over the box would leave a line that stops dead at the border.
+        assert_render(
+            "graph LR\n    A --> B\n    A --> C[VeryLongName]\n    B --> D\n    C --> D\n    D --> B\n",
+            r#"
+
+                    ┌─────┐
+            ┌──────▶│  B  │───────┐
+  ┌─────┐   │       └─────┘       │  ┌─────┐
+  │  A  │───┤        ▲            ├─▶│  D  │
+  └─────┘   │┌───────┘            │  └─────┘
+            ││ ┌──────────────┐   │       └─┐
+            └┼▶│ VeryLongName │───┘         │
+             │ └──────────────┘             │
+             │                              │
+             │                              │
+             └──────────────────────────────┘
+
+"#,
+        );
+    }
+
+    // ── Endpoints that share a layer, and gaps that carry both ──
+
+    #[test]
+    fn feedback_route_clears_a_wider_stacked_source_left_right() {
+        // The mirror of the case above: B leaves through a column edge because
+        // its own right margin is inside the wider box stacked under it. The
+        // crossing with C -> D is a junction, not a break.
+        assert_render(
+            "graph LR\n    A --> B\n    A --> C[VeryLongName]\n    B --> D\n    C --> D\n    B --> A\n",
+            r#"
+
+                    ┌─────┐
+            ┌──────▶│  B  │───────┐
+  ┌─────┐   │       └─────┘       │  ┌─────┐
+  │  A  │───┤            └─────┐  ├─▶│  D  │
+  └─────┘   │                  │  │  └─────┘
+   ▲        │  ┌──────────────┐│  │
+┌──┘        └─▶│ VeryLongName │┼──┘
+│              └──────────────┘│
+│                              │
+│                              │
+└──────────────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn two_feedback_sources_in_one_layer_leave_on_different_rows() {
+        assert_render(
+            "graph TD\n    S --> A\n    S --> B\n    A --> S\n    B --> S\n",
+            r#"
+              ┌──────────┬───┐
+              ▼          │   │
+         ┌─────┐         │   │
+         │  S  │         │   │
+         └─────┘         │   │
+            │            │   │
+            │            │   │
+      ┌─────┴────┐       │   │
+      ▼          ▼       │   │
+   ┌─────┐    ┌─────┐    │   │
+   │  A  │    │  B  │    │   │
+   └─────┘    └─────┘    │   │
+    │          │         │   │
+    │          └─────────┼───┘
+    └────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn three_feedback_sources_in_one_layer_leave_on_different_rows() {
+        // A third source needs a third row: one row per rank, not one row for the
+        // nearest source and one shared by all the rest.
+        assert_render(
+            "graph TD\n    S --> A\n    S --> B\n    S --> C\n    A --> S\n    B --> S\n    C --> S\n",
+            r#"
+                   ┌────────────────┬───┬───┐
+                   ▼                │   │   │
+              ┌─────┐               │   │   │
+              │  S  │               │   │   │
+              └─────┘               │   │   │
+                 │                  │   │   │
+                 │                  │   │   │
+      ┌──────────┼──────────┐       │   │   │
+      ▼          ▼          ▼       │   │   │
+   ┌─────┐    ┌─────┐    ┌─────┐    │   │   │
+   │  A  │    │  B  │    │  C  │    │   │   │
+   └─────┘    └─────┘    └─────┘    │   │   │
+    │          │          │         │   │   │
+    │          │          └─────────┼───┼───┘
+    │          └────────────────────┼───┘
+    └───────────────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn two_feedback_sources_in_one_column_drop_in_different_columns() {
+        assert_render(
+            "graph LR\n    S --> A\n    S --> B\n    A --> S\n    B --> S\n",
+            r#"
+
+               ┌─────┐
+            ┌─▶│  A  │
+  ┌─────┐   │  └─────┘
+  │  S  │───┤       └──┐
+  └─────┘   │          │
+   ▲        │  ┌─────┐ │
+┌──┘        └─▶│  B  │ │
+│              └─────┘ │
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn feedback_exit_and_entry_in_one_gap_use_different_rows() {
+        // B is a feedback source and C, one layer below it, is a feedback target,
+        // so one gap carries both. Sharing a row would fuse the two routes into a
+        // single line that reads as neither.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> C\n    C --> D\n    D --> C\n    B --> A\n",
+            r#"
+        ┌─────────┐
+        ▼         │
+   ┌─────┐        │
+   │  A  │        │
+   └─────┘        │
+      │           │
+      │           │
+      │           │
+      ▼           │
+   ┌─────┐        │
+   │  B  │        │
+   └─────┘        │
+    │ │           │
+    └─┼───────────┘
+      │
+      │
+      │ ┌─────┐
+      ▼ ▼     │
+   ┌─────┐    │
+   │  C  │    │
+   └─────┘    │
+      │       │
+      │       │
+      │       │
+      ▼       │
+   ┌─────┐    │
+   │  D  │    │
+   └─────┘    │
+    │         │
+    └─────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn two_feedback_edges_from_one_source_share_one_stem() {
+        // Both back edges leave C. They are one endpoint, so they share a rank
+        // and leave on one stem, which splits at a junction into the two lanes
+        // rather than drawing a second stem over the first.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> C\n    C --> A\n    C --> B\n",
+            r#"
+        ┌─────────┐
+        ▼         │
+   ┌─────┐        │
+   │  A  │        │
+   └─────┘        │
+      │           │
+      │           │
+      │           │
+      │ ┌─────┐   │
+      ▼ ▼     │   │
+   ┌─────┐    │   │
+   │  B  │    │   │
+   └─────┘    │   │
+      │       │   │
+      │       │   │
+      │       │   │
+      ▼       │   │
+   ┌─────┐    │   │
+   │  C  │    │   │
+   └─────┘    │   │
+    │         │   │
+    └─────────┴───┘
+"#,
+        );
+    }
+
+    #[test]
+    fn two_feedback_edges_into_one_target_share_one_entry() {
+        // The mirror: both back edges end at A, so they come down one column
+        // into a single arrowhead instead of two heads on the same border.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> C\n    C --> A\n    B --> A\n",
+            r#"
+        ┌─────┬───┐
+        ▼     │   │
+   ┌─────┐    │   │
+   │  A  │    │   │
+   └─────┘    │   │
+      │       │   │
+      │       │   │
+      │       │   │
+      ▼       │   │
+   ┌─────┐    │   │
+   │  B  │    │   │
+   └─────┘    │   │
+    │ │       │   │
+    └─┼───────┘   │
+      │           │
+      │           │
+      ▼           │
+   ┌─────┐        │
+   │  C  │        │
+   └─────┘        │
+    │             │
+    └─────────────┘
+"#,
+        );
+    }
+
+    // ── Labels ──
+
+    #[test]
+    fn feedback_labels_sit_beside_their_own_lane_top_down() {
+        assert_render(
+            "graph TD\n    Start --> Check\n    Check --> Work\n    Work --> Done\n    Done -->|retry| Start\n    Work -->|again| Check\n",
+            r#"
+          ┌──────────────┐
+          ▼              │
+   ┌───────┐             │
+   │ Start │             │
+   └───────┘             │
+       │                 │
+       │                 │
+       │                 │
+       │  ┌─────┐        │
+       ▼  ▼     │        │
+   ┌───────┐    │        │
+   │ Check │    │ again  │ retry
+   └───────┘    │        │
+       │        │        │
+       │        │        │
+       │        │        │
+       ▼        │        │
+   ┌──────┐     │        │
+   │ Work │     │        │
+   └──────┘     │        │
+    │  │        │        │
+    └──┼────────┘        │
+       │                 │
+       │                 │
+       ▼                 │
+   ┌──────┐              │
+   │ Done │              │
+   └──────┘              │
+    │                    │
+    └────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn feedback_labels_sit_inline_on_their_lane_left_right() {
+        assert_render(
+            "graph LR\n    Start --> Check\n    Check --> Work\n    Work --> Done\n    Done -->|retry| Start\n    Work -->|again| Check\n",
+            r#"
+
+  ┌───────┐      ┌───────┐      ┌──────┐      ┌──────┐
+  │ Start │─────▶│ Check │─────▶│ Work │─────▶│ Done │
+  └───────┘      └───────┘      └──────┘      └──────┘
+   ▲              ▲                   └─┐           └─┐
+┌──┘           ┌──┘                     │             │
+│              └─────────again──────────┘             │
+│                                                     │
+└────────────────────────retry────────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn a_label_longer_than_its_lane_is_truncated() {
+        // The lane runs between two node columns and that is all the room there
+        // is, so the label is cut rather than written over the corner and off
+        // the edge of the canvas.
+        assert_render(
+            "graph LR\n    A -->|this is a long label| A\n",
+            r#"
+
+  ┌─────┐
+  │  A  │
+  └─────┘
+   ▲   └─┐
+┌──┘     │
+└this is…┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn straight_forward_edge_label_clears_the_feedback_stem() {
+        // The label on B -> C sits on the first gap row, which is the row the
+        // feedback stem drops through. The stem leaves under the left border.
+        assert_render(
+            "graph TD\n    A --> B\n    B -->|ok| C\n    B --> A\n",
+            r#"
+        ┌─────┐
+        ▼     │
+   ┌─────┐    │
+   │  A  │    │
+   └─────┘    │
+      │       │
+      │       │
+      │       │
+      ▼       │
+   ┌─────┐    │
+   │  B  │    │
+   └─────┘    │
+    │ │ ok    │
+    └─┼───────┘
+      │
+      │
+      ▼
+   ┌─────┐
+   │  C  │
+   └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn bent_forward_edge_label_clears_the_feedback_route() {
+        // The yes/no labels sit on the row above the bus, which the row budget
+        // keeps below every exit row in the gap.
+        assert_render(
+            "graph TD\n    A --> B\n    B -->|yes| C\n    B -->|no| D\n    C --> E\n    D --> E\n    B --> A\n",
+            r#"
+              ┌──────────┐
+              ▼          │
+         ┌─────┐         │
+         │  A  │         │
+         └─────┘         │
+            │            │
+            │            │
+            │            │
+            ▼            │
+         ┌─────┐         │
+         │  B  │         │
+         └─────┘         │
+          │ │            │
+          └─┼────────────┘
+       yes  │no
+      ┌─────┴────┐
+      ▼          ▼
+   ┌─────┐    ┌─────┐
+   │  C  │    │  D  │
+   └─────┘    └─────┘
+      │          │
+      │          │
+      └─────┬────┘
+            ▼
+         ┌─────┐
+         │  E  │
+         └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn feedback_label_clears_an_outer_lane_top_down() {
+        // `back` belongs to the inner lane. Every gap row beside it carries the
+        // horizontal run of an outer lane, so the label sits on a node row.
+        assert_render(
+            "graph TD\n    A --> B\n    B --> X\n    B --> Y\n    X --> Z\n    Y --> Z\n    Z -->|back| X\n    X --> A\n    Y --> A\n",
+            r#"
+              ┌──────────────────┬───┐
+              ▼                  │   │
+         ┌─────┐                 │   │
+         │  A  │                 │   │
+         └─────┘                 │   │
+            │                    │   │
+            │                    │   │
+            │                    │   │
+            ▼                    │   │
+         ┌─────┐                 │   │
+         │  B  │                 │   │
+         └─────┘                 │   │
+            │                    │   │
+            │                    │   │
+      ┌─────┴────┐               │   │
+      │ ┌────────┼───────┐       │   │
+      ▼ ▼        ▼       │       │   │
+   ┌─────┐    ┌─────┐    │       │   │
+   │  X  │    │  Y  │    │ back  │   │
+   └─────┘    └─────┘    │       │   │
+    │ │        │ │       │       │   │
+    │ │        └─┼───────┼───────┼───┘
+    └─┼──────────┼───────┼───────┘
+      │          │       │
+      └─────┬────┘       │
+            ▼            │
+         ┌─────┐         │
+         │  Z  │         │
+         └─────┘         │
+          │              │
+          └──────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_long_label_cannot_reach_the_gutter_lanes_top_down() {
+        // The label runs along the first gap row towards the gutter, where the
+        // lane of the back edge is. It is cut before it gets there.
+        assert_render(
+            "graph TD\n    A -->|a very long edge label| B\n    B --> A\n",
+            r#"
+        ┌─────┐
+        ▼     │
+   ┌─────┐    │
+   │  A  │    │
+   └─────┘    │
+      │ a ve… │
+      │       │
+      │       │
+      ▼       │
+   ┌─────┐    │
+   │  B  │    │
+   └─────┘    │
+    │         │
+    └─────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_long_label_stops_before_a_sibling_feedback_stem_top_down() {
+        // B's label runs right along the first gap row, which is the row C's
+        // feedback stem drops through.
+        assert_render(
+            "graph TD\n    A --> B\n    A --> C\n    B -->|a long label| D\n    C --> E\n    C --> A\n",
+            r#"
+              ┌──────────┐
+              ▼          │
+         ┌─────┐         │
+         │  A  │         │
+         └─────┘         │
+            │            │
+            │            │
+      ┌─────┴────┐       │
+      ▼          ▼       │
+   ┌─────┐    ┌─────┐    │
+   │  B  │    │  C  │    │
+   └─────┘    └─────┘    │
+      │ a long…│ │       │
+      │        └─┼───────┘
+      │          │
+      │          │
+      ▼          ▼
+   ┌─────┐    ┌─────┐
+   │  D  │    │  E  │
+   └─────┘    └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn bent_forward_label_clears_the_feedback_rise_left_right() {
+        // `no` would sit right of the bend, which is where the route into B
+        // rises. There is room left of the bend, so it goes there instead.
+        assert_render(
+            "graph LR\n    A --> B\n    A -->|no| C\n    B --> D\n    C --> D\n    D --> B\n",
+            r#"
+
+                ┌─────┐
+            ┌──▶│  B  │───┐
+  ┌─────┐   │   └─────┘   │  ┌─────┐
+  │  A  │───┤    ▲        ├─▶│  D  │
+  └─────┘ no│ ┌──┘        │  └─────┘
+            │ │ ┌─────┐   │       └─┐
+            └─┼▶│  C  │───┘         │
+              │ └─────┘             │
+              │                     │
+              │                     │
+              └─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn straight_forward_label_clears_the_feedback_drop_left_right() {
+        // Y's label starts two columns right of its box, which is the column X
+        // drops through on its way to the lane. It starts past the drops.
+        assert_render(
+            "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|lbl| Z2\n",
+            r#"
+
+               ┌─────┐         ┌─────┐
+            ┌─▶│  X  │────────▶│ Z1  │
+  ┌─────┐   │  └─────┘         └─────┘
+  │  S  │───┤       └──┐
+  └─────┘   │          │
+   ▲        │  ┌─────┐ │lbl    ┌─────┐
+┌──┘        └─▶│  Y  │─┼──────▶│ Z2  │
+│              └─────┘ │       └─────┘
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn lane_label_keeps_clear_of_a_crossing_left_right() {
+        // The outer lane drops through this lane's run. The label takes the
+        // longest unbroken stretch instead of covering the crossing.
+        assert_render(
+            "graph LR\n    A --> B\n    B --> C\n    C --> D\n    D -->|label here| B\n    C --> A\n",
+            r#"
+
+  ┌─────┐      ┌─────┐      ┌─────┐      ┌─────┐
+  │  A  │─────▶│  B  │─────▶│  C  │─────▶│  D  │
+  └─────┘      └─────┘      └─────┘      └─────┘
+   ▲            ▲                └─┐          └─┐
+┌──┘         ┌──┘                  │            │
+│            └─────label here──────┼────────────┘
+│                                  │
+└──────────────────────────────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn a_forward_label_is_not_cut_to_an_ellipsis_left_right() {
+        // The gap between two columns is sized for the label it has to carry.
+        // At a fixed six columns a bent label had three columns to sit in, so
+        // anything longer came out as two characters and an ellipsis and the
+        // edge stopped saying what it meant.
+        assert_render(
+            "graph LR\n    A[Start] --> B{Check}\n    B -->|success| C[Deploy]\n    B -->|failure| D[Rollback]\n",
+            r#"
+
+                                        ┌────────┐
+                                    ┌──▶│ Deploy │
+  ┌───────┐      ◆─────────◆ success│   └────────┘
+  │ Start │─────▶│  Check  │────────┤
+  └───────┘      ◆─────────◆ failure│
+                                    │  ┌──────────┐
+                                    └─▶│ Rollback │
+                                       └──────────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn straight_label_clears_two_feedback_drops_left_right() {
+        // Y's column holds two feedback sources, so the gap right of it opens
+        // with two drop columns and the label has to start past both. Sizing
+        // the gap for the label and the rises alone leaves it a column short
+        // per drop, and `committed` comes back as `committ…`.
+        assert_render(
+            "graph LR\n    S --> X\n    S --> Y\n    X --> S\n    Y --> S\n    X --> Z1\n    Y -->|committed| Z2\n",
+            r#"
+
+               ┌─────┐               ┌─────┐
+            ┌─▶│  X  │──────────────▶│ Z1  │
+  ┌─────┐   │  └─────┘               └─────┘
+  │  S  │───┤       └──┐
+  └─────┘   │          │
+   ▲        │  ┌─────┐ │committed    ┌─────┐
+┌──┘        └─▶│  Y  │─┼────────────▶│ Z2  │
+│              └─────┘ │             └─────┘
+│                   └─┐│
+│                     ││
+├─────────────────────┼┘
+│                     │
+└─────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_bent_label_does_not_double_the_gap_left_right() {
+        // The bend moves right with the label instead of holding the middle of
+        // the gap. Sizing a centred bend to clear an 18-column label costs 38
+        // columns of gap against 22 here, and the viewer word-wraps a diagram
+        // wider than the terminal into fragments.
+        let code = "graph LR\n    A[Start] --> B{Check}\n    B -->|user clicks submit| C[Deploy]\n    B -->|failure| D[Rollback]\n    D --> B\n";
+        let text = render_text(code);
+        let width = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(width < 70, "diagram is {width} columns wide:\n{text}");
+        assert_render(
+            code,
+            r#"
+
+                                                   ┌────────┐
+                                               ┌──▶│ Deploy │
+  ┌───────┐      ◆─────────◆ user clicks submit│   └────────┘
+  │ Start │─────▶│  Check  │───────────────────┤
+  └───────┘      ◆─────────◆            failure│
+                  ▲                            │  ┌──────────┐
+               ┌──┘                            └─▶│ Rollback │
+               │                                  └──────────┘
+               │                                            └─┐
+               │                                              │
+               └──────────────────────────────────────────────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn bent_forward_label_clears_the_edges_own_run_left_right() {
+        // A -> X rises by two rows, so the label row used to land on A's own
+        // horizontal run and paint over it: `│  A  │lbl┐`. It goes on the row
+        // between the two runs instead.
+        assert_render(
+            "graph LR\n    A -->|lbl| X\n    B --> X\n    B --> Y\n    C --> Y\n",
+            r#"
+
+  ┌─────┐
+  │  A  │────┐
+  └─────┘ lbl│  ┌─────┐
+             ├─▶│  X  │
+             │  └─────┘
+  ┌─────┐    │
+  │  B  │────┤
+  └─────┘    │  ┌─────┐
+             ├─▶│  Y  │
+             │  └─────┘
+  ┌─────┐    │
+  │  C  │────┘
+  └─────┘
+
+"#,
+        );
+    }
+
+    #[test]
+    fn a_label_overrunning_an_acyclic_canvas_is_cut_with_an_ellipsis_top_down() {
+        // A top-down canvas is sized for its boxes, not for its labels, so a
+        // long label runs out of room at the right edge whether or not the
+        // diagram has feedback edges. `main` let the write run off the canvas,
+        // where `set` dropped it, and the label ended mid-word with nothing to
+        // say it had been cut. This is the one way an acyclic top-down render
+        // differs from `main`.
+        assert_render(
+            "graph TD\n    A -->|this is an extremely long edge label| B\n",
+            r#"
+   ┌─────┐
+   │  A  │
+   └─────┘
+      │ this…
+      │
+      │
+      ▼
+   ┌─────┐
+   │  B  │
+   └─────┘
+"#,
+        );
+    }
+
+    #[test]
+    fn a_label_with_no_room_to_be_cut_is_dropped() {
+        assert_eq!(fit_label("retry", 5), "retry");
+        assert_eq!(fit_label("retry", 4), "ret\u{2026}");
+        assert_eq!(fit_label("retry", 3), "re\u{2026}");
+        // Below three columns a cut label names the edge something it is not,
+        // and a bare ellipsis says only that something was dropped.
+        assert_eq!(fit_label("retry", 2), "");
+        assert_eq!(fit_label("retry", 1), "");
+        assert_eq!(fit_label("retry", 0), "");
+    }
+
+    #[test]
+    fn a_forward_label_clears_a_feedback_arrowhead_top_down() {
+        // Reduced from a case the route/label property test above generates.
+        // A forward edge spanning several layers takes the midpoint of its own
+        // span, which no gap budget accounts for, and writes its label on the
+        // row above. That row is where a feedback route drops from its
+        // horizontal run to its arrowhead, and the reserved rows used to cover
+        // the run alone, so the label went over the head of the edge arriving:
+        // two boxes that nothing appeared to reach. Covering the rows the
+        // whole route runs through is what stopped that; before it, this shape
+        // came out with five heads.
+        //
+        // The eighth head is the one a crossing forward run used to repaint as
+        // a junction, kept now that an arrowhead cell holds its glyph against
+        // [`Canvas::add_connection`].
+        let code = "graph TD
+    N8[x] --> N6[xxxxxxxxxxx]
+    N5[xxxxxx] --> N7[xxxxxxxxxxxxxxxx]
+    N1[xxxxxx] --> N3[xxxxxxxxxxxxxxxx]
+    N6[xxxxxxxxxxx] -->|LLLLLL| N5[xxxxxx]
+    N4[x] --> N8[x]
+    N9[xxxxxx] -->|LLLLLLL| N1[xxxxxx]
+    N7[xxxxxxxxxxxxxxxx] -->|LL| N1[xxxxxx]
+    N3[xxxxxxxxxxxxxxxx] -->|LLL| N5[xxxxxx]
+    N7[xxxxxxxxxxxxxxxx] --> N7[xxxxxxxxxxxxxxxx]
+";
+        let text = render_text(code);
+        assert_arrowheads(code, &text, false);
+        assert_eq!(text.matches('\u{25bc}').count(), 8, "\n{text}");
+    }
+
+    #[test]
+    fn one_long_label_does_not_widen_every_lane() {
+        let code = "graph TD\n    Start --> Check\n    Check --> Work\n    Work --> Done\n    Done -->|x| Start\n    Work -->|a very long label| Check\n";
+        let text = render_text(code);
+        let width = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        // Each lane reserves its own label's width. Charging every lane for the
+        // longest label would add another 16 columns here.
+        assert!(width < 45, "gutter is {width} columns wide:\n{text}");
+        assert_render(
+            code,
+            r#"
+          ┌──────────────────────────┐
+          ▼                          │
+   ┌───────┐                         │
+   │ Start │                         │
+   └───────┘                         │
+       │                             │
+       │                             │
+       │                             │
+       │  ┌─────┐                    │
+       ▼  ▼     │                    │
+   ┌───────┐    │                    │
+   │ Check │    │ a very long label  │ x
+   └───────┘    │                    │
+       │        │                    │
+       │        │                    │
+       │        │                    │
+       ▼        │                    │
+   ┌──────┐     │                    │
+   │ Work │     │                    │
+   └──────┘     │                    │
+    │  │        │                    │
+    └──┼────────┘                    │
+       │                             │
+       │                             │
+       ▼                             │
+   ┌──────┐                          │
+   │ Done │                          │
+   └──────┘                          │
+    │                                │
+    └────────────────────────────────┘
+"#,
+        );
     }
 }

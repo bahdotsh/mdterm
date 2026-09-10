@@ -323,7 +323,10 @@ impl<'a> Renderer<'a> {
         });
         self.lines.push(Line {
             spans: top_spans,
-            meta: LineMeta::CodeContent { block_id },
+            meta: LineMeta::CodeContent {
+                block_id,
+                diagram: false,
+            },
         });
 
         // Code lines
@@ -403,7 +406,10 @@ impl<'a> Renderer<'a> {
 
             self.lines.push(Line {
                 spans,
-                meta: LineMeta::CodeContent { block_id },
+                meta: LineMeta::CodeContent {
+                    block_id,
+                    diagram: false,
+                },
             });
         }
 
@@ -416,7 +422,10 @@ impl<'a> Renderer<'a> {
                     ..Default::default()
                 },
             }],
-            meta: LineMeta::CodeContent { block_id },
+            meta: LineMeta::CodeContent {
+                block_id,
+                diagram: false,
+            },
         });
     }
 
@@ -461,7 +470,10 @@ impl<'a> Renderer<'a> {
                     },
                 },
             ],
-            meta: LineMeta::CodeContent { block_id },
+            meta: LineMeta::CodeContent {
+                block_id,
+                diagram: true,
+            },
         });
 
         // Diagram content rows
@@ -507,7 +519,10 @@ impl<'a> Renderer<'a> {
 
             self.lines.push(Line {
                 spans,
-                meta: LineMeta::CodeContent { block_id },
+                meta: LineMeta::CodeContent {
+                    block_id,
+                    diagram: true,
+                },
             });
         }
 
@@ -520,7 +535,10 @@ impl<'a> Renderer<'a> {
                     ..Default::default()
                 },
             }],
-            meta: LineMeta::CodeContent { block_id },
+            meta: LineMeta::CodeContent {
+                block_id,
+                diagram: true,
+            },
         });
     }
 

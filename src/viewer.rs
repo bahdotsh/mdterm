@@ -834,7 +834,7 @@ impl ViewerState {
         for delta in 0..self.viewport() {
             for &idx in &[line_idx.wrapping_sub(delta), line_idx + delta] {
                 if let Some(line) = self.wrapped.get(idx)
-                    && let LineMeta::CodeContent { block_id } = line.meta
+                    && let LineMeta::CodeContent { block_id, .. } = line.meta
                 {
                     return Some(block_id);
                 }
@@ -1188,7 +1188,7 @@ fn handle_event(state: &mut ViewerState, ev: Event) -> bool {
                     && let Some(line) = state.wrapped.get(line_idx)
                 {
                     match line.meta {
-                        LineMeta::CodeContent { block_id } => {
+                        LineMeta::CodeContent { block_id, .. } => {
                             if let Some(block) = state.doc_info.code_blocks.get(block_id)
                                 && copy_to_clipboard(&block.content).is_ok()
                             {
@@ -2639,13 +2639,10 @@ fn render_frame(stdout: &mut io::Stdout, state: &mut ViewerState) -> io::Result<
                     let fill_bg = if is_json_cursor {
                         Some(line_bg)
                     } else {
-                        line.spans.first().and_then(|s| s.style.bg).and_then(|bg| {
-                            if line.spans.iter().all(|s| s.style.bg == Some(bg)) {
-                                Some(bg)
-                            } else {
-                                None
-                            }
-                        })
+                        line.spans
+                            .first()
+                            .and_then(|s| s.style.bg)
+                            .filter(|&bg| line.spans.iter().all(|s| s.style.bg == Some(bg)))
                     };
                     if let Some(bg) = fill_bg {
                         queue!(
