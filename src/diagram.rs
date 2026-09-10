@@ -12,7 +12,7 @@ enum Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum NodeShape {
+enum NodeShape {
     Rectangle,
     Rounded,
     Diamond,
@@ -270,10 +270,10 @@ fn parse_arrow(s: &str) -> Option<(Option<String>, &str)> {
 // ───── Layout ─────
 
 #[derive(Clone)]
-pub(crate) struct NodeLayout {
-    pub(crate) center_x: usize,
-    pub(crate) top_y: usize,
-    pub(crate) width: usize,
+struct NodeLayout {
+    center_x: usize,
+    top_y: usize,
+    width: usize,
 }
 
 impl NodeLayout {
@@ -432,45 +432,45 @@ fn plan_feedback(graph: &Graph, layout: &Layout) -> FeedbackPlans {
 
 /// Geometry of one feedback edge route in a top-down diagram.
 /// See [`Canvas::draw_feedback_edge_td`].
-pub(crate) struct FeedbackRouteTd {
+struct FeedbackRouteTd {
     /// Column where the route leaves the source's bottom border.
-    pub(crate) exit_x: usize,
+    exit_x: usize,
     /// Row of the source's bottom border.
-    pub(crate) src_bottom_y: usize,
+    src_bottom_y: usize,
     /// Gap row of the horizontal run below the source.
-    pub(crate) exit_y: usize,
+    exit_y: usize,
     /// Column where the arrowhead enters the destination's top border.
-    pub(crate) entry_x: usize,
+    entry_x: usize,
     /// Row of the destination's top border.
-    pub(crate) dst_top_y: usize,
+    dst_top_y: usize,
     /// Gap row of the horizontal run above the destination.
-    pub(crate) entry_y: usize,
+    entry_y: usize,
     /// Column of the vertical lane in the gutter right of the diagram.
-    pub(crate) lane_x: usize,
+    lane_x: usize,
 }
 
 /// Geometry of one feedback edge route in a left-right diagram.
 /// See [`Canvas::draw_feedback_edge_lr`].
-pub(crate) struct FeedbackRouteLr {
+struct FeedbackRouteLr {
     /// Column where the route leaves the source's bottom border.
-    pub(crate) exit_x: usize,
+    exit_x: usize,
     /// Row of the source's bottom border.
-    pub(crate) src_bottom_y: usize,
+    src_bottom_y: usize,
     /// Gap column right of the source's *column* that carries the drop to the
     /// lane. Boxes are centred in a column sized by its widest node, so a
     /// column edge is the only place guaranteed to be clear of every box.
-    pub(crate) exit_lane_x: usize,
+    exit_lane_x: usize,
     /// Column where the arrowhead enters the destination's bottom border.
-    pub(crate) entry_x: usize,
+    entry_x: usize,
     /// Row of the destination's bottom border.
-    pub(crate) dst_bottom_y: usize,
+    dst_bottom_y: usize,
     /// Gap column left of the destination's column that carries the rise from
     /// the lane, two columns clear of it rather than one: the column
     /// immediately left of a box is where every forward arrowhead into it
     /// lands, and sharing it would overwrite the junction.
-    pub(crate) entry_lane_x: usize,
+    entry_lane_x: usize,
     /// Row of the horizontal lane in the gutter below the diagram.
-    pub(crate) lane_y: usize,
+    lane_y: usize,
 }
 
 fn assign_layers(graph: &Graph, feedback_edges: &HashSet<usize>) -> Vec<Vec<String>> {
@@ -711,7 +711,7 @@ fn node_box_width(node: &Node) -> usize {
     label_box_width(&node.label, node.shape)
 }
 
-pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
+fn label_box_width(label: &str, shape: NodeShape) -> usize {
     let label_width = label.chars().count();
     let width = match shape {
         NodeShape::Diamond => label_width + 6,
@@ -730,7 +730,7 @@ pub(crate) fn label_box_width(label: &str, shape: NodeShape) -> usize {
 /// anything: one character and an ellipsis reads as a different word, and a
 /// bare ellipsis says only that something was dropped. The label is left out
 /// altogether instead, which at least does not misname the edge.
-pub(crate) fn fit_label(label: &str, width: usize) -> String {
+fn fit_label(label: &str, width: usize) -> String {
     if label.chars().count() <= width {
         return label.to_string();
     }
@@ -746,12 +746,12 @@ pub(crate) fn fit_label(label: &str, width: usize) -> String {
 
 // ───── Canvas ─────
 
-pub(crate) const CONN_UP: u8 = 1;
-pub(crate) const CONN_DOWN: u8 = 2;
-pub(crate) const CONN_LEFT: u8 = 4;
-pub(crate) const CONN_RIGHT: u8 = 8;
+const CONN_UP: u8 = 1;
+const CONN_DOWN: u8 = 2;
+const CONN_LEFT: u8 = 4;
+const CONN_RIGHT: u8 = 8;
 
-pub(crate) fn junction_char(connects: u8) -> char {
+fn junction_char(connects: u8) -> char {
     match connects {
         c if c == CONN_UP | CONN_DOWN => '│',
         c if c == CONN_LEFT | CONN_RIGHT => '─',
@@ -773,12 +773,12 @@ pub(crate) fn junction_char(connects: u8) -> char {
 }
 
 #[derive(Clone)]
-pub(crate) struct CanvasCell {
-    pub(crate) ch: char,
-    pub(crate) fg: Option<Color>,
-    pub(crate) bg: Option<Color>,
-    pub(crate) is_node: bool,
-    pub(crate) connects: u8,
+struct CanvasCell {
+    ch: char,
+    fg: Option<Color>,
+    bg: Option<Color>,
+    is_node: bool,
+    connects: u8,
     /// Drawn by a feedback route.
     is_feedback: bool,
     /// Part of a left-right gutter lane's plain horizontal run. A lane carries
@@ -802,8 +802,8 @@ impl Default for CanvasCell {
 }
 
 pub(crate) struct Canvas {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
+    width: usize,
+    height: usize,
     cells: Vec<Vec<CanvasCell>>,
 }
 
@@ -816,14 +816,14 @@ impl Canvas {
         }
     }
 
-    pub(crate) fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    fn set(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
         }
     }
 
-    pub(crate) fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
+    fn set_node(&mut self, x: usize, y: usize, ch: char, fg: Option<Color>) {
         if y < self.height && x < self.width {
             self.cells[y][x].ch = ch;
             self.cells[y][x].fg = fg;
@@ -831,7 +831,7 @@ impl Canvas {
         }
     }
 
-    pub(crate) fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
+    fn add_connection(&mut self, x: usize, y: usize, dir: u8, fg: Option<Color>) {
         if y < self.height && x < self.width {
             let cell = &mut self.cells[y][x];
             if !cell.is_node {
@@ -972,7 +972,7 @@ impl Canvas {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_node(
+    fn draw_node(
         &mut self,
         cx: usize,
         y: usize,
@@ -1158,7 +1158,7 @@ impl Canvas {
     /// right of the diagram on every row, so a label long enough to reach them
     /// would cut a feedback route; it is truncated instead.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_edge_td(
+    fn draw_edge_td(
         &mut self,
         src_cx: usize,
         src_bottom_y: usize,
@@ -1438,7 +1438,7 @@ impl Canvas {
     /// Gap rows never contain nodes, so the route cannot pass through a
     /// sibling of either endpoint. Forward edges it crosses render as
     /// junctions.
-    pub(crate) fn draw_feedback_edge_td(&mut self, route: &FeedbackRouteTd, fg: Option<Color>) {
+    fn draw_feedback_edge_td(&mut self, route: &FeedbackRouteTd, fg: Option<Color>) {
         let r = route;
 
         // Leave the source: stem down to the gap row, turn, run right to the lane.
@@ -1489,7 +1489,7 @@ impl Canvas {
     /// not beside its box. Boxes are centred in a column as wide as its widest
     /// node, so only a column edge is guaranteed clear of every box; a margin
     /// measured from a narrow box can sit inside a wider neighbour.
-    pub(crate) fn draw_feedback_edge_lr(&mut self, route: &FeedbackRouteLr, fg: Option<Color>) {
+    fn draw_feedback_edge_lr(&mut self, route: &FeedbackRouteLr, fg: Option<Color>) {
         let r = route;
         let exit_y = r.src_bottom_y + 1;
         let entry_y = r.dst_bottom_y + 2;
